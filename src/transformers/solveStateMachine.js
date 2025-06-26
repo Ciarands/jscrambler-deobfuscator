@@ -62,7 +62,7 @@ export const solveStateMachine = {
       }
     },
 
-    AssignmentExpression(path, state) {
+    AssignmentExpression(path) {
       if (stateMachineInfo) return;
       // console.log(`[STATE-MACHINE] Checking AssignmentExpression: ${gen(path.node.left)} = ...`);
 
@@ -126,7 +126,6 @@ export const solveStateMachine = {
       }
       
       if (setterName && calculatorName && logicMap.size > 0) {
-        // Assign to the module-level variable.
         stateMachineInfo = { objectName: gen(path.node.left), setterName, calculatorName, logicMap };
         console.log(`\n[STATE-MACHINE] State Machine fully parsed!`);
         console.log(`   - Object Name: '${stateMachineInfo.objectName}'`);
@@ -140,8 +139,7 @@ export const solveStateMachine = {
     },
 
     CallExpression: {
-      exit(path, state) {
-        // Use the module-level variable.
+      exit(path) {
         const info = stateMachineInfo;
         if (!info) return;
 

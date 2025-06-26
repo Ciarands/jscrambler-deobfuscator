@@ -96,14 +96,14 @@ export const solveStringArray = {
                         const body = funcPath.get('body.body');
                         if (body.length !== 1 || !body[0].isReturnStatement()) return;
                         const returnArg = body[0].get('argument');
-                        if (!returnArg.isStringLiteral() || returnArg.node.value.length < 500) return;
+                        if (!returnArg.isStringLiteral() || returnArg.node.value.length < 50) return;
                         console.log(`[SOLVE-STR] Found large string function: "${funcPath.node.id?.name || '(anonymous)'}"`);
                         largeStringInfo = { value: returnArg.node.value, path: funcPath };
                         funcPath.stop();
                     }
                 });
             },
-            exit(programPath) {
+            exit(path) {
                 if (!largeStringInfo || !decoderInfo) {
                     const missing = [];
                     if (!largeStringInfo) missing.push("large string function");

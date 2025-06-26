@@ -1,9 +1,14 @@
 import * as t from '@babel/types';
 
+
 function isSetupCallPattern(node) {
   const args = node.arguments;
+
+  if (args.length !== 4 && args.length !== 5) {
+    return false;
+  }
+
   return (
-    args.length === 4 &&
     t.isIdentifier(args[0]) &&
     t.isStringLiteral(args[1]) &&
     t.isNumericLiteral(args[2]) &&
@@ -31,7 +36,6 @@ export const inlineSetupFunctions = {
 
         let wrapperName = null;
         let setupCallPaths = [];
-
         for (const [name, paths] of potentialWrappers.entries()) {
           if (paths.length > setupCallPaths.length) {
             wrapperName = name;
@@ -40,6 +44,7 @@ export const inlineSetupFunctions = {
         }
 
         if (!wrapperName) {
+          console.log("Deobfuscation: No setup function found to inline.");
           return;
         }
 
@@ -65,17 +70,14 @@ export const inlineSetupFunctions = {
           Identifier(idPath) {
             if (
               renames.hasOwnProperty(idPath.node.name) &&
-              idPath.isReferenced()
+              idPath.isReferenced() &&
+              !(idPath.parentPath.isMemberExpression() && idPath.key === 'property')
             ) {
-              const isProperty =
-                idPath.parentPath.isMemberExpression() && idPath.key === 'property';
-
-              if (!isProperty) {
-                idPath.replaceWith(t.identifier(renames[idPath.node.name]));
-              }
+              idPath.replaceWith(t.identifier(renames[idPath.node.name]));
             }
           },
         };
+
         path.traverse(renamerVisitor);
 
         for (const callPath of setupCallPaths) {
@@ -85,8 +87,11 @@ export const inlineSetupFunctions = {
         }
 
         const wrapperBinding = path.scope.getBinding(wrapperName);
-        if (wrapperBinding && wrapperBinding.path.isVariableDeclarator()) {
-          // wrapperBinding.path.parentPath.remove();
+        if (wrapperBinding) {
+          const declarationPath = wrapperBinding.path.getStatementParent();
+          if (declarationPath) {
+            declarationPath.remove();
+          }
         }
       },
     },

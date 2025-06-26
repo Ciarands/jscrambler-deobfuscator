@@ -87,15 +87,15 @@ export const inlineWrapperFunctions = {
       const wrapperMap = new Map();
       
       path.traverse({
-        VariableDeclarator(aliasPath) {
-          const { id, init } = aliasPath.node;
+        VariableDeclarator(path) {
+          const { id, init } = path.node;
           if (t.isIdentifier(id) && t.isIdentifier(init) && baseObjectAliases.has(init.name)) {
             baseObjectAliases.add(id.name);
           }
         },
         AssignmentExpression: {
-          exit(mapPath) {
-            const { left, right } = mapPath.node;
+          exit(path) {
+            const { left, right } = path.node;
             if (!t.isMemberExpression(left) || !t.isIdentifier(left.object) || !baseObjectAliases.has(left.object.name)) {
               return;
             }
@@ -104,14 +104,14 @@ export const inlineWrapperFunctions = {
               const wrapperKey = getMemberKey(left);
               if (wrapperKey !== null) {
                 wrapperMap.set(wrapperKey, targetMemberExpr);
-                mapPath.remove();
+                path.remove();
               }
             }
           }
         },
         CallExpression: {
-            exit(callPath) {
-                const callee = callPath.node.callee;
+            exit(path) {
+                const callee = path.node.callee;
                 if (!t.isMemberExpression(callee) || !t.isIdentifier(callee.object) || !baseObjectAliases.has(callee.object.name)) {
                     return;
                 }
@@ -119,7 +119,7 @@ export const inlineWrapperFunctions = {
                 if (wrapperKey !== null && wrapperMap.has(wrapperKey)) {
                     const targetMemberExpr = wrapperMap.get(wrapperKey);
                     // console.log(`[INLINE-PROXY] Inlining call to "${callee.object.name}[${wrapperKey}]"`);
-                    callPath.replaceWith(t.callExpression(targetMemberExpr, callPath.node.arguments));
+                    path.replaceWith(t.callExpression(targetMemberExpr, path.node.arguments));
                 }
             }
         }

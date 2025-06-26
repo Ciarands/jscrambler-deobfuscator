@@ -52,8 +52,8 @@ export const inlineArrayBuilder = {
             };
 
             bodyPath.traverse({
-                AssignmentExpression(assignmentPath) {
-                    const { left, right, operator } = assignmentPath.node;
+                AssignmentExpression(path) {
+                    const { left, right, operator } = path.node;
 
                     if (!t.isMemberExpression(left) || !t.isIdentifier(left.object) || !t.isNumericLiteral(left.property)) {
                         return;
@@ -75,7 +75,7 @@ export const inlineArrayBuilder = {
                         } else {
                             return;
                         }
-                        const statement = assignmentPath.findParent(p => p.isStatement());
+                        const statement = path.findParent(p => p.isStatement());
                         if (statement) {
                             tracker.pathsToRemove.add(statement);
                         }
@@ -83,21 +83,26 @@ export const inlineArrayBuilder = {
                 },
             });
             bodyPath.traverse({
-                MemberExpression(memberPath) {
-                    if (!memberPath.parentPath.isAssignmentExpression({ left: memberPath.node })) {
-                        const { object, property } = memberPath.node;
+                MemberExpression(path) {
+                    // MINIMAL CHANGE: Add a guard to prevent replacement in the left side of a for...in loop.
+                    if (path.parentPath.isForInStatement({ left: path.node })) {
+                        return;
+                    }
+
+                    if (!path.parentPath.isAssignmentExpression({ left: path.node })) {
+                        const { object, property } = path.node;
                         if (t.isIdentifier(object) && t.isNumericLiteral(property)) {
                             const tracker = trackers.get(object.name);
                             if (tracker && tracker.values.has(property.value)) {
                                 const constValue = tracker.values.get(property.value);
                                 if (typeof constValue === 'number' && 
-                                    (memberPath.parentPath.isUpdateExpression() || 
-                                     memberPath.parentPath.isAssignmentExpression())) {
+                                    (path.parentPath.isUpdateExpression() || 
+                                     path.parentPath.isAssignmentExpression())) {
                                     return;
                                 }
                                 const replacementNode = valueToNode(constValue);
                                 if (replacementNode) {
-                                    memberPath.replaceWith(replacementNode);
+                                    path.replaceWith(replacementNode);
                                     hasChanges = true;
                                     return;
                                 }
@@ -105,21 +110,21 @@ export const inlineArrayBuilder = {
                         }
                     }
 
-                    if (memberPath.node.computed && t.isMemberExpression(memberPath.node.property)) {
-                        const propertyExpr = memberPath.node.property;
+                    if (path.node.computed && t.isMemberExpression(path.node.property)) {
+                        const propertyExpr = path.node.property;
                         if (t.isIdentifier(propertyExpr.object) && t.isNumericLiteral(propertyExpr.property)) {
                             const tracker = trackers.get(propertyExpr.object.name);
                             const index = propertyExpr.property.value;
                             if (tracker && tracker.values.has(index)) {
                                 const constValue = tracker.values.get(index);
                                 if (typeof constValue === 'number' && 
-                                    (memberPath.parentPath.isUpdateExpression() || 
-                                     memberPath.parentPath.isAssignmentExpression())) {
+                                    (path.parentPath.isUpdateExpression() || 
+                                     path.parentPath.isAssignmentExpression())) {
                                     return;
                                 }
                                 const replacementNode = valueToNode(constValue);
                                 if (replacementNode) {
-                                    memberPath.get('property').replaceWith(replacementNode);
+                                    path.get('property').replaceWith(replacementNode);
                                     hasChanges = true;
                                 }
                             }

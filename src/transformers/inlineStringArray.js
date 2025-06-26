@@ -27,9 +27,9 @@ export const inlineStringArray = {
 
       path.traverse({
 
-        AssignmentExpression(assignmentPath) {
+        AssignmentExpression(path) {
           if (arrayInfo) return;
-          const right = assignmentPath.get("right");
+          const right = path.get("right");
           if (!right.isCallExpression() || !right.get("callee").isFunctionExpression()) {
             return;
           }
@@ -56,14 +56,14 @@ export const inlineStringArray = {
                 return;
               }
               const theArray = evalResults.map((r) => r.value);
-              const objectName = gen(assignmentPath.node.left);
+              const objectName = gen(path.node.left);
               const accessorName = objectProp.get("key").isIdentifier() ? objectProp.get("key").node.name : objectProp.get("key").node.value;
               arrayInfo = {
                 objectName,
                 accessorName,
                 theArray
               };
-              arrayDefinitionPath = assignmentPath.getStatementParent();
+              arrayDefinitionPath = path.getStatementParent();
               console.log(`\n[INLINE-STR] Successfully parsed literal array!`);
               console.log(`[INLINE-STR] - Object Name: '${objectName}'`);
               console.log(`[INLINE-STR] - Accessor Name: '${accessorName}'`);
@@ -72,7 +72,7 @@ export const inlineStringArray = {
             },
           });
           if (arrayInfo) {
-            assignmentPath.stop();
+            path.stop();
           }
         },
       });
@@ -85,8 +85,8 @@ export const inlineStringArray = {
       let replacementsMade = 0;
 
       path.traverse({
-        CallExpression(callPath) {
-          const callee = callPath.get("callee");
+        CallExpression(path) {
+          const callee = path.get("callee");
           if (!callee.isMemberExpression()) return;
           const {
             objectName,
@@ -96,24 +96,24 @@ export const inlineStringArray = {
           if (gen(callee.node.object) === objectName && callee.get("property").isIdentifier({
               name: accessorName
             })) {
-            const evaluation = callPath.get("arguments.0").evaluate();
+            const evaluation = path.get("arguments.0").evaluate();
             if (evaluation.confident && typeof evaluation.value === "number") {
               const index = evaluation.value;
               if (index >= 0 && index < theArray.length) {
                 const resolvedValue = theArray[index];
                 const replacementNode = safeValueToNode(resolvedValue);
                 if (replacementNode) {
-                  // console.log(`[INLINE-STR] Inlining ${gen(callPath.node)} -> ${gen(replacementNode)}`);
-                  callPath.replaceWith(replacementNode);
+                  // console.log(`[INLINE-STR] Inlining ${gen(path.node)} -> ${gen(replacementNode)}`);
+                  path.replaceWith(replacementNode);
                   replacementsMade++;
                 } else {
                   console.warn(`[INLINE-STR] Could not create a literal node for value at index ${index}.`);
                 }
               } else {
-                console.warn(`[INLINE-STR] Index ${index} is out of bounds for call: ${gen(callPath.node)}`);
+                console.warn(`[INLINE-STR] Index ${index} is out of bounds for call: ${gen(path.node)}`);
               }
             } else {
-              console.warn(`[INLINE-STR] Could not statically resolve index for call: ${gen(callPath.node)}`);
+              console.warn(`[INLINE-STR] Could not statically resolve index for call: ${gen(path.node)}`);
             }
           }
         },
