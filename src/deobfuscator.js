@@ -20,15 +20,16 @@ export function processSample(samplePath, outputPath) {
         const ast = babel.parseSync(inputCode, {
             sourceType: "script"
         });
-        
-        // Pass 1: Normalize literals
-        console.log("--- Starting Pass 1: Normalizing Literals ---");
-        traverse.default(ast, normalizeLiterals.visitor);
-        console.log("Pass 1 complete.");
 
-        // Pass 2: Unflatten control flow
-        console.log("--- Starting Pass 2: Unflattening Control Flow ---");
+        
+        // Pass 1: Unflatten control flow
+        console.log("--- Starting Pass 1: Unflattening Control Flow ---");
         traverse.default(ast, controlFlowUnflattener.visitor);
+        console.log("Pass 1 complete.");
+        
+        // Pass 2: Normalize literals
+        console.log("--- Starting Pass 2: Normalizing Literals ---");
+        traverse.default(ast, normalizeLiterals.visitor);
         console.log("Pass 2 complete.");
 
         // Pass 3: Inline array builder
