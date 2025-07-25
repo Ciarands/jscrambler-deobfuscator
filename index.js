@@ -22,20 +22,11 @@ try {
     console.log(`Found ${sampleFiles.length} sample files to process:`);
     sampleFiles.forEach(file => console.log(`  - ${path.basename(file)}`));
     
-    let successCount = 0;
-    let totalCount = sampleFiles.length;
     
     for (const sampleFile of sampleFiles) {
         const outputFile = path.join(outputDir, path.basename(sampleFile));
-        const success = processSample(sampleFile, outputFile);
-        if (success) {
-            successCount++;
-        }
+        processSample(sampleFile, outputFile);
     }
-    
-    console.log(`\n=== Processing Complete ===`);
-    console.log(`Successfully processed: ${successCount}/${totalCount} files`);
-    console.log(`Output files saved in: ${outputDir}`);
     
 } catch (err) {
     console.error("\nAn error occurred during batch processing:", err);
