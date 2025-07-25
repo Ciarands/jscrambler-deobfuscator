@@ -26,7 +26,7 @@ function areVarsEquivalent(node1, node2) {
 }
 
 export const controlFlowUnflattener = {
-    priority: 200,
+    priority: 100,
     visitor: {
         ForStatement: {
             exit(path) {
