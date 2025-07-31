@@ -27,7 +27,11 @@ export const inlineArrayBuilder = {
             }
 
             const evaluateNode = (node) => {
-                if (t.isStringLiteral(node) || t.isNumericLiteral(node) || t.isBooleanLiteral(node)) {
+                if (
+                    t.isStringLiteral(node) ||
+                    t.isNumericLiteral(node) ||
+                    t.isBooleanLiteral(node)
+                ) {
                     return { success: true, value: node.value };
                 }
                 if (t.isNullLiteral(node)) {
@@ -43,7 +47,11 @@ export const inlineArrayBuilder = {
                         return { success: true, value: left.value + right.value };
                     }
                 }
-                if (t.isMemberExpression(node) && t.isIdentifier(node.object) && t.isNumericLiteral(node.property)) {
+                if (
+                    t.isMemberExpression(node) &&
+                    t.isIdentifier(node.object) &&
+                    t.isNumericLiteral(node.property)
+                ) {
                     const tracker = trackers.get(node.object.name);
                     if (tracker && tracker.values.has(node.property.value)) {
                         return { success: true, value: tracker.values.get(node.property.value) };
@@ -56,7 +64,11 @@ export const inlineArrayBuilder = {
                 AssignmentExpression(path) {
                     const { left, right, operator } = path.node;
 
-                    if (!t.isMemberExpression(left) || !t.isIdentifier(left.object) || !t.isNumericLiteral(left.property)) {
+                    if (
+                        !t.isMemberExpression(left) ||
+                        !t.isIdentifier(left.object) ||
+                        !t.isNumericLiteral(left.property)
+                    ) {
                         return;
                     }
 
@@ -76,7 +88,7 @@ export const inlineArrayBuilder = {
                         } else {
                             return;
                         }
-                        const statement = path.findParent(p => p.isStatement());
+                        const statement = path.findParent((p) => p.isStatement());
                         if (statement) {
                             tracker.pathsToRemove.add(statement);
                         }
@@ -95,9 +107,11 @@ export const inlineArrayBuilder = {
                             const tracker = trackers.get(object.name);
                             if (tracker && tracker.values.has(property.value)) {
                                 const constValue = tracker.values.get(property.value);
-                                if (typeof constValue === 'number' && 
-                                    (path.parentPath.isUpdateExpression() || 
-                                     path.parentPath.isAssignmentExpression())) {
+                                if (
+                                    typeof constValue === 'number' &&
+                                    (path.parentPath.isUpdateExpression() ||
+                                        path.parentPath.isAssignmentExpression())
+                                ) {
                                     return;
                                 }
                                 const replacementNode = valueToNode(constValue);
@@ -112,14 +126,19 @@ export const inlineArrayBuilder = {
 
                     if (path.node.computed && t.isMemberExpression(path.node.property)) {
                         const propertyExpr = path.node.property;
-                        if (t.isIdentifier(propertyExpr.object) && t.isNumericLiteral(propertyExpr.property)) {
+                        if (
+                            t.isIdentifier(propertyExpr.object) &&
+                            t.isNumericLiteral(propertyExpr.property)
+                        ) {
                             const tracker = trackers.get(propertyExpr.object.name);
                             const index = propertyExpr.property.value;
                             if (tracker && tracker.values.has(index)) {
                                 const constValue = tracker.values.get(index);
-                                if (typeof constValue === 'number' && 
-                                    (path.parentPath.isUpdateExpression() || 
-                                     path.parentPath.isAssignmentExpression())) {
+                                if (
+                                    typeof constValue === 'number' &&
+                                    (path.parentPath.isUpdateExpression() ||
+                                        path.parentPath.isAssignmentExpression())
+                                ) {
                                     return;
                                 }
                                 const replacementNode = valueToNode(constValue);
@@ -135,7 +154,9 @@ export const inlineArrayBuilder = {
 
             if (hasChanges) {
                 for (const tracker of trackers.values()) {
-                    const sortedPaths = Array.from(tracker.pathsToRemove).sort((a, b) => b.key - a.key);
+                    const sortedPaths = Array.from(tracker.pathsToRemove).sort(
+                        (a, b) => b.key - a.key
+                    );
                     for (const p of sortedPaths) {
                         if (p && !p.removed) {
                             p.remove();
@@ -145,7 +166,11 @@ export const inlineArrayBuilder = {
                 functionScope.crawl();
                 for (const name in functionScope.bindings) {
                     const binding = functionScope.getBinding(name);
-                    if (binding && binding.references === 0 && binding.path.isVariableDeclarator()) {
+                    if (
+                        binding &&
+                        binding.references === 0 &&
+                        binding.path.isVariableDeclarator()
+                    ) {
                         binding.path.remove();
                     }
                 }
