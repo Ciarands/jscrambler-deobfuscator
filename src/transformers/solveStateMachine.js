@@ -14,6 +14,8 @@ function evaluateAstNode(node, args) {
         const numLeft = Number(left);
         const numRight = Number(right);
         switch (node.operator) {
+            case '==':
+                return numLeft == numRight;
             case '-':
                 return numLeft - numRight;
             case '*':
@@ -174,7 +176,7 @@ export const solveStateMachine = {
                 console.log(`   |-> Setter Fn:   '${setterName}'`);
                 console.log(`   |-> Calculator Fn: '${calculatorName}'`);
                 console.log(`   |-> Logic map size: ${logicMap.size}\n`);
-                path.getStatementParent().remove();
+                // path.getStatementParent().remove();
             } else {
                 console.log(
                     ` |-> [FAIL] Could not identify both a setter and a calculator from the properties.`
@@ -232,17 +234,19 @@ export const solveStateMachine = {
                     const argValues = path.get('arguments').map((p) => {
                         const evalResult = p.evaluate();
                         if (!evalResult.confident) {
-                            console.error(
-                                `Argument ${gen(p.node)} could not be evaluated confidently.`
+                            console.warn(
+                                `Argument ${gen(p.node)} could not be evaluated confidently. (${p.node.value})`
                             );
-                            return p.node;
+                            return p.node.value;
                         }
                         return evalResult.value;
                     });
 
                     try {
-                        const result = evaluateAstNode(logicNode, argValues);
-                        path.replaceWith(t.valueToNode(result));
+                        if (Object.values(argValues).every(val => typeof val === 'number' && Number.isFinite(val))) {
+                            const result = evaluateAstNode(logicNode, argValues);
+                            path.replaceWith(t.valueToNode(result));
+                        }
                     } catch (e) {
                         console.error(` |-> Failed evaluation for ${gen(path.node)}: ${e.message}`);
                     }
