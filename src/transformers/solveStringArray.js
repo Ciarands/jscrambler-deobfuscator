@@ -23,57 +23,85 @@ function correctlyShuffle(arr, ops) {
     return newArr;
 }
 
-function findDecoderIngredients(funcPath) {
+function findDecoderData(funcPath) {
     let separator = '';
     const shuffleOps = [];
 
     funcPath.traverse({
-        'AssignmentExpression|CallExpression'(path) {
-            let callPath = path.isCallExpression() ? path : path.get('right');
-            if (!callPath.isCallExpression()) return;
-
-            const callee = callPath.get('callee');
-            const args = callPath.get('arguments');
+        CallExpression(path) {
+            const callee = path.get('callee');
+            const args = path.get('arguments');
+            const calleeNode = callee.node;
 
             if (
+                !separator &&
                 callee.isMemberExpression() &&
-                t.isIdentifier(callee.node.property, { name: 'split' }) &&
-                args.length === 1 &&
-                args[0].isStringLiteral()
+                t.isIdentifier(calleeNode.property, { name: 'split' })
             ) {
-                separator = args[0].node.value;
-            } else if (
-                args.length === 2 &&
-                args[1].isStringLiteral() &&
-                args[1].node.value.length < 5
-            ) {
-                separator = args[1].node.value;
-            }
-
-            let innerCall,
-                outerCall = callPath;
-            if (callee.isMemberExpression() && callee.get('object').isCallExpression()) {
-                innerCall = callee.get('object');
-            } else {
-                const nestedCallArg = args.find(
-                    (p) =>
-                        p.isCallExpression() &&
-                        p
-                            .get('arguments')
-                            .some((arg) => arg.isNumericLiteral() || arg.isUnaryExpression())
-                );
-                if (nestedCallArg) {
-                    innerCall = nestedCallArg;
+                const separatorArg = args.length === 1 ? args[0] : args[1];
+                if (separatorArg && separatorArg.isStringLiteral()) {
+                    separator = separatorArg.node.value;
                 }
             }
 
-            if (innerCall) {
-                const innerNumericArgs = innerCall
-                    .get('arguments')
-                    .filter((p) => t.isNumericLiteral(p.node) || t.isUnaryExpression(p.node));
-                const outerNumericArgs = outerCall
-                    .get('arguments')
-                    .filter((p) => t.isNumericLiteral(p.node) || t.isUnaryExpression(p.node));
+            let outerSplicePath = null;
+            if (
+                t.isMemberExpression(calleeNode) &&
+                t.isIdentifier(calleeNode.property, { name: 'apply' })
+            ) {
+                const object = callee.get('object');
+                // Pattern A: array.unshift.apply(array, spliceChain)
+                if (
+                    args.length === 2 &&
+                    object.isMemberExpression() &&
+                    t.isIdentifier(object.node.property, { name: 'unshift' })
+                ) {
+                    outerSplicePath = args[1];
+                }
+                // Pattern B: _.apply(_.unshift(), array, spliceChain)
+                else if (args.length === 3) {
+                    const firstArg = args[0];
+                    if (
+                        firstArg.isCallExpression() &&
+                        t.isIdentifier(firstArg.get('callee.property').node, { name: 'unshift' })
+                    ) {
+                        outerSplicePath = args[2];
+                    }
+                }
+            }
+
+            if (outerSplicePath) {
+                const outerArgs = outerSplicePath.get('arguments');
+                if (!outerSplicePath.isCallExpression() || outerArgs.length < 3) return;
+
+                const innerSplicePath = outerArgs[0];
+                const innerArgs = innerSplicePath.get('arguments');
+                if (!innerSplicePath.isCallExpression() || innerArgs.length < 3) return;
+
+                const op = {
+                    s1_offset: getNumericValue(innerArgs[1].node),
+                    s1_length: getNumericValue(innerArgs[2].node),
+                    s2_offset: getNumericValue(outerArgs[1].node),
+                    s2_length: getNumericValue(outerArgs[2].node),
+                };
+
+                if (!Object.values(op).some(isNaN)) {
+                    shuffleOps.push(op);
+                }
+                path.skip();
+                return;
+            }
+
+            // fallback
+            if (callee.isMemberExpression() && callee.get('object').isCallExpression()) {
+                const innerCall = callee.get('object');
+                const getNumericArgs = (callPath) =>
+                    callPath
+                        .get('arguments')
+                        .filter((p) => t.isNumericLiteral(p.node) || t.isUnaryExpression(p.node));
+
+                const innerNumericArgs = getNumericArgs(innerCall);
+                const outerNumericArgs = getNumericArgs(path);
 
                 if (innerNumericArgs.length >= 2 && outerNumericArgs.length >= 2) {
                     const op = {
@@ -119,7 +147,7 @@ export const solveStringArray = {
                         if (!returnArg.isStringLiteral() || returnArg.node.value.length < 50)
                             return;
                         console.log(
-                            ` |-> Found string function: "${
+                            ` |-> Found string function identifier: "${
                                 funcPath.node.id?.name || '(anonymous)'
                             }"`
                         );
@@ -136,11 +164,14 @@ export const solveStringArray = {
                     console.error(` |-> Aborting. Could not find: ${missing.join(' and ')}.`);
                     return;
                 }
-                console.log(' |-> Both targets found. Starting deobfuscation...');
+                console.log(' |-> Targets found, attempting to reveal strings...');
                 const { value: uriString } = largeStringInfo;
-                const { xorKey, separator, shuffleOps, path: decoderPath } = decoderInfo;
+                const { xorKey, separator, shuffleOps, replacementPath, propKey, isNested } =
+                    decoderInfo;
 
-                console.log(` |-> Successfully extracted ${shuffleOps.length} shuffle operations.`);
+                console.log(
+                    `   |-> Successfully extracted ${shuffleOps.length} shuffle operations.`
+                );
                 const decodedString = decodeURIComponent(uriString);
                 let xorResult = '';
                 for (let i = 0; i < decodedString.length; i++) {
@@ -150,7 +181,7 @@ export const solveStringArray = {
                 }
                 let processedArray = xorResult.split(separator);
                 processedArray = correctlyShuffle(processedArray, shuffleOps);
-                console.log(` |-> Decrypted array with ${processedArray.length} elements.`);
+                console.log(`   |-> Decrypted array with ${processedArray.length} elements.`);
 
                 const finalArrayNode = t.arrayExpression(
                     processedArray.map((s) => t.stringLiteral(s))
@@ -166,36 +197,88 @@ export const solveStringArray = {
                     ])
                 );
 
-                decoderPath.replaceWith(newFunctionNode);
-                console.log(' |-> Replaced decoder IIFE with a new accessor function.');
+                if (isNested) {
+                    const assignmentPath = replacementPath.findParent((p) =>
+                        p.isAssignmentExpression()
+                    );
+                    const newRight = t.objectExpression([
+                        t.objectProperty(t.identifier(propKey), newFunctionNode),
+                    ]);
+                    if (assignmentPath) {
+                        assignmentPath.get('right').replaceWith(newRight);
+                        console.log(`   |-> Replaced nested decoder with a clean accessor object.`);
+                    } else {
+                        const outerIife = replacementPath.findParent(
+                            (p) =>
+                                p.isCallExpression() &&
+                                (p.get('callee').isFunctionExpression() ||
+                                    p.get('callee').isArrowFunctionExpression())
+                        );
+                        if (outerIife) {
+                            outerIife.replaceWith(newRight);
+                            console.log(
+                                `   |-> Replaced nested decoder IIFE with a clean accessor object. (early return fallback)`
+                            );
+                        }
+                    }
+                } else {
+                    replacementPath.replaceWith(newFunctionNode);
+                    console.log('   |-> Replaced simple decoder IIFE with a new accessor function.');
+                }
+
                 largeStringInfo.path.remove();
-                console.log(' |-> Removed string function.');
+                console.log('   |-> Removed string function.');
             },
         },
         CallExpression(path) {
             if (decoderInfo || !largeStringInfo) return;
             const callee = path.get('callee');
             const args = path.get('arguments');
-            if (!callee.isFunctionExpression() || args.length !== 1 || !args[0].isStringLiteral()) {
+
+            if (
+                !(callee.isFunctionExpression() || callee.isArrowFunctionExpression()) ||
+                args.length !== 1 ||
+                !args[0].isStringLiteral()
+            ) {
                 return;
             }
             const xorKey = args[0].node.value;
-            console.log(` |-> Found candidate decoder IIFE with key "${xorKey}". Verifying...`);
-            const ingredients = findDecoderIngredients(callee);
+            console.log(` |-> Found candidate decoder IIFE`);
+            console.log(`   |-> Identifier: ${callee.name}`);
+            console.log(`   |-> XOR Key: "${xorKey}"`);
+            const data = findDecoderData(callee);
+            if (!data) {
+                console.error(` |-> Candidate with key "${xorKey}" failed verification.`);
+                return;
+            }
+            console.log(` |-> Sucessfully verified candidate function`);
+            console.log(`   |->  Separator: "${data.separator}"`);
+            console.log(`   |->  Shuffles: ${data.shuffleOps.length}`);
 
-            if (ingredients) {
-                console.log(
-                    ` |-> Verification successful! Separator: "${ingredients.separator}", Shuffles: ${ingredients.shuffleOps.length}.`
-                );
+            const assignmentPath = path.findParent((p) => p.isAssignmentExpression());
+            if (assignmentPath) {
+                const propPath = path.findParent((p) => p.isObjectProperty());
+                if (propPath) {
+                    const keyNode = propPath.get('key').node;
+                    const propKey = t.isIdentifier(keyNode) ? keyNode.name : keyNode.value;
+                    decoderInfo = {
+                        xorKey,
+                        ...data,
+                        replacementPath: path,
+                        propKey,
+                        isNested: true,
+                    };
+                    path.stop();
+                }
+            } else {
                 decoderInfo = {
                     xorKey,
-                    separator: ingredients.separator,
-                    shuffleOps: ingredients.shuffleOps,
-                    path: path,
+                    ...data,
+                    replacementPath: path,
+                    propKey: null,
+                    isNested: false,
                 };
                 path.stop();
-            } else {
-                console.log(` |-> Candidate with key "${xorKey}" failed verification.`);
             }
         },
     },
