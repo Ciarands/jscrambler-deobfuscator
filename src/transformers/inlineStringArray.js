@@ -16,73 +16,83 @@ export const inlineStringArray = {
     priority: 800,
     visitor: {
         Program(path) {
-            console.log(' |-> Starting inlining pass...');
+            console.log(' |-> Starting string array inlining pass...');
 
             let arrayInfo = null;
-            let anyInlineFailed = false;
             let arrayDefinitionPath = null;
 
             path.traverse({
-                AssignmentExpression(path) {
+                AssignmentExpression(assignmentPath) {
                     if (arrayInfo) return;
-                    const right = path.get('right');
-                    if (!right.isCallExpression() || !right.get('callee').isFunctionExpression()) {
-                        return;
-                    }
 
-                    const iifePath = right.get('callee');
-                    iifePath.traverse({
-                        ArrayExpression(arrayPath) {
-                            const parentMemberExpr = arrayPath.parentPath;
-                            if (
-                                !parentMemberExpr.isMemberExpression({
-                                    object: arrayPath.node,
-                                })
-                            )
-                                return;
-                            const grandParentReturn = parentMemberExpr.parentPath;
-                            if (
-                                !grandParentReturn.isReturnStatement({
-                                    argument: parentMemberExpr.node,
-                                })
-                            )
-                                return;
-                            const accessorFunc = grandParentReturn.findParent((p) =>
-                                p.isFunctionExpression()
-                            );
-                            if (!accessorFunc) return;
-                            const objectProp = accessorFunc.findParent((p) =>
-                                p.isObjectProperty({
-                                    value: accessorFunc.node,
-                                })
-                            );
-                            if (!objectProp) return;
-                            const evalResults = arrayPath
+                    const right = assignmentPath.get('right');
+                    if (!right.isCallExpression()) return;
+                    const iife = right.get('callee');
+                    if (!iife.isFunction()) return;
+
+                    let foundInIIFE = false;
+
+                    iife.traverse({
+                        ObjectProperty(propPath) {
+                            const accessorFunc = propPath.get('value');
+                            if (!accessorFunc.isFunctionExpression()) return;
+                            let returnedArray = null;
+                            accessorFunc.traverse({
+                                ReturnStatement(returnPath) {
+                                    const arg = returnPath.get('argument');
+                                    if (!arg.isMemberExpression()) return;
+
+                                    const arrayCandidate = arg.get('object');
+                                    if (arrayCandidate.isArrayExpression()) {
+                                        returnedArray = arrayCandidate;
+                                        returnPath.stop();
+                                    }
+                                },
+                            });
+
+                            if (!returnedArray) return;
+                            const evalResults = returnedArray
                                 .get('elements')
                                 .map((el) => el.evaluate());
+
                             if (!evalResults.every((r) => r.confident)) {
+                                console.warn(
+                                    ' |-> Found a potential array, but could not evaluate all its elements confidently.'
+                                );
                                 return;
                             }
+
                             const theArray = evalResults.map((r) => r.value);
-                            const objectName = generate.default(path.node.left);
-                            const accessorName = objectProp.get('key').isIdentifier()
-                                ? objectProp.get('key').node.name
-                                : objectProp.get('key').node.value;
+                            const objectNameString = generate.default(
+                                assignmentPath.node.left
+                            ).code;
+
+                            const key = propPath.get('key');
+                            const accessorName = key.isIdentifier()
+                                ? key.node.name
+                                : key.node.value;
+
                             arrayInfo = {
-                                objectName,
+                                objectNameString,
                                 accessorName,
                                 theArray,
                             };
-                            arrayDefinitionPath = path.getStatementParent();
-                            console.log(` |-> Successfully parsed literal array!`);
-                            console.log(`   |-> Object Name: '${objectName}'`);
-                            console.log(`   |->  Accessor Name: '${accessorName}'`);
-                            console.log(`   |->  Array Size:${theArray.length}\n`);
-                            arrayPath.stop();
+
+                            arrayDefinitionPath = assignmentPath.getStatementParent();
+                            console.log(
+                                ` |-> Successfully fingerprinted and parsed the literal array!`
+                            );
+                            console.log(`   |-> Object Name: '${objectNameString}'`);
+                            console.log(`   |-> Accessor Name: '${accessorName}'`);
+                            console.log(`   |-> Array Size: ${theArray.length}\n`);
+
+                            foundInIIFE = true;
+                            propPath.stop();
                         },
                     });
-                    if (arrayInfo) {
-                        path.stop();
+
+                    if (foundInIIFE) {
+                        assignmentPath.stop();
                     }
                 },
             });
@@ -93,50 +103,62 @@ export const inlineStringArray = {
             }
 
             let replacementsMade = 0;
+            let anyInlineFailed = false;
 
             path.traverse({
-                CallExpression(path) {
-                    const callee = path.get('callee');
+                CallExpression(callPath) {
+                    const callee = callPath.get('callee');
                     if (!callee.isMemberExpression()) return;
-                    const { objectName, accessorName, theArray } = arrayInfo;
-                    if (
-                        generate.default(callee.node.object) === objectName &&
-                        callee.get('property').isIdentifier({
-                            name: accessorName,
-                        })
-                    ) {
-                        const evaluation = path.get('arguments.0').evaluate();
-                        if (evaluation.confident && typeof evaluation.value === 'number') {
-                            const index = evaluation.value;
-                            if (index >= 0 && index < theArray.length) {
-                                const resolvedValue = theArray[index];
-                                const replacementNode = safeValueToNode(resolvedValue);
-                                if (replacementNode) {
-                                    // console.log(` |-> Inlining ${generate.default(path.node)} -> ${generate.default(replacementNode)}`);
-                                    path.replaceWith(replacementNode);
-                                    replacementsMade++;
-                                } else {
-                                    console.warn(
-                                        ` |-> Could not create a literal node for value at index ${index}.`
-                                    );
-                                    anyInlineFailed = true;
-                                }
+
+                    const { objectNameString, accessorName, theArray } = arrayInfo;
+                    if (generate.default(callee.node.object).code !== objectNameString) return;
+
+                    const property = callee.get('property');
+                    const isAccessorMatch =
+                        property.isIdentifier({ name: accessorName }) ||
+                        property.isStringLiteral({ value: accessorName });
+
+                    if (!isAccessorMatch) return;
+
+                    const firstArg = callPath.get('arguments.0');
+                    if (!firstArg) {
+                        anyInlineFailed = true;
+                        return;
+                    }
+
+                    const evaluation = firstArg.evaluate();
+
+                    if (evaluation.confident && typeof evaluation.value === 'number') {
+                        const index = evaluation.value;
+                        if (index >= 0 && index < theArray.length) {
+                            const resolvedValue = theArray[index];
+                            const replacementNode = safeValueToNode(resolvedValue);
+
+                            if (replacementNode) {
+                                // console.log(` |-> Inlining ${generate.default(path.node).code} -> ${generate.default(replacementNode).code}`);
+                                callPath.replaceWith(replacementNode);
+                                replacementsMade++;
                             } else {
                                 console.warn(
-                                    ` |-> Index ${index} is out of bounds for call: ${generate.default(
-                                        path.node
-                                    )}`
+                                    ` |-> Could not create a literal node for value at index ${index}.`
                                 );
                                 anyInlineFailed = true;
                             }
                         } else {
                             console.warn(
-                                ` |-> Could not statically resolve index for call: ${generate.default(
-                                    path.node
-                                )}`
+                                ` |-> Index ${index} is out of bounds for call: ${
+                                    generate.default(callPath.node).code
+                                }`
                             );
                             anyInlineFailed = true;
                         }
+                    } else {
+                        console.warn(
+                            ` |-> Could not statically resolve index for call: ${
+                                generate.default(callPath.node).code
+                            }`
+                        );
+                        anyInlineFailed = true;
                     }
                 },
             });
