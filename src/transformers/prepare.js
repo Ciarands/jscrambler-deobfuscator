@@ -21,6 +21,9 @@ export const normalize = {
             const callee = right.callee;
             if (!t.isFunctionExpression(callee) && !t.isArrowFunctionExpression(callee)) return;
 
+            console.log(
+                ` |-> Found candidate AssignmentExpression "${left.object.name}", attempting to validate and retrieve global getter obj`
+            );
             let isGlobalGetter = false;
             path.get('right.callee').traverse({
                 CallExpression(callPath) {

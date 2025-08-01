@@ -108,7 +108,12 @@ export const inlineWrapperFunctions = {
             const baseObjectNode = programPath.node.injectedGlobal;
 
             if (!baseObjectNode || !t.isIdentifier(baseObjectNode)) {
-                console.log(' |-> No injected global base object found. Halting.');
+                console.error(
+                    ' |-> No injected global base object found. Halting. (prepare.js didnt find global object func!)'
+                );
+                console.warn(
+                    ' |-> FIXME (knownissue): This happens on some samples, it will still work.'
+                );
                 return;
             }
             console.log(` |-> Base Object is the injected global: "${baseObjectNode.name}".`);

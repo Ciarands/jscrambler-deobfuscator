@@ -17,6 +17,7 @@ export const inlineArrayBuilder = {
             if (!bodyPath.isBlockStatement()) return;
 
             const trackers = new Map();
+            let foundPaths = 0;
             let hasChanges = false;
 
             for (const name in functionScope.bindings) {
@@ -25,7 +26,7 @@ export const inlineArrayBuilder = {
                     pathsToRemove: new Set(),
                 });
             }
-
+            if (!trackers.size) return;
             const evaluateNode = (node) => {
                 if (
                     t.isStringLiteral(node) ||
@@ -90,11 +91,17 @@ export const inlineArrayBuilder = {
                         }
                         const statement = path.findParent((p) => p.isStatement());
                         if (statement) {
+                            foundPaths += 1;
                             tracker.pathsToRemove.add(statement);
                         }
                     }
                 },
             });
+
+            if (!foundPaths) return;
+            console.log(` |-> Found ${trackers.size} target bindings.`);
+            console.log(`   |-> Discovered ${foundPaths} target paths.`);
+
             bodyPath.traverse({
                 MemberExpression(path) {
                     if (path.parentPath.isForInStatement({ left: path.node })) {
@@ -153,6 +160,7 @@ export const inlineArrayBuilder = {
             });
 
             if (hasChanges) {
+                let removedPaths = 0;
                 for (const tracker of trackers.values()) {
                     const sortedPaths = Array.from(tracker.pathsToRemove).sort(
                         (a, b) => b.key - a.key
@@ -160,6 +168,7 @@ export const inlineArrayBuilder = {
                     for (const p of sortedPaths) {
                         if (p && !p.removed) {
                             p.remove();
+                            removedPaths += 1;
                         }
                     }
                 }
@@ -172,8 +181,13 @@ export const inlineArrayBuilder = {
                         binding.path.isVariableDeclarator()
                     ) {
                         binding.path.remove();
+                        removedPaths += 1;
                     }
                 }
+
+                console.log(`   |-> Removed ${removedPaths} related paths.`);
+            } else {
+                console.warn('  |-> No modified paths!');
             }
         },
     },

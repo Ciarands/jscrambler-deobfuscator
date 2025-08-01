@@ -106,11 +106,11 @@ export const controlFlowUnflattener = {
             console.log(
                 ` |-> Found cyclical array generator. Base object: "${baseIdentifierCode}", Property: "${propertyName}"`
             );
-            console.log(` |->   - Arguments: size=${arg1}, offset=${arg2}, key=[${arg3}]`);
+            console.log(`   |-> Arguments: size=${arg1}, offset=${arg2}, key=[${arg3}]`);
 
             const realArray = generateCyclicalArray(arg1, arg2, arg3);
             generatedArraysMap.set(fullKey, realArray);
-            console.log(` |->   - In-memory array generated and stored for key: "${fullKey}"`);
+            console.log(`   |-> In-memory array generated and stored for key: "${fullKey}"`);
 
             const parentStatement = path.findParent((p) => p.isStatement());
             if (parentStatement) {
@@ -250,11 +250,11 @@ export const controlFlowUnflattener = {
                 }
 
                 if (initialStateInfo === null) {
-                    console.log(' |-> Could not determine initial state.');
+                    console.log('   |-> Could not determine initial state.');
                     return;
                 }
                 const initialId = initialStateInfo.id;
-                console.log(` |-> Initial state: ${initialStateInfo.raw}`);
+                console.log(`   |-> Initial state: ${initialStateInfo.raw}`);
 
                 const caseMap = new Map();
                 for (const switchCase of switchStatement.cases) {
@@ -266,7 +266,7 @@ export const controlFlowUnflattener = {
                     );
                     caseMap.set(caseInfo.id, caseBody);
                 }
-                console.log(` |-> Found ${caseMap.size} switch cases`);
+                console.log(`   |-> Found ${caseMap.size} switch cases`);
 
                 function getStateUpdateRhs(body) {
                     const lastStmt = body.length > 0 ? body[body.length - 1] : null;
@@ -476,7 +476,7 @@ export const controlFlowUnflattener = {
                     }
                     newNodes.push(...unflattenedBody);
                     console.log(
-                        ` |-> Successfully unflattened state machine. Generated ${newNodes.length} nodes.`
+                        `   |-> Successfully unflattened state machine. Generated ${newNodes.length} nodes.`
                     );
                     path.replaceWithMultiple(newNodes);
                     if (initializerPath && !inLoopInitializer) {
@@ -495,7 +495,7 @@ export const controlFlowUnflattener = {
                         }
                     }
                 } else {
-                    console.log(' |-> Failed to unflatten state machine. Reverting changes.');
+                    console.warn('   |-> Failed to unflatten state machine. Reverting changes.');
                 }
             },
         },
