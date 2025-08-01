@@ -122,7 +122,7 @@ export const inlineArrayBuilder = {
                                     return;
                                 }
                                 const replacementNode = valueToNode(constValue);
-                                if (replacementNode) {
+                                if (replacementNode && !t.isNullLiteral(replacementNode)) {
                                     path.replaceWith(replacementNode);
                                     hasChanges = true;
                                     return;
@@ -149,7 +149,7 @@ export const inlineArrayBuilder = {
                                     return;
                                 }
                                 const replacementNode = valueToNode(constValue);
-                                if (replacementNode) {
+                                if (replacementNode && !t.isNullLiteral(replacementNode)) {
                                     path.get('property').replaceWith(replacementNode);
                                     hasChanges = true;
                                 }
