@@ -1,19 +1,8 @@
 import * as t from '@babel/types';
 
-export const normalize = {
+export const prepare = {
     priority: 0,
     visitor: {
-        StringLiteral(path) {
-            const { extra } = path.node;
-
-            if (extra && extra.raw) {
-                const standardRepresentation = `'${path.node.value}'`;
-                if (extra.raw !== standardRepresentation) {
-                    path.replaceWith(t.stringLiteral(path.node.value));
-                }
-            }
-        },
-
         AssignmentExpression(path) {
             const { left, right } = path.node;
             if (!t.isMemberExpression(left) || !t.isIdentifier(left.object)) return;
@@ -22,8 +11,9 @@ export const normalize = {
             if (!t.isFunctionExpression(callee) && !t.isArrowFunctionExpression(callee)) return;
 
             console.log(
-                ` |-> Found candidate AssignmentExpression "${left.object.name}", attempting to validate and retrieve global getter obj`
+                ` |-> Found candidate AssignmentExpression for "${left.object.name}", attempting to validate and retrieve global getter obj`
             );
+
             let isGlobalGetter = false;
             path.get('right.callee').traverse({
                 CallExpression(callPath) {
@@ -65,6 +55,7 @@ export const normalize = {
                     }
                 },
             });
+
             if (!isGlobalGetter) return;
             const proxyIdentifier = left.object;
             const proxyName = proxyIdentifier.name;
@@ -73,8 +64,12 @@ export const normalize = {
             console.log(` |-> Found global object proxy: '${proxyName}' (via ${callee.type}).`);
 
             const programPath = path.scope.getProgramParent().path;
-            const binding = programPath.scope.getBinding(proxyName);
-            if (!binding) return;
+            const binding = path.scope.getBinding(proxyName);
+
+            if (!binding) {
+                console.warn(` |-> Could not find binding for proxy '${proxyName}'. Skipping.`);
+                return;
+            }
 
             if (!programPath.node.injectedGlobal) {
                 const globalIdentifier = programPath.scope.generateUidIdentifier('global');
@@ -87,9 +82,11 @@ export const normalize = {
                 programPath.node.injectedGlobal = globalIdentifier;
                 console.log(` |-> Injected global variable: ${globalIdentifier.name}`);
             }
-            const globalIdentifier = programPath.node.injectedGlobal;
 
+            const globalIdentifier = programPath.node.injectedGlobal;
             const refs = binding.referencePaths;
+            console.log(` |-> Found ${refs.length} references to '${proxyName}'.`);
+
             for (let i = refs.length - 1; i >= 0; i--) {
                 const refPath = refs[i];
                 const parentMemberExpr = refPath.parentPath;
@@ -106,12 +103,10 @@ export const normalize = {
                     refPath.replaceWith(globalIdentifier);
                 }
             }
-            console.log(
-                ` |-> Replaced all ${refs.length} references to '${proxyName}' and its alias.`
-            );
+            console.log(` |-> Replaced all references to '${proxyName}' and its specific alias.`);
             if (binding.path.isVariableDeclarator()) {
                 binding.path.remove();
-                console.log(` |-> Removed original proxy declaration.`);
+                console.log(` |-> Removed original proxy declaration for '${proxyName}'.`);
             }
 
             if (path.parentPath.isSequenceExpression()) {
@@ -121,7 +116,6 @@ export const normalize = {
                 path.parentPath.remove();
                 console.log(` |-> Removed redundant ExpressionStatement.`);
             } else {
-                // in a structure we don't recognise
                 console.warn(
                     ` |-> Assignment found in an unexpected parent container: ${path.parentPath.type}. Cleanup skipped.`
                 );
