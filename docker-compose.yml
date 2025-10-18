@@ -1,0 +1,28 @@
+version: '3.8' 
+
+services:
+  jscrambler-deobfuscator:
+    build: .
+    container_name: jscrambler-deobfuscator
+    volumes:
+      - ./samples:/app/input:ro
+      - ./output:/app/output
+      - ./src:/app/src:ro
+    environment:
+      - NODE_ENV=production
+    command: ["/app/input", "-o", "/app/output", "-v"]
+    
+  jscrambler-deobfuscator-dev:
+    build: .
+    container_name: jscrambler-deobfuscator-dev
+    volumes:
+      - ./samples:/app/input:ro
+      - ./output:/app/output
+      - ./src:/app/src
+      - ./tsconfig.json:/app/tsconfig.json
+      - ./package.json:/app/package.json
+    environment:
+      - NODE_ENV=development
+    command: ["npx", "ts-node", "--esm", "src/cli.ts", "/app/input", "-o", "/app/output", "-v"]
+    profiles:
+      - dev
