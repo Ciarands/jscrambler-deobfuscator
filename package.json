@@ -16,7 +16,14 @@
     "test:coverage": "jest --config jest.config.cjs --coverage",
     "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\""
   },
-  "keywords": [],
+  "keywords": [
+    "javascript",
+    "deobfuscation",
+    "ast",
+    "babel",
+    "jscrambler",
+    "reverse-engineering"
+  ],
   "author": "Ciarands",
   "license": "ISC",
   "description": "",
