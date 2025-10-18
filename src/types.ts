@@ -3,22 +3,14 @@ import type { File } from "@babel/types";
 
 export enum TransformerPriority {
     PREPARE = 0,
-    SETUP_FUNCTIONS = 10,
-    STRING_ARRAY_SOLVER = 100,
-    STATE_MACHINE_SOLVER = 200,
-    ARRAY_BUILDER = 300,
-    INLINE_STRING_ARRAY = 400,
-    INLINE_WRAPPER_FUNCTIONS = 500,
-    INLINE_SETUP_FUNCTIONS = 600,
-    CONTROL_FLOW_UNFLATTENER = 700,
-    FINAL = 1000,
+    CONTROL_FLOW_UNFLATTENER = 100,
 }
 
 export interface Transformer {
     readonly name: string;
     readonly description: string;
     readonly priority: TransformerPriority;
-    readonly visitor: Visitor<File>;
+    readonly visitor: Visitor<any>; // extend File later, we'll pass some stuff like logger too so cant use File type rn
 }
 
 export interface TransformResult<T> {
@@ -54,10 +46,11 @@ export interface BatchProcessingResult {
     readonly results: readonly FileProcessingResult[];
 }
 
-export type LogLevel = "silent" | "error" | "info" | "debug";
+export type LogLevel = "silent" | "error" | "warn" | "info" | "debug";
 
 export interface Logger {
     readonly error: (message: string, ...args: any[]) => void;
+    readonly warn: (message: string, ...args: any[]) => void;
     readonly info: (message: string, ...args: any[]) => void;
     readonly debug: (message: string, ...args: any[]) => void;
 }

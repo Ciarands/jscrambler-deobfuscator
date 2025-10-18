@@ -53,7 +53,7 @@ export const applyTransformer = (ast: File, transformer: Transformer, logger: Lo
         if (transformer.description) {
             logger.debug(`  ${transformer.description}`);
         }
-        traverse(ast as any, transformer.visitor as any);
+        traverse(ast, transformer.visitor, undefined, { logger });
         return { success: true, data: ast };
     } catch (error) {
         return {

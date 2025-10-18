@@ -4,8 +4,9 @@ export const createLogger = (level: LogLevel = "info"): Logger => {
     const levels: Record<LogLevel, number> = {
         silent: 0,
         error: 1,
-        info: 2,
-        debug: 3,
+        warn: 2,
+        info: 3,
+        debug: 4,
     };
 
     const currentLevel = levels[level];
@@ -14,6 +15,11 @@ export const createLogger = (level: LogLevel = "info"): Logger => {
         error: (message: string, ...args: any[]) => {
             if (currentLevel >= levels.error) {
                 console.error(message, ...args);
+            }
+        },
+        warn: (message: string, ...args: any[]) => {
+            if (currentLevel >= levels.warn) {
+                console.warn(message, ...args);
             }
         },
         info: (message: string, ...args: any[]) => {
