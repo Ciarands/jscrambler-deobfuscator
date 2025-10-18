@@ -9,7 +9,7 @@
   "scripts": {
     "build": "tsc && npm run copy-transformers",
     "copy-transformers": "npx cpx2 \"src/transformers/**/*\" dist/transformers",
-    "dev": "tsx src/cli.ts",
+    "dev": "tsx src/cli.ts -v --debug",
     "start": "node dist/cli.js",
     "test": "jest --config jest.config.cjs",
     "test:watch": "jest --config jest.config.cjs --watch",
