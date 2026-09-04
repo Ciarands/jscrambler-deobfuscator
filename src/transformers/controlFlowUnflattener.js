@@ -450,7 +450,9 @@ export const controlFlowUnflattener = {
                                     test,
                                     t.blockStatement(trueBranchBody),
                                     falseBranchBody.length > 0
-                                        ? t.blockStatement(falseBranchBody)
+                                        ? falseBranchBody.length === 1 && t.isIfStatement(falseBranchBody[0])
+                                            ? falseBranchBody[0]
+                                            : t.blockStatement(falseBranchBody)
                                         : null
                                 );
                                 result = [...processedBody, ifStatement];
