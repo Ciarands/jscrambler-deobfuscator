@@ -332,13 +332,66 @@ export const controlFlowUnflattener = {
                     return false;
                 }
 
+                function getSuccessorIds(id, recursionStack) {
+                    if (id === terminalId) return [];
+                    if (recursionStack && recursionStack.has(id)) return [];
+                    const body = caseMap.get(id);
+                    if (!body) return [];
+                    const stateUpdateRhs = getStateUpdateRhs(body);
+                    if (!stateUpdateRhs) return [];
+                    const info = resolveAndGetStateId(stateUpdateRhs);
+                    if (info.id !== null) return [info.id];
+                    const result = [];
+                    if (t.isConditionalExpression(stateUpdateRhs)) {
+                        const consequent = resolveAndGetStateId(stateUpdateRhs.consequent);
+                        const alternate = resolveAndGetStateId(stateUpdateRhs.alternate);
+                        if (consequent.id !== null) result.push(consequent.id);
+                        if (alternate.id !== null) result.push(alternate.id);
+                    }
+                    return result;
+                }
+
+                function findMergePoint(caseA, caseB, recursionStack) {
+                    if (caseA === caseB) return caseA;
+                    const visitedA = new Set([caseA]);
+                    const visitedB = new Set([caseB]);
+                    let queueA = [caseA];
+                    let queueB = [caseB];
+                    const maxSteps = caseMap.size + 2;
+                    function expandSearch(queue, visited, otherVisited) {
+                        const nextQueue = [];
+                        for (const id of queue) {
+                            for (const successorId of getSuccessorIds(id, recursionStack)) {
+                                if (otherVisited.has(successorId)) return { found: successorId };
+                                if (!visited.has(successorId)) {
+                                    visited.add(successorId);
+                                    nextQueue.push(successorId);
+                                }
+                            }
+                        }
+                        return { queue: nextQueue };
+                    }
+                    for (let step = 1; step <= maxSteps && (queueA.length || queueB.length); step++) {
+                        const resultA = expandSearch(queueA, visitedA, visitedB);
+                        if ('found' in resultA) return resultA.found;
+                        queueA = resultA.queue;
+                        const resultB = expandSearch(queueB, visitedB, visitedA);
+                        if ('found' in resultB) return resultB.found;
+                        queueB = resultB.queue;
+                    }
+                    return null;
+                }
+
                 let success = true;
                 const hoistedVars = new Set();
                 const memo = new Map();
 
-                function unflatten(currentId, recursionStack) {
+                function unflatten(currentId, recursionStack, stopId = null) {
                     if (currentId === terminalId) return [];
-                    if (memo.has(currentId)) return memo.get(currentId);
+                    if (stopId !== null && currentId === stopId) return [];
+                    if (memo.has(currentId) && memo.get(currentId).has(stopId)) {
+                        return memo.get(currentId).get(stopId);
+                    }
                     if (recursionStack.has(currentId)) {
                         return [];
                     }
@@ -354,7 +407,8 @@ export const controlFlowUnflattener = {
 
                     if (t.isReturnStatement(lastStmtInCase)) {
                         const result = processVarDeclarations(caseBody, hoistedVars);
-                        memo.set(currentId, result);
+                        if (!memo.has(currentId)) memo.set(currentId, new Map());
+                        memo.get(currentId).set(stopId, result);
                         return result;
                     }
                     let stateUpdateRhs = getStateUpdateRhs(caseBody);
@@ -389,7 +443,7 @@ export const controlFlowUnflattener = {
 
                     const nextStateInfo = resolveAndGetStateId(stateUpdateRhs);
                     if (nextStateInfo.id !== null) {
-                        const nextBlock = unflatten(nextStateInfo.id, newRecursionStack);
+                        const nextBlock = unflatten(nextStateInfo.id, newRecursionStack, stopId);
                         if (!success) return null;
                         result = [...processedBody, ...nextBlock];
                     } else if (t.isConditionalExpression(stateUpdateRhs)) {
@@ -404,14 +458,14 @@ export const controlFlowUnflattener = {
                         if (trueBranchInfo.id === currentId) {
                             const loopBody = t.blockStatement(processedBody);
                             const doWhileLoop = t.doWhileStatement(test, loopBody);
-                            const afterLoopBody = unflatten(falseBranchInfo.id, newRecursionStack);
+                            const afterLoopBody = unflatten(falseBranchInfo.id, newRecursionStack, stopId);
                             if (!success) return null;
                             result = [doWhileLoop, ...afterLoopBody];
                         } else if (falseBranchInfo.id === currentId) {
                             const loopBody = t.blockStatement(processedBody);
                             const negatedTest = t.unaryExpression('!', test, true);
                             const doWhileLoop = t.doWhileStatement(negatedTest, loopBody);
-                            const afterLoopBody = unflatten(trueBranchInfo.id, newRecursionStack);
+                            const afterLoopBody = unflatten(trueBranchInfo.id, newRecursionStack, stopId);
                             if (!success) return null;
                             result = [doWhileLoop, ...afterLoopBody];
                         } else {
@@ -423,12 +477,14 @@ export const controlFlowUnflattener = {
                             if (isWhileLoop) {
                                 const loopBodyNodes = unflatten(
                                     trueBranchInfo.id,
-                                    newRecursionStack
+                                    newRecursionStack,
+                                    stopId
                                 );
                                 if (!success) return null;
                                 const afterLoopNodes = unflatten(
                                     falseBranchInfo.id,
-                                    newRecursionStack
+                                    newRecursionStack,
+                                    stopId
                                 );
                                 if (!success) return null;
                                 const whileLoop = t.whileStatement(
@@ -437,13 +493,21 @@ export const controlFlowUnflattener = {
                                 );
                                 result = [...processedBody, whileLoop, ...afterLoopNodes];
                             } else {
+                                const joinId = findMergePoint(
+                                    trueBranchInfo.id,
+                                    falseBranchInfo.id,
+                                    recursionStack
+                                );
+                                const branchStopId = joinId !== null ? joinId : stopId;
                                 const trueBranchBody = unflatten(
                                     trueBranchInfo.id,
-                                    newRecursionStack
+                                    newRecursionStack,
+                                    branchStopId
                                 );
                                 const falseBranchBody = unflatten(
                                     falseBranchInfo.id,
-                                    newRecursionStack
+                                    newRecursionStack,
+                                    branchStopId
                                 );
                                 if (!success) return null;
                                 const ifStatement = t.ifStatement(
@@ -453,18 +517,24 @@ export const controlFlowUnflattener = {
                                         ? t.blockStatement(falseBranchBody)
                                         : null
                                 );
-                                result = [...processedBody, ifStatement];
+                                const tailNodes =
+                                    joinId !== null
+                                        ? unflatten(joinId, newRecursionStack, stopId)
+                                        : [];
+                                if (!success) return null;
+                                result = [...processedBody, ifStatement, ...tailNodes];
                             }
                         }
                     } else {
                         success = false;
                         return null;
                     }
-                    memo.set(currentId, result);
+                    if (!memo.has(currentId)) memo.set(currentId, new Map());
+                    memo.get(currentId).set(stopId, result);
                     return result;
                 }
 
-                const unflattenedBody = unflatten(initialId, new Set());
+                const unflattenedBody = unflatten(initialId, new Set(), null);
 
                 if (success && unflattenedBody) {
                     const newNodes = [];
