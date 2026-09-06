@@ -387,6 +387,33 @@ export const controlFlowUnflattener = {
                         return null;
                     }
 
+                    function distributeMemberOverConditional(node) {
+                        const indices = [];
+                        let cur = node;
+                        while (
+                            t.isMemberExpression(cur) &&
+                            cur.computed &&
+                            t.isNumericLiteral(cur.property)
+                        ) {
+                            indices.unshift(cur.property);
+                            cur = cur.object;
+                        }
+                        if (!t.isConditionalExpression(cur)) return node;
+
+                        const applyIndices = (branch) =>
+                            indices.reduce((acc, idx) => t.memberExpression(acc, idx, true), branch);
+
+                        return t.conditionalExpression(
+                            cur.test,
+                            applyIndices(cur.consequent),
+                            applyIndices(cur.alternate)
+                        );
+                    }
+
+                    stateUpdateRhs = t.isMemberExpression(stateUpdateRhs)
+                            ? distributeMemberOverConditional(stateUpdateRhs)
+                            : stateUpdateRhs;
+
                     const nextStateInfo = resolveAndGetStateId(stateUpdateRhs);
                     if (nextStateInfo.id !== null) {
                         const nextBlock = unflatten(nextStateInfo.id, newRecursionStack);
