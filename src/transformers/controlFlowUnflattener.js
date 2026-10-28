@@ -351,33 +351,58 @@ export const controlFlowUnflattener = {
                     return result;
                 }
 
-                function findMergePoint(caseA, caseB, recursionStack) {
-                    if (caseA === caseB) return caseA;
-                    const visitedA = new Set([caseA]);
-                    const visitedB = new Set([caseB]);
-                    let queueA = [caseA];
-                    let queueB = [caseB];
-                    const maxSteps = caseMap.size + 2;
-                    function expandSearch(queue, visited, otherVisited) {
-                        const nextQueue = [];
-                        for (const id of queue) {
-                            for (const successorId of getSuccessorIds(id, recursionStack)) {
-                                if (otherVisited.has(successorId)) return { found: successorId };
-                                if (!visited.has(successorId)) {
-                                    visited.add(successorId);
-                                    nextQueue.push(successorId);
-                                }
+                function reachableInBfsOrder(start, recursionStack) {
+                    const order = [start];
+                    const seen = new Set(order);
+                    for (let i = 0; i < order.length; i++) {
+                        for (const next of getSuccessorIds(order[i], recursionStack)) {
+                            if (!seen.has(next)) {
+                                seen.add(next);
+                                order.push(next);
                             }
                         }
-                        return { queue: nextQueue };
                     }
-                    for (let step = 1; step <= maxSteps && (queueA.length || queueB.length); step++) {
-                        const resultA = expandSearch(queueA, visitedA, visitedB);
-                        if ('found' in resultA) return resultA.found;
-                        queueA = resultA.queue;
-                        const resultB = expandSearch(queueB, visitedB, visitedA);
-                        if ('found' in resultB) return resultB.found;
-                        queueB = resultB.queue;
+                    return order;
+                }
+
+                function endsInReturn(id) {
+                    const body = caseMap.get(id);
+                    return !!body && body.length > 0 && t.isReturnStatement(body[body.length - 1]);
+                }
+
+                // Every path from startId must hit candidateId before it can fall through
+                // past the if. Return cases leave the function, so they never fall through;
+                // the terminal state and back-edges (recursionStack) do.
+                function postDominates(candidateId, startId, recursionStack) {
+                    const seen = new Set();
+                    const stack = [startId];
+                    while (stack.length) {
+                        const id = stack.pop();
+                        if (id === candidateId || seen.has(id)) continue;
+                        seen.add(id);
+                        const successors = getSuccessorIds(id, recursionStack);
+                        if (successors.length === 0) {
+                            if (id === terminalId || recursionStack.has(id) || !endsInReturn(id)) {
+                                return false;
+                            }
+                            continue;
+                        }
+                        stack.push(...successors);
+                    }
+                    return true;
+                }
+
+                function findMergePoint(caseA, caseB, recursionStack) {
+                    if (caseA === caseB) return caseA;
+                    const reachableFromB = new Set(reachableInBfsOrder(caseB, recursionStack));
+                    for (const id of reachableInBfsOrder(caseA, recursionStack)) {
+                        if (
+                            reachableFromB.has(id) &&
+                            postDominates(id, caseA, recursionStack) &&
+                            postDominates(id, caseB, recursionStack)
+                        ) {
+                            return id;
+                        }
                     }
                     return null;
                 }
@@ -478,7 +503,7 @@ export const controlFlowUnflattener = {
                                 const loopBodyNodes = unflatten(
                                     trueBranchInfo.id,
                                     newRecursionStack,
-                                    stopId
+                                    null
                                 );
                                 if (!success) return null;
                                 const afterLoopNodes = unflatten(
