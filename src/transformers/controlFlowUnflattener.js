@@ -268,7 +268,35 @@ export const controlFlowUnflattener = {
                 }
                 console.log(`   |-> Found ${caseMap.size} switch cases`);
 
+                function distributeMemberOverConditional(node) {
+                    const indices = [];
+                    let cur = node;
+                    while (
+                        t.isMemberExpression(cur) &&
+                        cur.computed &&
+                        t.isNumericLiteral(cur.property)
+                    ) {
+                        indices.unshift(cur.property);
+                        cur = cur.object;
+                    }
+                    if (!t.isConditionalExpression(cur)) return node;
+
+                    const applyIndices = (branch) =>
+                        indices.reduce((acc, idx) => t.memberExpression(acc, idx, true), branch);
+
+                    return t.conditionalExpression(
+                        cur.test,
+                        applyIndices(cur.consequent),
+                        applyIndices(cur.alternate)
+                    );
+                }
+
                 function getStateUpdateRhs(body) {
+                    const rhs = findStateUpdateRhs(body);
+                    return t.isMemberExpression(rhs) ? distributeMemberOverConditional(rhs) : rhs;
+                }
+
+                function findStateUpdateRhs(body) {
                     const lastStmt = body.length > 0 ? body[body.length - 1] : null;
                     if (!lastStmt) return null;
                     if (t.isExpressionStatement(lastStmt)) {
