@@ -302,9 +302,10 @@ export const controlFlowUnflattener = {
                     return null;
                 }
 
-                function doesPathLeadTo(startId, targetId, visited) {
+                function doesPathLeadTo(startId, targetId, visited, recursionStack) {
                     if (startId === targetId) return true;
                     if (visited.has(startId) || startId === terminalId) return false;
+                    if (recursionStack && recursionStack.has(startId)) return false;
                     visited.add(startId);
                     const body = caseMap.get(startId);
                     if (!body) return false;
@@ -312,7 +313,7 @@ export const controlFlowUnflattener = {
                     if (!stateUpdateRhs) return false;
                     const nextStateInfo = resolveAndGetStateId(stateUpdateRhs);
                     if (nextStateInfo.id !== null) {
-                        return doesPathLeadTo(nextStateInfo.id, targetId, visited);
+                        return doesPathLeadTo(nextStateInfo.id, targetId, visited, recursionStack);
                     } else if (t.isConditionalExpression(stateUpdateRhs)) {
                         const consequentInfo = resolveAndGetStateId(stateUpdateRhs.consequent);
                         const alternateInfo = resolveAndGetStateId(stateUpdateRhs.alternate);
@@ -320,12 +321,14 @@ export const controlFlowUnflattener = {
                         const consequentPath = doesPathLeadTo(
                             consequentInfo.id,
                             targetId,
-                            new Set(visited)
+                            new Set(visited),
+                            recursionStack
                         );
                         const alternatePath = doesPathLeadTo(
                             alternateInfo.id,
                             targetId,
-                            new Set(visited)
+                            new Set(visited),
+                            recursionStack
                         );
                         return consequentPath || alternatePath;
                     }
@@ -418,7 +421,8 @@ export const controlFlowUnflattener = {
                             const isWhileLoop = doesPathLeadTo(
                                 trueBranchInfo.id,
                                 currentId,
-                                new Set()
+                                new Set(),
+                                recursionStack
                             );
                             if (isWhileLoop) {
                                 const loopBodyNodes = unflatten(
