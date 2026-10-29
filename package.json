@@ -25,7 +25,8 @@
         "lint": "oxlint",
         "test": "vitest run",
         "check": "npm run typecheck && npm run lint && npm run test",
-        "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\""
+        "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
+        "corpus": "tsx scripts/corpus.ts"
     },
     "keywords": [
         "javascript",
