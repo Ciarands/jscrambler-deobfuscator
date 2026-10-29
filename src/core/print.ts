@@ -115,11 +115,17 @@ const escapeCode = (code: number, next: number): string | undefined => {
     return code > 0xffff ? `\\u{${hex(code, 0)}}` : `\\u${hex(code, 4)}`;
 };
 
-/** A string's characters with `extra` (the quote, or what a template must escape) escaped. */
-const escapeText = (text: string, escapeExtra: (code: number, index: number) => string | undefined): string => {
+/**
+ * A string's characters with `extra` (the quote, or what a template must escape) escaped. `special` (global) matches
+ * every character `extra` or `escapeCode` may escape: printable ASCII other than those can't need it, so runs of it
+ * are copied as they are.
+ */
+const escapeText = (text: string, special: RegExp, escapeExtra: (code: number, index: number) => string | undefined): string => {
     let out = "";
     let from = 0;
-    for (let i = 0; i < text.length; i++) {
+    special.lastIndex = 0;
+    for (let match = special.exec(text); match !== null; match = special.exec(text)) {
+        const i = match.index;
         let code = text.charCodeAt(i);
         let width = 1;
         if (code >= 0xd800 && code <= 0xdbff) {
@@ -134,10 +140,15 @@ const escapeText = (text: string, escapeExtra: (code: number, index: number) => 
             out += text.slice(from, i) + escaped;
             from = i + width;
         }
-        i += width - 1;
+        special.lastIndex = i + width;
     }
     return out + text.slice(from);
 };
+
+/** What may need escaping in a string literal in double or single quotes, and in a template. */
+const DOUBLE_SPECIAL = /[^\x20-\x7e]|["\\]/g;
+const SINGLE_SPECIAL = /[^\x20-\x7e]|['\\]/g;
+const TEMPLATE_SPECIAL = /[^\x20-\x7e]|[`$\\]/g;
 
 /** A string literal, in the quotes that need fewer escapes (double when even). */
 export const quoteString = (value: string): string => {
@@ -145,12 +156,12 @@ export const quoteString = (value: string): string => {
     const quote = doubles > 0 && doubles > value.split("'").length - 1 ? "'" : '"';
     if (SIMPLE_STRING.test(value) && !value.includes(quote) && !value.includes("\\")) return quote + value + quote;
     const quoteCode = quote.charCodeAt(0);
-    return quote + escapeText(value, (code) => (code === quoteCode ? `\\${quote}` : undefined)) + quote;
+    return quote + escapeText(value, quote === '"' ? DOUBLE_SPECIAL : SINGLE_SPECIAL, (code) => (code === quoteCode ? `\\${quote}` : undefined)) + quote;
 };
 
 /** Raw template text whose cooked value is `cooked`: escapes backslashes, backticks, `${`, and invisible characters. */
 export const templateRaw = (cooked: string): string =>
-    escapeText(cooked, (code, index) => {
+    escapeText(cooked, TEMPLATE_SPECIAL, (code, index) => {
         if (code === 0x60) return "\\`";
         if (code === 0x24 && cooked.charCodeAt(index + 1) === 0x7b) return "\\$";
         if (code === 0x0a) return "\n"; // a line break reads better as itself, and cooks back to `\n`

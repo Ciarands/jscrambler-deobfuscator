@@ -30,8 +30,15 @@ const GLOBAL_CONSTANTS = new Map<string, Value>([
     ["Infinity", Number.POSITIVE_INFINITY],
 ]);
 
+/** A literal that makes a fresh object without running anything: `[]` / `[1, "a"]`, `{}`, a function. */
+const isInertObject = (node: Node): boolean =>
+    (node.type === "ArrayExpression" && node.elements.every((element) => element === null || element.type === "Literal")) ||
+    (node.type === "ObjectExpression" && node.properties.length === 0) ||
+    node.type === "FunctionExpression" ||
+    node.type === "ArrowFunctionExpression";
+
 /** JS binary operators on primitives. Values are always primitives here, so these can't run user code. */
-const binary = (operator: string, left: Value, right: Value): Evaluation => {
+export const binary = (operator: string, left: Value, right: Value): Evaluation => {
     // Primitives only: the casts below never reach valueOf/toString on an object.
     const l = left as number;
     const r = right as number;
@@ -114,6 +121,8 @@ export const evaluate = (node: Node, env: EvaluateEnv = {}): Evaluation => {
             }
             case "UnaryExpression": {
                 if (n.operator === "delete") return FAIL;
+                // `![]`, `!{}`, `!function () {}`: a fresh object, made without running anything, is truthy.
+                if (n.operator === "!" && isInertObject(n.argument)) return value(false);
                 const arg = visit(n.argument);
                 if (!arg.ok) return FAIL;
                 const v = arg.value as number; // primitive, see `binary`

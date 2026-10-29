@@ -2,7 +2,7 @@ import { analyze } from "eslint-scope";
 import type { Reference, Scope, ScopeManager, Variable } from "eslint-scope";
 import { visitorKeys } from "oxc-parser";
 import type { Node, Program } from "./ast.js";
-import { traverse } from "./traverse.js";
+import { forEachChild } from "./traverse.js";
 
 export type { Reference, Scope, Variable };
 
@@ -50,11 +50,11 @@ export class ScopeInfo {
      */
     refresh(program: Program): void {
         const attached = new Set<Node>();
-        traverse(program, {
-            Identifier: (path) => {
-                attached.add(path.node);
-            },
-        });
+        const collect = (node: Node): void => {
+            if (node.type === "Identifier") attached.add(node);
+            forEachChild(node, collect);
+        };
+        collect(program);
         const live = (reference: Reference): boolean => attached.has(reference.identifier as unknown as Node);
         for (const scope of this.manager.scopes) {
             scope.references = scope.references.filter(live);
