@@ -1,5 +1,6 @@
 import { parseSync } from "oxc-parser";
 import type { OxcError, Program } from "oxc-parser";
+import { SourceMap } from "./log.js";
 
 export class ParseError extends Error {
     /** Formatted code frames, one per parser error. These repeat the whole source line, which can be huge in minified input. */
@@ -12,19 +13,9 @@ export class ParseError extends Error {
     }
 }
 
-const location = (code: string, offset: number): string => {
-    let line = 1;
-    let lineStart = 0;
-    for (let i = code.indexOf("\n"); i !== -1 && i < offset; i = code.indexOf("\n", i + 1)) {
-        line += 1;
-        lineStart = i + 1;
-    }
-    return `${line}:${offset - lineStart + 1}`;
-};
-
-const describe = (code: string, error: OxcError): string => {
+const describe = (source: SourceMap, error: OxcError): string => {
     const start = error.labels[0]?.start;
-    return start === undefined ? error.message : `${error.message} (${location(code, start)})`;
+    return start === undefined ? error.message : `${error.message} (${source.location(start)})`;
 };
 
 /**
@@ -41,10 +32,11 @@ export const parse = (code: string, filename = "input.js"): Program => {
         preserveParens: false,
     });
     if (result.errors.length > 0) {
-        const details = result.errors.map((error) => describe(code, error)).join("; ");
+        const source = new SourceMap(code);
+        const details = result.errors.map((error) => describe(source, error)).join("; ");
         throw new ParseError(
             `Failed to parse ${filename}: ${details}`,
-            result.errors.map((error) => error.codeframe ?? error.message),
+            result.errors.map((error) => error.codeframe ?? error.message)
         );
     }
     return result.program;
