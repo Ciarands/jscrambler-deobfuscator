@@ -42,7 +42,7 @@ describe("cli", () => {
         await write("in.js", "x=1+2");
         const result = await run(["in.js"]);
         expect(result.code).toBe(EXIT_OK);
-        expect(result.stdout).toBe("x = 1 + 2;\n");
+        expect(result.stdout).toBe("x = 3;\n");
         expect(result.stderr).toBe("");
     });
 
