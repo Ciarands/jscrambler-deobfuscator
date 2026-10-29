@@ -37,6 +37,7 @@
         "reverse-engineering"
     ],
     "dependencies": {
+        "eslint-scope": "9.1.2",
         "oxc-codegen": "0.156.0",
         "oxc-parser": "0.156.0"
     },
