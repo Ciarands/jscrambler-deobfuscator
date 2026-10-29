@@ -7,12 +7,12 @@ describe("deobfuscate", () => {
         const first = await deobfuscate(input);
         const second = await deobfuscate(first.code);
         expect(second.code).toBe(first.code);
-        expect(first.code).toContain("a[1] = function(x) {");
+        expect(first.code).toContain("a[1] = function (x) {");
     });
 
     it("parses scripts that are not valid modules", async () => {
         const { code } = await deobfuscate("with (o) { x = 1; }");
-        expect(code).toBe("with(o) {\n  x = 1;\n}\n");
+        expect(code).toBe("with (o) {\n  x = 1;\n}\n");
     });
 
     it("throws ParseError with a line and column", async () => {

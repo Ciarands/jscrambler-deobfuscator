@@ -1,0 +1,43 @@
+var s = ["a\nb", 'it\'s', "\u2028\u2029", "\x00\x7f", "\0" + "1", "😀", "\ud800", "</script>", "a\\b", "\u200b\ufeff\xa0"];
+var t = [`t${1}\`${"x"}\${`, `a\nb\r${2}`, tag`x\u{`];
+var r = [/a\/b[/]/gimsuy, /[\]\/]/v, /\u{1F600}/u];
+var n = [0.5, 1000000, 1e21, 1e-7, 0x1f, 0o17, 0b101, 1_000_000, 123n, 0xffn, 2 ** -1, (-1) ** 2, (-a) ** b, 5e-324, 1e999];
+var o = { "a": 1, "b-c": 2, "__proto__": null, ["__proto__"]: 1, __proto__: 2, 1: 2, "01": 4, get g() { return 1; }, set g(v) {}, async *m() { yield* x; }, [k]: 1, ...rest, async: 1, get: 2, a() {} };
+var p = { __proto__ };
+class C extends (a, B) { #p = 1; static #q; static { this.x = 1; } "constructor"() { super(); } ["constructor"]() {} get [k]() {} static async *m() { await 1; } #m() { return #p in this; } static = 1; get; set; accessor x = 1; }
+a?.b?.[c]?.(d); (a?.b).c; (a?.b)(); new (a?.b)(); a?.b.c(); (a?.b.c)();
+new (a())(); new (a.b())(); new (a().b)(); new a.b(); new (new a)(); new new a()(); new (a`x`)();
+(function () {})(); (() => {})(); (async () => {})(); (class {}); (function* () {}); (async function () {});
+({}).x; ({} = a); ({ a } = b); [a, , b = 1, ...c] = d; ({ a: { b } = {}, ...r } = o); [a, ,] = b;
+let x1 = (a, b) => ({ a }); let x2 = async function* () { for await (const z of w) {} }; let x3 = async x => x; let x4 = () => () => 1;
+let x5 = () => ({}).x; let x6 = () => (a, b); let x7 = (a = 1, { b }, [c], ...d) => 0;
+label: for (;;) { break label; }
+outer: { break outer; }
+if (a) b; else if (c) d; else { e; }
+if (a) { if (b) c; } else d;
+if (a) for (;;) if (b) c; else d;
+x = a ? b : c ? d : e; x = (a ? b : c) ? d : e; x = a ? (b, c) : d; x = (a, b); x = (a || b) ?? c; x = a ?? (b && c); x = (a ?? b) || c;
+x = a ** -b; x = - -a; x = +-a; x = - --a; x = + ++a; x = -(-1); x = a + +b; x = a - -b; x = a++ + ++b; x = a-- - --b; x = typeof typeof a; x = !(a in b);
+x = (a, b) ? c : d; x = a = b = c; x = (a = b) ? c : d; x = (await) ; x = a || (b = c); x = (a => a) || b; x = (yield) ;
+x = (1).toString(); x = 1.5.toFixed(); x = (1e3).x; x = 1e21.x; x = (-1).x; x = (0.5).x; x = a[1]; x = 1["x"];
+x = void 0; x = delete a.b; x = typeof (a + b); x = !(a = b); x = (a, b).c; x = (a + b).c; x = (a + b)(); x = (await_ = 1);
+for (var i = ("x" in o); i;) ; for (var j = (a in b) ? 1 : 2; ;) break; for (k = (a, b in c); ;) break; for (let m = () => { a in b; }; ;) break;
+for (var v in o) ; for (v of a) ; for ((async) of a) ; for ((let) in a) ; for ((let).x of a) ; for ([a, b] of c) ; for (var [a1, b1] = [1, 2]; ;) break;
+for (const z of (a, b)) ; for (var q in (a, b)) ;
+(let)[0] = 1; (let); let_ = 1;
+do x; while (y); do { x; } while (y);
+switch (a) { case 1: case 2: { b; } default: c; }
+try {} catch {} finally {}
+try { a; } catch ({ message }) { b; }
+with (o) { x = 1; }
+debugger;
+;
+function* g1() { yield; yield a, b; yield (a, b); yield* (a, b); x = yield a; }
+async function a1() { await (a, b); (await a)(); (await a).b; (await a) ** 2 === -((await a) ** 2); }
+x = function () { return new.target; };
+x = { "if": 1, "class": 2, 0.5: 3, 1e21: 4, [1 + 2]: 5 }.if;
+x = a ? function () {} : class {};
+x = f(...a, ...(b, c)); x = [...a, (b, c)]; x = { ...(a, b) };
+x = ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "cccccccccccccccccccccccccccccccccc", , "d", ,];
+l\u0065t: do { break l\u0065t; } while (false);
+for (var f = () => (a in b); ;) break; for (var g = () => () => (a in b); ;) break;
