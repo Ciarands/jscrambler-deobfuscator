@@ -9,6 +9,7 @@ import type { Logger, LogLevel } from "../logger.js";
 import { PIPELINE } from "../passes/index.js";
 import { passesOf, selectPasses, UnknownPassError } from "../pipeline/run.js";
 import type { PassSelection } from "../pipeline/run.js";
+import { dumpHooks } from "./dump.js";
 
 export const EXIT_OK = 0;
 export const EXIT_FAILED = 1;
@@ -35,8 +36,9 @@ Options:
       --skip <list>      Skip these passes (comma-separated)
       --list-passes      Print the available passes and exit
       --report <file>    Write a JSON report to <file>
+      --dump-dir <dir>   Write the code after every pass to <dir>/<input name>/NN-<pass>.js
   -q, --quiet            Only print errors
-  -v, --verbose          Print debug output, including parse error code frames
+  -v, --verbose          Print what each pass did; repeat (-vv) for every decision, with source locations
   -h, --help             Print this help and exit
       --version          Print the version and exit
 
@@ -118,8 +120,9 @@ export const runCli = async (argv: readonly string[], env: CliEnv): Promise<numb
                 skip: { type: "string" },
                 "list-passes": { type: "boolean" },
                 report: { type: "string" },
+                "dump-dir": { type: "string" },
                 quiet: { type: "boolean", short: "q" },
-                verbose: { type: "boolean", short: "v" },
+                verbose: { type: "boolean", short: "v", multiple: true },
                 help: { type: "boolean", short: "h" },
                 version: { type: "boolean" },
             },
@@ -142,17 +145,20 @@ export const runCli = async (argv: readonly string[], env: CliEnv): Promise<numb
         return EXIT_OK;
     }
 
-    const level: LogLevel = values.quiet ? "error" : values.verbose ? "debug" : "info";
+    const verbosity = values.verbose?.length ?? 0;
+    const level: LogLevel = values.quiet ? "error" : verbosity >= 2 ? "debug" : verbosity === 1 ? "info" : "warn";
     const logger = createLogger(level, (line) => env.stderr(`${line}\n`));
     const selection: PassSelection = { passes: splitList(values.passes), skip: splitList(values.skip) };
 
     try {
-        if (values.quiet && values.verbose) throw new UsageError("--quiet and --verbose can't be used together");
+        if (values.quiet && verbosity > 0) throw new UsageError("--quiet and --verbose can't be used together");
         if (positionals.length > 1) throw new UsageError(`Expected at most one input, got ${positionals.length}`);
         selectPasses(PIPELINE, selection);
 
         const outputPath = values.output === undefined ? undefined : path.resolve(env.cwd, values.output);
-        const options = { force: values.force === true, outputPath, selection, logger, env };
+        const dumpDir = values["dump-dir"] === undefined ? undefined : path.resolve(env.cwd, values["dump-dir"]);
+        const progress = values.quiet ? () => {} : (line: string) => env.stderr(`${line}\n`);
+        const options: RunOptions = { force: values.force === true, outputPath, dumpDir, selection, logger, progress, env };
         const input = positionals[0];
         const results = input === undefined ? await runStdin(options) : await runPath(path.resolve(env.cwd, input), options);
 
@@ -175,18 +181,22 @@ export const runCli = async (argv: readonly string[], env: CliEnv): Promise<numb
 interface RunOptions {
     readonly force: boolean;
     readonly outputPath: string | undefined;
+    readonly dumpDir: string | undefined;
     readonly selection: PassSelection;
     readonly logger: Logger;
+    /** Batch progress lines (one per file and a summary). Silent with --quiet. */
+    readonly progress: (line: string) => void;
     readonly env: CliEnv;
 }
 
 const display = (env: CliEnv, target: string): string => path.relative(env.cwd, target) || ".";
 
 /** Deobfuscate `code` and write it to `outputPath`, or stdout when there is none. */
-const runOne = async (code: string, label: string, filename: string, outputPath: string | undefined, run: RunOptions): Promise<FileResult> => {
+const runOne = async (code: string, label: string, name: string, outputPath: string | undefined, run: RunOptions): Promise<FileResult> => {
     const output = outputPath === undefined ? "<stdout>" : display(run.env, outputPath);
     try {
-        const result = await deobfuscate(code, { ...run.selection, filename, logger: run.logger });
+        const hooks = run.dumpDir === undefined ? {} : dumpHooks(path.join(run.dumpDir, name));
+        const result = await deobfuscate(code, { ...run.selection, ...hooks, filename: path.basename(name), logger: run.logger });
         if (outputPath === undefined) {
             run.env.stdout(result.code);
         } else {
@@ -213,7 +223,7 @@ const refuseOverwrite = async (targets: readonly string[], run: RunOptions): Pro
 const runStdin = async (run: RunOptions): Promise<FileResult[]> => {
     if (run.env.stdinIsTTY) throw new UsageError(`No input given and stdin is a terminal\n\n${USAGE}`);
     if (run.outputPath !== undefined) await refuseOverwrite([run.outputPath], run);
-    return [await runOne(await run.env.readStdin(), "<stdin>", "stdin.js", run.outputPath, run)];
+    return [await runOne(await run.env.readStdin(), "<stdin>", "stdin", run.outputPath, run)];
 };
 
 const runPath = async (inputPath: string, run: RunOptions): Promise<FileResult[]> => {
@@ -242,11 +252,11 @@ const runPath = async (inputPath: string, run: RunOptions): Promise<FileResult[]
     for (const [index, source] of sources.entries()) {
         const target = targets[index] ?? outputDir;
         const label = display(run.env, source);
-        const result = await runOne(await fs.readFile(source, "utf8"), label, path.basename(source), target, run);
-        if (result.ok) run.logger.info(`ok: ${label} -> ${result.output}`);
+        const result = await runOne(await fs.readFile(source, "utf8"), label, path.relative(inputPath, source), target, run);
+        if (result.ok) run.progress(`ok: ${label} -> ${result.output}`);
         results.push(result);
     }
     const failed = results.filter((result) => !result.ok).length;
-    run.logger.info(`${results.length} file(s): ${results.length - failed} ok, ${failed} failed`);
+    run.progress(`${results.length} file(s): ${results.length - failed} ok, ${failed} failed`);
     return results;
 };
