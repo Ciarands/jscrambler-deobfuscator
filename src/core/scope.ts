@@ -11,6 +11,15 @@ type EstreeNode = Parameters<ScopeManager["acquire"]>[0];
 const asEstree = (node: Node): EstreeNode => node as unknown as EstreeNode;
 
 /**
+ * Child keys eslint-scope needs beyond its own (estraverse 5.3's, ESTree up to ES2021). Node types estraverse doesn't
+ * know are walked by iteration (`fallback`), and eslint-scope handles classes, imports and exports itself, so the only
+ * JS shape it would walk short is `import(source, options)`: the options can hold references. Kept this small on
+ * purpose: esrecurse copies the merged keys into every visitor it creates, one per pattern, which made passing all
+ * of oxc's keys the slowest part of the analysis. (Known gap, as before: eslint-scope doesn't visit decorators.)
+ */
+export const SCOPE_CHILD_KEYS: Readonly<Record<string, readonly string[]>> = { ImportExpression: visitorKeys["ImportExpression"] ?? ["source", "options"] };
+
+/**
  * Scope analysis for one program, as it is right now.
  *
  * Any pass that changes bindings or references must ask for a fresh `ScopeInfo` afterwards (the pipeline does this).
@@ -25,7 +34,7 @@ export class ScopeInfo {
         this.manager = analyze(asEstree(program) as Parameters<typeof analyze>[0], {
             ecmaVersion: 2022,
             sourceType: program.sourceType === "module" ? "module" : "script",
-            childVisitorKeys: visitorKeys,
+            childVisitorKeys: SCOPE_CHILD_KEYS as Record<string, string[]>,
             fallback: "iteration",
         });
         for (const scope of this.manager.scopes) {
