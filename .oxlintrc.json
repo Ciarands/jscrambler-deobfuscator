@@ -4,5 +4,5 @@
         "correctness": "error",
         "suspicious": "warn"
     },
-    "ignorePatterns": ["dist"]
+    "ignorePatterns": ["dist", ".corpus"]
 }
