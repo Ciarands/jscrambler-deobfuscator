@@ -1,9 +1,10 @@
+import { SourceMap } from "./core/log.js";
 import { parse } from "./core/parse.js";
 import { print } from "./core/print.js";
 import { silentLogger } from "./logger.js";
 import type { Logger } from "./logger.js";
-import { ALL_PASSES } from "./passes/index.js";
-import { runPasses, selectPasses } from "./pipeline/run.js";
+import { PIPELINE } from "./passes/index.js";
+import { runPipeline, selectPasses } from "./pipeline/run.js";
 import type { PassReport, PassSelection } from "./pipeline/run.js";
 
 export interface DeobfuscateOptions extends PassSelection {
@@ -32,9 +33,9 @@ export interface DeobfuscateResult {
 export const deobfuscate = async (code: string, options: DeobfuscateOptions = {}): Promise<DeobfuscateResult> => {
     const start = performance.now();
     const logger = options.logger ?? silentLogger;
-    const passes = selectPasses(ALL_PASSES, options);
+    const steps = selectPasses(PIPELINE, options);
     const program = parse(code, options.filename);
-    const reports = runPasses(program, passes, logger);
+    const reports = await runPipeline(program, steps, { logger, source: new SourceMap(code) });
     return {
         code: print(program),
         report: { passes: reports, durationMs: performance.now() - start },

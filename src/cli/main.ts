@@ -6,8 +6,8 @@ import { deobfuscate } from "../deobfuscate.js";
 import type { DeobfuscateReport } from "../deobfuscate.js";
 import { createLogger } from "../logger.js";
 import type { Logger, LogLevel } from "../logger.js";
-import { ALL_PASSES } from "../passes/index.js";
-import { selectPasses, UnknownPassError } from "../pipeline/run.js";
+import { PIPELINE } from "../passes/index.js";
+import { passesOf, selectPasses, UnknownPassError } from "../pipeline/run.js";
 import type { PassSelection } from "../pipeline/run.js";
 
 export const EXIT_OK = 0;
@@ -138,7 +138,7 @@ export const runCli = async (argv: readonly string[], env: CliEnv): Promise<numb
         return EXIT_OK;
     }
     if (values["list-passes"]) {
-        for (const pass of ALL_PASSES) env.stdout(`${pass.name}\t${pass.description}\n`);
+        for (const pass of passesOf(PIPELINE)) env.stdout(`${pass.name}\t${pass.description}\n`);
         return EXIT_OK;
     }
 
@@ -149,7 +149,7 @@ export const runCli = async (argv: readonly string[], env: CliEnv): Promise<numb
     try {
         if (values.quiet && values.verbose) throw new UsageError("--quiet and --verbose can't be used together");
         if (positionals.length > 1) throw new UsageError(`Expected at most one input, got ${positionals.length}`);
-        selectPasses(ALL_PASSES, selection);
+        selectPasses(PIPELINE, selection);
 
         const outputPath = values.output === undefined ? undefined : path.resolve(env.cwd, values.output);
         const options = { force: values.force === true, outputPath, selection, logger, env };

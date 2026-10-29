@@ -1,4 +1,4 @@
-import type { Pass } from "../pipeline/pass.js";
+import type { PipelineStep } from "../pipeline/pass.js";
 
-/** Every pass, in run order. */
-export const ALL_PASSES: readonly Pass[] = [];
+/** The pipeline, in run order: passes and fixpoint groups of passes. */
+export const PIPELINE: readonly PipelineStep[] = [];

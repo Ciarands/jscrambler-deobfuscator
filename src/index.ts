@@ -3,7 +3,7 @@ export type { DeobfuscateOptions, DeobfuscateReport, DeobfuscateResult } from ".
 export { ParseError } from "./core/parse.js";
 export { UnknownPassError } from "./pipeline/run.js";
 export type { PassReport, PassSelection } from "./pipeline/run.js";
-export type { Pass, PassContext, PassResult } from "./pipeline/pass.js";
-export { ALL_PASSES } from "./passes/index.js";
+export type { FixpointGroup, Pass, PassContext, PassResult, PipelineStep } from "./pipeline/pass.js";
+export { PIPELINE } from "./passes/index.js";
 export { createLogger, silentLogger } from "./logger.js";
 export type { Logger, LogLevel } from "./logger.js";
