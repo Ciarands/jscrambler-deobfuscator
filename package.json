@@ -37,9 +37,11 @@
         "reverse-engineering"
     ],
     "dependencies": {
+        "@jitl/quickjs-wasmfile-release-sync": "0.32.0",
         "eslint-scope": "9.1.2",
         "oxc-codegen": "0.156.0",
-        "oxc-parser": "0.156.0"
+        "oxc-parser": "0.156.0",
+        "quickjs-emscripten-core": "0.32.0"
     },
     "devDependencies": {
         "@types/node": "^22.19.0",
