@@ -1,5 +1,6 @@
 *.deobfuscated.js
 /output/*
+/input/*
 
 # Logs
 logs
