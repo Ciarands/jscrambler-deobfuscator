@@ -24,6 +24,11 @@ export const DEFAULT_LIMITS: SandboxLimits = { memoryBytes: 256 * 1024 * 1024, s
 
 export type RunResult = { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly error: string; readonly timedOut: boolean };
 
+/** A guest object only the host holds (see `Sandbox.hold`): no name in the guest reaches it. */
+export interface Held {
+    readonly id: number;
+}
+
 let modulePromise: Promise<QuickJSWASMModule> | undefined;
 /** The variant package's typings describe its CommonJS shape (default nested once more); at runtime this is the variant. */
 const baseVariant = variantModule.default as unknown as QuickJSSyncVariant;
@@ -108,8 +113,10 @@ export class Sandbox {
     /** Guest transport functions: tagged JSON text to value, value to tagged JSON text. */
     readonly #decode: QuickJSHandle;
     readonly #encode: QuickJSHandle;
-    /** Guest functions `invoke` has looked up, by path. */
+    /** Guest functions `invoke` has looked up, by base and path. */
     readonly #functions = new Map<string, { fn: QuickJSHandle; owner: QuickJSHandle }>();
+    /** Objects `hold` keeps, by id. */
+    readonly #held = new Map<number, QuickJSHandle>();
     #deadline = 0;
     /** The interrupt handler stopped the current run (its deadline passed). */
     #interrupted = false;
@@ -205,16 +212,34 @@ export class Sandbox {
     }
 
     /**
-     * Call a guest function, found by property path from the global object (`["__jsd", "resolve"]`), with `payload`
-     * as its one argument. Nothing is compiled: the payload and the result cross as data (tagged JSON, so `undefined`,
-     * `NaN`, `-0` and NULs in strings survive). Guest functions are looked up once and kept.
+     * Evaluate `code`, an expression, and keep its value on the host side only: guest code finds it under no name, so
+     * helper objects installed this way can't collide with the program's names or show up among the globals.
      */
-    invoke(path: readonly string[], payload: unknown, timeoutMs = this.#limits.timeoutMs): RunResult {
+    hold(code: string, timeoutMs = this.#limits.timeoutMs): { readonly ok: true; readonly held: Held } | (RunResult & { readonly ok: false }) {
+        if (this.#broken !== undefined) return { ok: false, error: `sandbox aborted earlier: ${this.#broken}`, timedOut: false };
+        try {
+            this.#arm(timeoutMs);
+            const result = this.#context.evalCode(code, "sandbox.js", { type: "global" });
+            if (result.error !== undefined) return this.#failure(result.error, true) as RunResult & { readonly ok: false };
+            const held = { id: this.#held.size + 1 };
+            this.#held.set(held.id, result.value);
+            return { ok: true, held };
+        } catch (error) {
+            return this.#hostFailure(error) as RunResult & { readonly ok: false };
+        }
+    }
+
+    /**
+     * Call a guest function, found by property path from `base` (a held object) or else the global object, with
+     * `payload` as its one argument. Nothing is compiled: the payload and the result cross as data (tagged JSON, so
+     * `undefined`, `NaN`, `-0` and NULs in strings survive). Guest functions are looked up once and kept.
+     */
+    invoke(path: readonly string[], payload: unknown, timeoutMs = this.#limits.timeoutMs, base?: Held): RunResult {
         if (this.#broken !== undefined) return { ok: false, error: `sandbox aborted earlier: ${this.#broken}`, timedOut: false };
         const context = this.#context;
         try {
             this.#arm(timeoutMs);
-            const target = this.#lookup(path);
+            const target = this.#lookup(path, base);
             if (target === undefined) return { ok: false, error: `no guest function ${path.join(".")}`, timedOut: false };
             const text = context.newString(encode(payload));
             const argument = context.callFunction(this.#decode, context.undefined, text);
@@ -234,24 +259,28 @@ export class Sandbox {
         }
     }
 
-    #lookup(path: readonly string[]): { fn: QuickJSHandle; owner: QuickJSHandle } | undefined {
-        const key = path.join(".");
+    #lookup(path: readonly string[], base?: Held): { fn: QuickJSHandle; owner: QuickJSHandle } | undefined {
+        const key = `${base?.id ?? 0}:${path.join(".")}`;
         const cached = this.#functions.get(key);
         if (cached !== undefined) return cached;
         const context = this.#context;
-        let owner: QuickJSHandle = context.global;
+        const start = base === undefined ? context.global : this.#held.get(base.id);
+        if (start === undefined) return undefined;
+        /** Handles this lookup made (the start isn't one: the global object or a held object stays). */
+        const own = (handle: QuickJSHandle): boolean => handle !== start;
+        let owner: QuickJSHandle = start;
         for (const segment of path.slice(0, -1)) {
             const next = context.getProp(owner, segment);
-            if (owner !== context.global) owner.dispose();
+            if (own(owner)) owner.dispose();
             owner = next;
         }
         const fn = context.getProp(owner, path.at(-1) ?? "");
         if (context.typeof(fn) !== "function") {
             fn.dispose();
-            if (owner !== context.global) owner.dispose();
+            if (own(owner)) owner.dispose();
             return undefined;
         }
-        const entry = { fn, owner };
+        const entry = { fn, owner: own(owner) ? owner : start };
         this.#functions.set(key, entry);
         return entry;
     }
@@ -282,6 +311,8 @@ export class Sandbox {
                 if (owner !== this.#context.global && owner.alive) owner.dispose();
             }
             this.#functions.clear();
+            for (const handle of this.#held.values()) if (handle.alive) handle.dispose();
+            this.#held.clear();
             this.#quote.dispose();
             this.#decode.dispose();
             this.#encode.dispose();

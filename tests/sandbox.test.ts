@@ -40,6 +40,18 @@ describe("sandbox", () => {
         expect(sandbox.invoke(["missing", "fn"], null)).toMatchObject({ ok: false });
     });
 
+    it("calls functions of a held object, which no guest name reaches", () => {
+        const names = "Object.getOwnPropertyNames(globalThis).sort().join()";
+        const before = sandbox.run(names);
+        const held = sandbox.hold("({ inc: function (v) { return v + 1; } })");
+        if (!held.ok) throw new Error(held.error);
+        expect(sandbox.invoke(["inc"], 1, undefined, held.held)).toEqual({ ok: true, value: 2 });
+        expect(sandbox.run(names)).toEqual(before);
+        // A guest global of the same name is another thing.
+        sandbox.run("globalThis.inc = function () { return 0; };");
+        expect(sandbox.invoke(["inc"], 1, undefined, held.held)).toEqual({ ok: true, value: 2 });
+    });
+
     it("executes a statement for its effects even when its value can't be copied out", () => {
         const cyclic = "globalThis.table = (function () { var r = [[]]; r[0][0] = r; return r; })();";
         expect(sandbox.execute(cyclic)).toEqual({ ok: true, value: undefined });

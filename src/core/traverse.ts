@@ -156,17 +156,40 @@ export type Visitors = { [T in Node["type"]]?: VisitEntry<NodeOfType<T>> } & {
 /** Child slots (from `visitorKeys`) hold nodes or nothing. */
 const isNode = (value: unknown): value is Node => typeof value === "object" && value !== null && typeof (value as { type?: unknown }).type === "string";
 
+/**
+ * Per node type, a function reading its child slots in `visitorKeys` order, each slot written out by name: one
+ * property load per type and slot, which V8 specialises to the type's shape, where a loop over the keys has one load
+ * for every type and key (the walks over large programs spent most of their time there). A slot is read when its turn
+ * comes, after the slots before it were walked, as the loop did. `body` gives the code handling one slot's `value`.
+ */
+const compileSlots = <F>(params: readonly string[], body: (key: string) => string): Readonly<Record<string, F | undefined>> => {
+    const compiled: Record<string, F | undefined> = Object.create(null) as Record<string, F | undefined>;
+    for (const [type, keys] of Object.entries(visitorKeys)) {
+        if (keys.length === 0) continue;
+        const code = keys.map((key) => `{ const value = node[${JSON.stringify(key)}]; if (typeof value === "object" && value !== null) { ${body(JSON.stringify(key))} } }`).join("\n");
+        compiled[type] = new Function("node", ...params, code) as F;
+    }
+    return compiled;
+};
+
+/** Calls `fn` on each child node of `node` (see `forEachChild`). */
+const EACH_CHILD = compileSlots<(node: Node, fn: (child: Node) => void) => void>(
+    ["fn"],
+    () =>
+        'if (Array.isArray(value)) { for (let i = 0; i < value.length; i++) { const child = value[i]; if (typeof child === "object" && child !== null && typeof child.type === "string") fn(child); } } else if (typeof value.type === "string") fn(value);'
+);
+
+/** Hands each child slot of `node` to the walk: arrays to `list`, nodes to `one` (see `traverse`). */
+type ListSlot = (value: unknown[], parentPath: Path, key: string, depth: number) => void;
+type OneSlot = (value: Node, parentPath: Path, key: string, depth: number) => void;
+const WALK_SLOTS = compileSlots<(node: Node, parentPath: Path, depth: number, list: ListSlot, one: OneSlot) => void>(
+    ["parentPath", "depth", "list", "one"],
+    (key) => `if (Array.isArray(value)) list(value, parentPath, ${key}, depth); else if (typeof value.type === "string") one(value, parentPath, ${key}, depth);`
+);
+
 /** Call `fn` on each direct child node of `node`, in source order. */
 export const forEachChild = (node: Node, fn: (child: Node) => void): void => {
-    const container = fields(node);
-    for (const key of visitorKeys[node.type] ?? []) {
-        const value = container[key];
-        if (Array.isArray(value)) {
-            for (const child of value) if (isNode(child)) fn(child);
-        } else if (isNode(value)) {
-            fn(value);
-        }
-    }
+    EACH_CHILD[node.type]?.(node, fn);
 };
 
 /**
@@ -189,6 +212,15 @@ export const traverse = (root: Node, visitors: Visitors): void => {
         return created;
     };
 
+    const list: ListSlot = (value, parentPath, key, depth) => {
+        const cursor: Cursor = { index: 0 };
+        for (; cursor.index < value.length; cursor.index++) {
+            const child: unknown = value[cursor.index];
+            if (isNode(child)) visit(pathAt(depth + 1, child, parentPath, key, cursor), depth + 1);
+        }
+    };
+    const one: OneSlot = (value, parentPath, key, depth) => visit(pathAt(depth + 1, value, parentPath, key, null), depth + 1);
+
     const visit = (path: Path, depth: number): void => {
         const entry = byType[path.node.type];
         const enter = typeof entry === "function" ? entry : entry?.enter;
@@ -198,22 +230,8 @@ export const traverse = (root: Node, visitors: Visitors): void => {
         if (!path.skipped) enter?.(path);
 
         if (!path.skipped) {
-            const node = fields(path.node);
-            const keys = visitorKeys[path.node.type];
-            if (keys !== undefined) {
-                for (const key of keys) {
-                    const value = node[key];
-                    if (Array.isArray(value)) {
-                        const cursor: Cursor = { index: 0 };
-                        for (; cursor.index < value.length; cursor.index++) {
-                            const child: unknown = value[cursor.index];
-                            if (isNode(child)) visit(pathAt(depth + 1, child, path, key, cursor), depth + 1);
-                        }
-                    } else if (isNode(value)) {
-                        visit(pathAt(depth + 1, value, path, key, null), depth + 1);
-                    }
-                }
-            }
+            const node = path.node;
+            WALK_SLOTS[node.type]?.(node, path, depth, list, one);
         }
 
         if (!path.removed) {
