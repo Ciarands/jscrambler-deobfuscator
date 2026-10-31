@@ -1,10 +1,11 @@
 import type { Statement } from "../../core/ast.js";
+import { isFunctionNode } from "../../core/ast.js";
 import { traverse } from "../../core/traverse.js";
 import type { Path } from "../../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../../pipeline/pass.js";
 import { UnminifyContext } from "./context.js";
 import { rewriteExpression } from "./expressions.js";
-import { expandStatements, mergeElseIf, rewriteStatement } from "./statements.js";
+import { expandStatements, mergeElseIf, removeDeclarators, rewriteStatement, unlabelStatements } from "./statements.js";
 
 /** Rewrites of one node in a row (each one step: `!(1 === x)` -> `1 !== x` -> `x !== 1`). More means a loop. */
 const MAX_STEPS = 16;
@@ -63,9 +64,11 @@ export const unminify: Pass = {
                 const node = path.node;
                 switch (node.type) {
                     case "Program":
-                    case "BlockStatement":
                     case "StaticBlock":
                         expandStatements(node.body as Statement[], context);
+                        return;
+                    case "BlockStatement":
+                        expandStatements(node.body, context, isFunctionNode(path.parent) && path.key === "body");
                         return;
                     case "SwitchCase":
                         expandStatements(node.consequent, context);
@@ -76,9 +79,14 @@ export const unminify: Pass = {
                 rewrite(path);
             },
             exit(path) {
-                mergeElseIf(path.node, context);
+                const node = path.node;
+                if (node.type === "Program" || node.type === "StaticBlock") unlabelStatements(node.body as Statement[], context);
+                else if (node.type === "BlockStatement") unlabelStatements(node.body, context, isFunctionNode(path.parent) && path.key === "body");
+                else if (node.type === "SwitchCase") unlabelStatements(node.consequent, context);
+                mergeElseIf(node, context);
             },
         });
+        if (context.unusedDeclarators.size > 0) removeDeclarators(program, context.unusedDeclarators);
 
         const stats = context.counts;
         const changed = Object.values(stats).reduce((sum, count) => sum + count, 0);

@@ -1,10 +1,24 @@
-import type { BlockStatement, Expression, ForStatement, IfStatement, LabeledStatement, Node, ObjectExpression, Statement, VariableDeclaration, VariableDeclarator } from "../../core/ast.js";
-import { isFunctionNode } from "../../core/ast.js";
+import type {
+    AssignmentExpression,
+    BlockStatement,
+    Expression,
+    ForStatement,
+    IfStatement,
+    LabeledStatement,
+    Node,
+    ObjectExpression,
+    Statement,
+    VariableDeclaration,
+    VariableDeclarator,
+} from "../../core/ast.js";
+import { isFunctionNode, isJump } from "../../core/ast.js";
 import { at } from "../../core/build.js";
+import { deadRemainder, isPlaceholder } from "../../core/hoisting.js";
 import { forEachChild, traverse } from "../../core/traverse.js";
 import type { Path } from "../../core/traverse.js";
 import type { UnminifyContext } from "./context.js";
-import { not, storedProperty } from "./expressions.js";
+import type { PlannedStore } from "./expressions.js";
+import { isPlainLiteral, not, plannedStore } from "./expressions.js";
 
 const block = (body: Statement[], origin: Node): BlockStatement => at<BlockStatement>({ type: "BlockStatement", body }, origin);
 const expressionStatement = (expression: Expression): Statement => at<Statement>({ type: "ExpressionStatement", expression }, expression);
@@ -72,12 +86,11 @@ const jumpsTo = (node: Node | null | undefined, label: string): boolean => {
     return found;
 };
 
-/** `if (c) { ...; break label; }` with no other jump to `label` in it. */
+/** `if (c) { ...; break label; }`: an `if` whose block ends by leaving `label`'s block. */
 const isBreakingIf = (statement: Statement, label: string): statement is IfStatement & { consequent: BlockStatement } => {
     if (statement.type !== "IfStatement" || statement.alternate !== null || statement.consequent.type !== "BlockStatement") return false;
-    const body = statement.consequent.body;
-    const last = body.at(-1);
-    return last?.type === "BreakStatement" && last.label?.name === label && !body.slice(0, -1).some((s) => jumpsTo(s, label)) && !jumpsTo(statement.test, label);
+    const last = statement.consequent.body.at(-1);
+    return last?.type === "BreakStatement" && last.label?.name === label;
 };
 
 /** Whether a statement declares a block-scoped name (`let`, `const`, `class`, or a function in a block). */
@@ -85,33 +98,148 @@ const isLexical = (statement: Statement): boolean =>
     (statement.type === "VariableDeclaration" && statement.kind !== "var") || statement.type === "ClassDeclaration" || statement.type === "FunctionDeclaration";
 
 /**
+ * A statement list that ends where `label`'s block ends, without its breaks to `label`: `if (c) { x; break label; }
+ * rest` -> `if (c) { x } else { rest }` (each break skips to the end of the block, which is what the `else` does; `x`
+ * too ends there, so its own breaks go the same way), also inside the last statement when it is an `if` (both
+ * branches end where the list does) or a block, and a last `break label;` dropped. `undefined` when another jump
+ * names the label, or a block-scoped declaration in `rest` would move into the `else`.
+ */
+const withoutTailBreaks = (list: readonly Statement[], label: string): Statement[] | undefined => {
+    for (const [i, statement] of list.entries()) {
+        const last = i === list.length - 1;
+        if (statement.type === "BreakStatement" && statement.label?.name === label) return last ? list.slice(0, i) : undefined;
+        if (isBreakingIf(statement, label)) {
+            const rest = list.slice(i + 1);
+            const alternate = rest.some(isLexical) ? undefined : withoutTailBreaks(rest, label);
+            const taken = withoutTailBreaks(statement.consequent.body.slice(0, -1), label);
+            if (alternate === undefined || taken === undefined) return undefined;
+            const consequent = block(taken, statement.consequent);
+            const otherwise = alternate.length === 0 ? null : block(alternate, rest[0] as Statement);
+            return [...list.slice(0, i), at<IfStatement>({ type: "IfStatement", test: statement.test, consequent, alternate: otherwise }, statement)];
+        }
+        if (!jumpsTo(statement, label)) continue;
+        if (!last) return undefined;
+        if (statement.type === "BlockStatement") {
+            const body = withoutTailBreaks(statement.body, label);
+            return body === undefined ? undefined : [...list.slice(0, i), block(body, statement)];
+        }
+        if (statement.type !== "IfStatement") return undefined;
+        const branch = (taken: Statement): Statement | undefined => {
+            const body = withoutTailBreaks(taken.type === "BlockStatement" ? taken.body : [taken], label);
+            // An `else if` stays one.
+            return body === undefined ? undefined : taken.type !== "BlockStatement" && body.length === 1 && body[0]?.type === "IfStatement" ? body[0] : block(body, taken);
+        };
+        const consequent = branch(statement.consequent);
+        const alternate = statement.alternate === null ? null : branch(statement.alternate);
+        if (consequent === undefined || alternate === undefined) return undefined;
+        return [...list.slice(0, i), at<IfStatement>({ type: "IfStatement", test: statement.test, consequent, alternate }, statement)];
+    }
+    return [...list];
+};
+
+/**
  * `label: { a; if (c1) { x; break label; } if (c2) { y; break label; } rest }` -> `a; if (c1) { x } else if (c2) { y }
- * else { rest }` (the unflattener's exits): each break skips to the end of the block, which is what
- * the `else` does, and no other jump names the label. Block-scoped declarations keep a block around the result.
+ * else { rest }` (the unflattener's exits), breaks nested in a last `if` too (`withoutTailBreaks`), when no other jump
+ * names the label. Block-scoped declarations keep a block around the result. First, when the block ends with a loop,
+ * the loop's own breaks to the label lose it (`plainJumps`): leaving the loop reaches the end of the block too.
  */
 const unlabelBlock = (statement: LabeledStatement, context: UnminifyContext): Statement[] | undefined => {
     if (statement.body.type !== "BlockStatement") return undefined;
     const label = statement.label.name;
-    const body = statement.body.body as Statement[];
-    const first = body.findIndex((s) => isBreakingIf(s, label));
-    if (first === -1) {
-        if (jumpsTo(statement.body, label)) return undefined;
-        context.did("labeledBlocks", statement);
-        return body.some(isLexical) ? [statement.body] : body;
-    }
-    let end = first;
-    while (end < body.length && isBreakingIf(body[end] as Statement, label)) end++;
-    const leading = body.slice(0, first);
-    const tail = body.slice(end);
-    if ([...leading, ...tail].some((s) => jumpsTo(s, label))) return undefined;
-    let chain: Statement | null = tail.length === 0 ? null : block(tail, tail[0] as Statement);
-    for (let i = end - 1; i >= first; i--) {
-        const branch = body[i] as IfStatement & { consequent: BlockStatement };
-        chain = at<IfStatement>({ type: "IfStatement", test: branch.test, consequent: block(branch.consequent.body.slice(0, -1), branch.consequent), alternate: chain }, branch);
-    }
+    const last = statement.body.body.at(-1);
+    if (last !== undefined && LOOPS.has(last.type)) for (const jump of plainJumps(last, label, "same") ?? []) (jump as Statement & { label: unknown }).label = null;
+    const body = withoutTailBreaks(statement.body.body, label);
+    if (body === undefined || body.some((s) => jumpsTo(s, label))) return undefined;
     context.did("labeledBlocks", statement);
-    const result = [...leading, chain as Statement];
-    return body.some(isLexical) ? [block(result, statement)] : result;
+    return body.some(isLexical) ? [block(body, statement)] : body;
+};
+
+/**
+ * `label: { ... break label; ... } jump;` -> its statements, each break a copy of `jump`: a `break`, `continue` or
+ * `return;` right after the block (or the end of the function the block ends: a `return;`, `finally` blocks run
+ * either way), which is where leaving it leads. An unlabeled `break`/`continue` copy needs each break outside any loop
+ * (and `switch`, for `break`) of the block, so that it reaches the same loop. Block-scoped declarations keep a block
+ * around the statements.
+ */
+const forwardBreaks = (statement: LabeledStatement, next: Statement | undefined, context: UnminifyContext): Statement[] | undefined => {
+    if (statement.body.type !== "BlockStatement" || next === undefined) return undefined;
+    const plainNext = (next.type === "BreakStatement" || next.type === "ContinueStatement") && next.label === null;
+    if (next.type !== "BreakStatement" && next.type !== "ContinueStatement" && !(next.type === "ReturnStatement" && next.argument === null)) return undefined;
+    const label = statement.label.name;
+    const breaks = plainNext ? plainJumps(statement.body, label, next.type) : allJumps(statement.body, label);
+    if (breaks === undefined) return undefined;
+    const copy = (origin: Node): Statement => {
+        if (next.type === "ReturnStatement") return at<Statement>({ type: "ReturnStatement", argument: null }, origin);
+        const target = next.label === null ? null : at<Node & { type: "Identifier" }>({ type: "Identifier", name: next.label.name }, origin);
+        return at<Statement>(next.type === "BreakStatement" ? { type: "BreakStatement", label: target } : { type: "ContinueStatement", label: target }, origin);
+    };
+    replaceJumps(statement.body, new Map(breaks.map((jump) => [jump as Node, copy(jump)])));
+    context.did("labeledBlocks", statement);
+    const body = statement.body.body;
+    return body.some(isLexical) ? [statement.body] : body;
+};
+
+/** Every jump to `label` under `node` (not in functions). */
+const allJumps = (node: Node, label: string): Statement[] => {
+    const jumps: Statement[] = [];
+    const visit = (child: Node): void => {
+        if (isFunctionNode(child)) return;
+        if ((child.type === "BreakStatement" || child.type === "ContinueStatement") && child.label?.name === label) jumps.push(child);
+        else forEachChild(child, visit);
+    };
+    forEachChild(node, visit);
+    return jumps;
+};
+
+/** Put each jump's replacement in (not in functions). */
+const replaceJumps = (node: Node, replacements: ReadonlyMap<Node, Statement>): void => {
+    traverse(node, {
+        enter(path) {
+            if (isFunctionNode(path.node)) path.skip();
+        },
+        BreakStatement(path) {
+            const replacement = replacements.get(path.node);
+            if (replacement !== undefined) path.replace(replacement);
+        },
+    });
+};
+
+const LOOPS: ReadonlySet<string> = new Set(["WhileStatement", "DoWhileStatement", "ForStatement", "ForInStatement", "ForOfStatement"]);
+
+/**
+ * The jumps to `label` under `node` (not in functions), when none is in a loop of `node`, nor in a `switch` of it
+ * when it is (or becomes, `as`) a `break`: then the jump without its label, or the unlabeled jump it becomes, reaches
+ * the loop around `node` (or `node`'s own, for its children). `undefined` otherwise.
+ */
+const plainJumps = (node: Node, label: string, as: "same" | "BreakStatement" | "ContinueStatement"): Statement[] | undefined => {
+    const jumps: Statement[] = [];
+    let plain = true;
+    const visit = (child: Node, inLoop: boolean, inSwitch: boolean): void => {
+        if (!plain || isFunctionNode(child)) return;
+        if ((child.type === "BreakStatement" || child.type === "ContinueStatement") && child.label?.name === label) {
+            if (inLoop || ((as === "same" ? child.type : as) === "BreakStatement" && inSwitch)) plain = false;
+            else jumps.push(child);
+            return;
+        }
+        forEachChild(child, (grandchild) => visit(grandchild, inLoop || LOOPS.has(child.type), inSwitch || child.type === "SwitchStatement"));
+    };
+    forEachChild(node, (child) => visit(child, false, false));
+    return plain ? jumps : undefined;
+};
+
+/**
+ * `label: while (c) { ... continue label; ... break label; }` -> the loop unlabeled, when each jump to the label is
+ * in no inner loop (and a `break` in no `switch`) of it (`plainJumps`): the same jump without the label goes to the
+ * same place.
+ */
+const unlabelLoop = (statement: LabeledStatement, context: UnminifyContext): Statement[] | undefined => {
+    const loop = statement.body;
+    if (!LOOPS.has(loop.type)) return undefined;
+    const jumps = plainJumps(loop, statement.label.name, "same");
+    if (jumps === undefined) return undefined;
+    for (const jump of jumps) (jump as Statement & { label: unknown }).label = null;
+    context.did("labeledLoops", statement);
+    return [loop];
 };
 
 /**
@@ -169,43 +297,130 @@ const expandStatement = (statement: Statement, context: UnminifyContext): Statem
         }
         case "ForStatement":
             return splitForLoopVars(statement, context);
-        case "LabeledStatement":
-            return unlabelBlock(statement, context);
         default:
             return undefined;
     }
 };
 
-/** Expand the statements of a list in place (see `expandStatement`), repeating on what an expansion made. */
-export const expandStatements = (list: Statement[], context: UnminifyContext): void => {
+/**
+ * What a labeled statement at `index` of `list` becomes, if anything: a block unlabeled (`unlabelBlock`), a loop
+ * unlabeled (`unlabelLoop`), or a block whose breaks go where the jump after it does, or to a `return;` when it ends a
+ * function body (`functionBody`: `forwardBreaks`).
+ */
+const unlabel = (list: readonly Statement[], index: number, context: UnminifyContext, functionBody: boolean): Statement[] | undefined => {
+    const statement = list[index] as Statement;
+    if (statement.type !== "LabeledStatement") return undefined;
+    const ending = functionBody && index === list.length - 1 ? at<Statement>({ type: "ReturnStatement", argument: null }, statement) : undefined;
+    return unlabelBlock(statement, context) ?? unlabelLoop(statement, context) ?? forwardBreaks(statement, list[index + 1] ?? ending, context);
+};
+
+/** Statements after a jump go (`deadRemainder` keeps the declarations they hoist). */
+const dropUnreachable = (list: Statement[], context: UnminifyContext): void => {
+    const jump = list.findIndex(isJump);
+    if (jump === -1 || jump === list.length - 1 || list.slice(jump + 1).every(isPlaceholder)) return;
+    context.did("unreachable", list[jump + 1] as Statement);
+    list.push(...deadRemainder(list.splice(jump + 1), list[jump] as Statement));
+};
+
+/**
+ * Expand the statements of a list in place (see `expandStatement`, `unlabel`), repeating on what an expansion made,
+ * then drop unreachable statements and merge object assignments and copies.
+ */
+export const expandStatements = (list: Statement[], context: UnminifyContext, functionBody = false): void => {
     for (let i = 0; i < list.length; i++) {
-        const statements = expandStatement(list[i] as Statement, context);
+        const statements = expandStatement(list[i] as Statement, context) ?? unlabel(list, i, context, functionBody);
         if (statements === undefined) continue;
         list.splice(i, 1, ...statements);
         i--;
     }
+    dropUnreachable(list, context);
     mergeObjectAssignments(list, context);
+    mergeCopies(list, context);
+};
+
+/**
+ * Labels again once the list's own statements are done (the walk's exit): their rewrites may have turned breaks into
+ * jumps to a label of this list (a nested block's breaks forwarded to `break outer;`). The `if`s an unlabeled block
+ * becomes get their `else if`s merged here, past their own exit.
+ */
+export const unlabelStatements = (list: Statement[], context: UnminifyContext, functionBody = false): void => {
+    let changed = false;
+    for (let i = 0; i < list.length; i++) {
+        const statements = unlabel(list, i, context, functionBody);
+        if (statements === undefined) continue;
+        list.splice(i, 1, ...statements);
+        changed = true;
+        for (const statement of statements) traverse(statement, { exit: (path) => mergeElseIf(path.node, context) });
+        i--;
+    }
+    if (changed) dropUnreachable(list, context);
+};
+
+/** `x = value;` with `x` a name: the assignment. */
+const assignmentOf = (statement: Statement | undefined): (AssignmentExpression & { left: Node & { type: "Identifier" } }) | undefined => {
+    const e = statement?.type === "ExpressionStatement" ? statement.expression : undefined;
+    return e?.type === "AssignmentExpression" && e.operator === "=" && e.left.type === "Identifier" ? (e as AssignmentExpression & { left: Node & { type: "Identifier" } }) : undefined;
+};
+
+/**
+ * `a = x; b = a;` -> `b = x;` when nothing else uses `a`: a function's (or module's) `var` whose only references are
+ * these two (so no initializer, which writes it too, no closure, no `arguments` alias as a parameter would have, no
+ * other script sees it). `b`, a declared name, is resolved before `x` runs instead of after, which only a `with` or a
+ * direct `eval` could make differ (an undeclared one could be made by `x`: strict assignments to it then throw only
+ * when resolved before). Names under a `with` or a direct `eval` don't resolve in the scope analysis, so neither is
+ * found there. `a`'s declarators go after the walk (`unusedDeclarators`).
+ */
+const mergeCopies = (list: Statement[], context: UnminifyContext): void => {
+    const { scopes } = context;
+    for (let i = 0; i + 1 < list.length; i++) {
+        const first = assignmentOf(list[i]);
+        const second = assignmentOf(list[i + 1]);
+        if (first === undefined || second === undefined || second.right.type !== "Identifier") continue;
+        const temp = scopes.variableOf(first.left);
+        if (temp === undefined || scopes.variableOf(second.right) !== temp || scopes.variableOf(second.left) === undefined) continue;
+        const references = temp.references.filter((reference) => !context.removedReferences.has(reference.identifier as unknown as Node));
+        if (!temp.defs.every((def) => (def.parent as { kind?: string } | null)?.kind === "var") || temp.scope.type === "global" || references.length !== 2) continue;
+        context.did("copies", list[i] as Statement);
+        first.left = second.left;
+        list.splice(i + 1, 1);
+        for (const def of temp.defs) context.unusedDeclarators.add(def.node as unknown as Node);
+        // The merged statement may start another pair (`b = x; c = b;`).
+        i--;
+    }
+};
+
+/** Drop the declarators in `unused` (`var a;`), and the declarations they leave empty in statement lists. */
+export const removeDeclarators = (program: Node, unused: ReadonlySet<Node>): void => {
+    traverse(program, {
+        VariableDeclaration(path) {
+            const node = path.node;
+            const kept = node.declarations.filter((declarator) => !unused.has(declarator));
+            if (kept.length === node.declarations.length) return;
+            if (kept.length > 0) node.declarations = kept;
+            else if (path.isInStatementList()) path.remove();
+        },
+    });
 };
 
 /** `var o = {};` (one declarator) or `o = {};`: the name and the empty literal. */
 const freshObject = (statement: Statement): { id: Node & { type: "Identifier"; name: string }; literal: ObjectExpression } | undefined => {
     if (statement.type === "VariableDeclaration" && statement.declarations.length === 1 && statement.kind !== "using" && statement.kind !== "await using") {
         const [declarator] = statement.declarations;
-        if (declarator?.id.type === "Identifier" && declarator.init?.type === "ObjectExpression" && declarator.init.properties.length === 0) return { id: declarator.id, literal: declarator.init };
+        if (declarator?.id.type === "Identifier" && declarator.init !== null && isPlainLiteral(declarator.init)) return { id: declarator.id, literal: declarator.init };
     }
     const e = statement.type === "ExpressionStatement" ? statement.expression : undefined;
-    if (e?.type === "AssignmentExpression" && e.operator === "=" && e.left.type === "Identifier" && e.right.type === "ObjectExpression" && e.right.properties.length === 0)
-        return { id: e.left, literal: e.right };
+    if (e?.type === "AssignmentExpression" && e.operator === "=" && e.left.type === "Identifier" && isPlainLiteral(e.right)) return { id: e.left, literal: e.right };
     return undefined;
 };
 
 /**
- * `var o = {}; o.a = x; o["b"] = y;` -> `var o = { a: x, b: y };` (also after `o = {};`). The values run in the same
- * order, and setting a property of a fresh plain object creates it as the literal does (model 7; never `__proto__`,
- * see `storedProperty`). What differs is what `o` holds while the values run (the bare object, or its old value), so
- * nothing may read `o` then: the values don't name it, no `with` or direct `eval` can, and every other reference to
- * it is in the same function (which runs these statements in their order, not during them) or in a function created
- * after them in this list (not a declaration: those exist from the start).
+ * `var o = {}; o.a = x; o["b"] = y; o.a.c = z;` -> `var o = { a: x, b: y };` (also after `o = {...};`, and into a
+ * literal a property holds: see `plannedStore`). The values run in the same order, and setting a property of a fresh
+ * plain object creates it as the literal does (model 7; never `__proto__`). What differs is what `o` holds while the
+ * values run (the bare object, or its old value), so nothing may read `o` then: the values don't name it, no `with`
+ * or direct `eval` can, and every other reference to it is in the same function (which runs these statements in
+ * their order, not during them) or in a function created after them in this list (not a declaration: those exist
+ * from the start).
  */
 const mergeObjectAssignments = (list: Statement[], context: UnminifyContext): void => {
     if (context.hasWith || context.hasEval) return;
@@ -236,16 +451,21 @@ const mergeObjectAssignments = (list: Statement[], context: UnminifyContext): vo
     for (let i = 0; i < list.length; i++) {
         const fresh = freshObject(list[i] as Statement);
         if (fresh === undefined) continue;
-        const properties: Node[] = [];
+        const planned: PlannedStore[] = [];
         for (let j = i + 1; j < list.length; j++) {
-            const property = storedProperty(list[j] as Statement, fresh.id.name, false);
-            if (property === undefined) break;
-            properties.push(property);
+            const store = plannedStore(list[j] as Statement, fresh.id.name, "none", fresh.literal, planned);
+            if (store === undefined) break;
+            planned.push(store);
         }
-        if (properties.length === 0 || !unobservedDuring(i + properties.length, fresh.id, context, createdAt)) continue;
+        if (planned.length === 0 || !unobservedDuring(i + planned.length, fresh.id, context, createdAt)) continue;
         context.did("objectAssignments", list[i] as Statement);
-        fresh.literal.properties.push(...(properties as ObjectExpression["properties"]));
-        list.splice(i + 1, properties.length);
+        for (const { into, property } of planned) into.properties.push(property as ObjectExpression["properties"][number]);
+        // The stores' references to `o` go with them (`o.a = x`, `o.a.c = z`: the root of the assignment's target).
+        for (const statement of list.splice(i + 1, planned.length)) {
+            let target: Node | undefined = statement.type === "ExpressionStatement" && statement.expression.type === "AssignmentExpression" ? statement.expression.left : undefined;
+            while (target?.type === "MemberExpression") target = target.object;
+            if (target !== undefined) context.removedReferences.add(target);
+        }
         positions = undefined;
     }
 };

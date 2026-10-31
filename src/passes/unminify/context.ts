@@ -26,11 +26,14 @@ export const TRANSFORMS = [
     "regexEscapes",
     "regexClasses",
     "labeledBlocks",
+    "labeledLoops",
     "yoda",
     "booleanTails",
     "directCalls",
     "nestedIife",
     "emptyBranches",
+    "unreachable",
+    "copies",
 ] as const;
 
 export type Transform = (typeof TRANSFORMS)[number];
@@ -39,6 +42,13 @@ export class UnminifyContext {
     readonly scopes: ScopeInfo;
     readonly log: PassLog;
     readonly counts: Record<Transform, number>;
+
+    /** Declarators of locals a rewrite left unused (`var a;`), removed after the walk. */
+    readonly unusedDeclarators = new Set<Node>();
+
+    /** Identifiers a rewrite removed, which the scope analysis still counts as references. */
+    readonly removedReferences = new Set<Node>();
+
     readonly #hasWith: boolean;
     readonly #hasEval: boolean;
 

@@ -314,12 +314,20 @@ const canonicalPattern = (pattern: string, flags: string): string | undefined =>
     return out === pattern ? undefined : out;
 };
 
-/** Whether `node` mentions the name `name`, or (`ownThis`) uses `this`/`arguments` outside functions that bind their own. */
-export const uses = (node: Node | null | undefined, name: string, ownThis: boolean): boolean => {
+/**
+ * Bindings of a function that code moved out of it would lose: `"all"` its `this`, `arguments`, `new.target` and
+ * `super`; `"except-this"` all but `this` (passed on by `.apply(this)`/`.call(this)`); `"none"` (an arrow's are the
+ * caller's).
+ */
+export type OwnBindings = "all" | "except-this" | "none";
+
+/** Whether `node` mentions the name `name`, or uses bindings of the function it leaves (`own`) outside functions that bind their own. */
+export const uses = (node: Node | null | undefined, name: string, own: OwnBindings): boolean => {
     if (node === null || node === undefined) return false;
-    if (node.type === "Identifier") return node.name === name || (ownThis && node.name === "arguments");
-    if (node.type === "ThisExpression" || node.type === "MetaProperty" || node.type === "Super") return ownThis;
-    const inner = ownThis && isFunctionNode(node) && node.type !== "ArrowFunctionExpression" ? false : ownThis;
+    if (node.type === "Identifier") return node.name === name || (own !== "none" && node.name === "arguments");
+    if (node.type === "ThisExpression") return own === "all";
+    if (node.type === "MetaProperty" || node.type === "Super") return own !== "none";
+    const inner = isFunctionNode(node) && node.type !== "ArrowFunctionExpression" ? "none" : own;
     let found = false;
     forEachChild(node, (child) => {
         found ||= uses(child, name, inner);
@@ -327,16 +335,40 @@ export const uses = (node: Node | null | undefined, name: string, ownThis: boole
     return found;
 };
 
+/** A property's key as the property name it defines (`a`, `"a"` and `a` alike; `1` and `"1"` alike), when static. */
+const keyName = (property: Node): string | undefined => {
+    if (property.type !== "Property" || property.computed) return undefined;
+    const key = property.key;
+    if (key.type === "Identifier") return key.name;
+    return key.type === "Literal" && (typeof key.value === "string" || typeof key.value === "number") ? String(key.value) : undefined;
+};
+
 /**
- * `name.k = v;`, `name["k"] = v;` or `name[1] = v;` as a statement, where `v` doesn't name `name` (nor, with
- * `ownThis`, uses `this`/`arguments`): the property `k: v` for an object literal. Not `__proto__`, which a literal
- * reads as the prototype; not computed keys other than literals (an assignment converts its key after the value).
+ * An object literal whose properties assignments may add to as the literal would have them: plain properties only (no
+ * spread, getter or setter, which an assignment would run or copy), none named `__proto__` (a prototype, whose setters
+ * an assignment could meet).
  */
-export const storedProperty = (statement: Statement, name: string, ownThis: boolean): Node | undefined => {
+export const isPlainLiteral = (node: Node): node is ObjectExpression =>
+    node.type === "ObjectExpression" && node.properties.every((property) => property.type === "Property" && property.kind === "init" && keyName(property) !== "__proto__");
+
+/** A property an assignment adds to an object literal, and that literal. */
+export interface PlannedStore {
+    readonly into: ObjectExpression;
+    readonly property: Node;
+}
+
+/**
+ * `name.k = v;`, `name["k"] = v;` or `name[1] = v;` as a statement, where `v` doesn't name `name` (nor uses the
+ * bindings of the function it leaves, `own`): the property `k: v` for `literal`, which `name` holds. Also `name.j.k =
+ * v;` when `j` is the last property of `literal` (with the properties `planned` before it) and holds a plain object
+ * literal: `k: v` goes in that one, where `v` still runs after every other value (it ran last). Not `__proto__`,
+ * which a literal reads as the prototype; not computed keys other than literals (an assignment converts its key after
+ * the value).
+ */
+export const plannedStore = (statement: Statement, name: string, own: OwnBindings, literal: ObjectExpression, planned: readonly PlannedStore[]): PlannedStore | undefined => {
     const e = statement.type === "ExpressionStatement" ? statement.expression : undefined;
-    if (e?.type !== "AssignmentExpression" || e.operator !== "=" || e.left.type !== "MemberExpression") return undefined;
+    if (e?.type !== "AssignmentExpression" || e.operator !== "=" || e.left.type !== "MemberExpression" || uses(e.right, name, own)) return undefined;
     const { object, property, computed } = e.left;
-    if (object.type !== "Identifier" || object.name !== name || uses(e.right, name, ownThis)) return undefined;
     const key = computed
         ? property.type === "Literal" && (typeof property.value === "string" || typeof property.value === "number")
             ? property.value
@@ -346,32 +378,41 @@ export const storedProperty = (statement: Statement, name: string, ownThis: bool
           : undefined;
     if (key === undefined || key === "__proto__") return undefined;
     const keyNode = typeof key === "string" && isIdentifierName(key) ? at<Expression>({ type: "Identifier", name: key }, property) : valueToNode(key, property);
-    return at<Node>({ type: "Property", kind: "init", key: keyNode, value: e.right, computed: false, method: false, shorthand: false }, statement) as Node;
+    const stored = at<Node>({ type: "Property", kind: "init", key: keyNode, value: e.right, computed: false, method: false, shorthand: false }, statement) as Node;
+    if (object.type === "Identifier") return object.name === name ? { into: literal, property: stored } : undefined;
+    if (object.type !== "MemberExpression" || object.object.type !== "Identifier" || object.object.name !== name) return undefined;
+    const holder = object.computed ? (object.property.type === "Literal" ? String(object.property.value) : undefined) : object.property.type === "Identifier" ? object.property.name : undefined;
+    const last = [...literal.properties, ...planned.filter((store) => store.into === literal).map((store) => store.property)].at(-1);
+    const into = last !== undefined && holder !== undefined && keyName(last) === holder && last.type === "Property" ? last.value : undefined;
+    return into !== undefined && isPlainLiteral(into) ? { into, property: stored } : undefined;
 };
 
 /**
- * `(() => { var t; t = {}; t.a = x; t["b"] = y; return t; })()` -> `{ a: x, b: y }` (jscrambler builds object
- * literals this way, also as `function () {...}.apply(this, arguments)`). The values run in order either way;
- * setting a property of a fresh plain object creates it (no setter on Object.prototype but `__proto__`'s, which
- * stays: model 7), as the literal does; nothing else sees the object until it's returned, and a value can't reach it
- * without naming it. A plain function's own `this` and `arguments` aren't the caller's (even through `.apply(this,
- * arguments)`: a sloppy function gets the global object for an undefined `this`, and a fresh `arguments`), so values
- * using them only move out of an arrow.
+ * `(() => { var t = {}; t.a = x; t.b.c = y; return t; })()` -> `{ a: x, b: { c: y } }` when `t.b` holds a literal
+ * (jscrambler builds object literals this way, also as `function () {...}.apply(this, arguments)`, `.apply(this)` and
+ * `.call(this)`; the literal may start with properties, and may be assigned after a bare `var t;`). The values run in
+ * order either way; setting a property of a fresh plain object creates it (no setter on Object.prototype but
+ * `__proto__`'s, which stays: model 7), as the literal does; nothing else sees the object until it's returned, and a
+ * value can't reach it without naming it. A plain function's own `arguments`, `new.target` and `super` aren't the
+ * caller's, so values using them only move out of an arrow; its `this` is when the call passes it (a sloppy function
+ * would replace an undefined or primitive `this`, but the caller then is sloppy too and has replaced its own).
  */
 const objectFromBuilder = (node: Node, context: UnminifyContext): ObjectExpression | undefined => {
     if (node.type !== "CallExpression" || node.optional) return undefined;
     let fn: Node = node.callee;
-    if (fn.type === "MemberExpression" && !fn.computed && fn.property.type === "Identifier" && fn.property.name === "apply") {
+    let passesThis = false;
+    if (fn.type === "MemberExpression" && !fn.computed && fn.property.type === "Identifier" && (fn.property.name === "apply" || fn.property.name === "call")) {
         const [self, args] = node.arguments;
-        if (node.arguments.length !== 2 || self?.type !== "ThisExpression" || args?.type !== "Identifier" || args.name !== "arguments") return undefined;
+        if (self?.type !== "ThisExpression" || node.arguments.length > (fn.property.name === "apply" ? 2 : 1)) return undefined;
         // Reading `arguments` outside a function that has one throws: it must be the caller's own.
-        if (context.scopes.variableOf(args)?.scope.type !== "function") return undefined;
+        if (args !== undefined && (args.type !== "Identifier" || args.name !== "arguments" || context.scopes.variableOf(args)?.scope.type !== "function")) return undefined;
         fn = fn.object;
         if (fn.type !== "FunctionExpression") return undefined;
+        passesThis = true;
     } else if (node.arguments.length > 0) return undefined;
-    const ownThis = fn.type === "FunctionExpression";
     if ((fn.type !== "FunctionExpression" && fn.type !== "ArrowFunctionExpression") || fn.params.length > 0 || fn.async || fn.generator || fn.body?.type !== "BlockStatement") return undefined;
     if (fn.type === "FunctionExpression" && fn.id !== null) return undefined;
+    const own: OwnBindings = fn.type === "ArrowFunctionExpression" ? "none" : passesThis ? "except-this" : "all";
     const body = fn.body.body as Statement[];
     const [first] = body;
     if (first?.type !== "VariableDeclaration" || first.kind === "using" || first.kind === "await using" || first.declarations.length !== 1) return undefined;
@@ -379,22 +420,25 @@ const objectFromBuilder = (node: Node, context: UnminifyContext): ObjectExpressi
     if (declarator?.id.type !== "Identifier") return undefined;
     const name = declarator.id.name;
     let rest = body.slice(1);
-    if (declarator.init === null) {
+    let literal = declarator.init;
+    if (literal === null) {
         const [assign] = rest;
         const e = assign?.type === "ExpressionStatement" ? assign.expression : undefined;
-        if (e?.type !== "AssignmentExpression" || e.operator !== "=" || e.left.type !== "Identifier" || e.left.name !== name || e.right.type !== "ObjectExpression" || e.right.properties.length > 0)
-            return undefined;
+        if (e?.type !== "AssignmentExpression" || e.operator !== "=" || e.left.type !== "Identifier" || e.left.name !== name) return undefined;
+        literal = e.right;
         rest = rest.slice(1);
-    } else if (declarator.init.type !== "ObjectExpression" || declarator.init.properties.length > 0) return undefined;
+    }
+    if (!isPlainLiteral(literal) || uses(literal, name, own)) return undefined;
     const last = rest.at(-1);
     if (last?.type !== "ReturnStatement" || last.argument?.type !== "Identifier" || last.argument.name !== name) return undefined;
-    const properties: Node[] = [];
+    const planned: PlannedStore[] = [];
     for (const statement of rest.slice(0, -1)) {
-        const property = storedProperty(statement, name, ownThis);
-        if (property === undefined) return undefined;
-        properties.push(property);
+        const store = plannedStore(statement, name, own, literal, planned);
+        if (store === undefined) return undefined;
+        planned.push(store);
     }
-    return at<ObjectExpression>({ type: "ObjectExpression", properties }, node);
+    for (const { into, property } of planned) into.properties.push(property as ObjectExpression["properties"][number]);
+    return literal;
 };
 
 /**
