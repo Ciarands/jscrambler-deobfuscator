@@ -5,6 +5,7 @@ import { calculators } from "./calculators.js";
 import { cleanup } from "./cleanup.js";
 import { codeLocks } from "./code-locks.js";
 import { detectors } from "./detectors.js";
+import { domainLocks } from "./domain-locks.js";
 import { emulate } from "./emulate/index.js";
 import { globalProxy } from "./global-proxy.js";
 import { hashPredicates } from "./hash-predicates.js";
@@ -21,8 +22,9 @@ import { wrappers } from "./wrappers.js";
  * The pipeline, in run order. Each pass documents why it sits where it does. resolve-calls comes right after emulate:
  * decoded strings turn computed storage keys (`G[G.w(147)]`) into static ones, which the storage analysis of the
  * passes after it (what may change `G` after the prelude) needs. code-locks follows wrappers, which turned calls of
- * the locks' wrappers into direct calls; detectors (anti-debug checks, answered with what they say undebugged) comes
- * with it and reads the slot shapes too. calculators comes next: it reads calls of a calculator's methods
+ * the locks' wrappers into direct calls; detectors (anti-debug checks, answered with what they say undebugged) and
+ * domain-locks (tests of a hash of the host against the licensed ones, answered as passed) come with it, detectors
+ * reading the slot shapes too. calculators comes next: it reads calls of a calculator's methods
  * directly and through the wrappers left (`runtime.wrappers`), the removed lock and detector calls no longer stand
  * between a selector call and its calculation, and the simplify group after it folds the case expressions it puts in
  * (`7735 - 7280`). storage-comparisons folds the matrix predicates (`G.k.m[1][10] != G.k.m[3][10]`) once, before the
@@ -35,9 +37,10 @@ import { wrappers } from "./wrappers.js";
  * arguments-arrays then turns `var S = [arguments]` slot arrays into parameters and locals: the passes before it
  * (constants, code-locks, builders, calculators) read the slot shapes. It leads the cleanup group, so an array the
  * group's simplify frees (a predicate deciding between two of its definitions) is converted in the next round, and
- * cleanup drops the locals whose reads the passes before already resolved. calculators runs again right after it:
- * calculations it kept because an argument was a read through the arguments array (a possible getter, read out of
- * turn) now take plain parameters and locals. hash-predicates comes next in both groups:
+ * cleanup drops the locals whose reads the passes before already resolved. calculators, code-locks and domain-locks
+ * run again right after it: calculations it kept because an argument was a read through the arguments array (a
+ * possible getter, read out of turn) now take plain parameters and locals, and lock calls their literal arguments.
+ * hash-predicates comes next in both groups:
  * it decides tests on the runtime's pure hash from the locals assigned right before them, so simplify drops the dead
  * branches and loops in the same round; in the cleanup group it sees the predicates whose locals were slots until
  * arguments-arrays. Cleanup comes after, when the runtime has no users left; removing it can make more locals unused,
@@ -54,9 +57,10 @@ export const PIPELINE: readonly PipelineStep[] = [
     wrappers,
     codeLocks,
     detectors,
+    domainLocks,
     calculators,
     storageComparisons,
     { group: "simplify", passes: [hashPredicates, simplify, normalize, unflatten, resolveCalls, pureCalls], maxRounds: 8 },
-    { group: "cleanup", passes: [argumentsArrays, codeLocks, calculators, hashPredicates, cleanup, simplify], maxRounds: 4 },
+    { group: "cleanup", passes: [argumentsArrays, codeLocks, domainLocks, calculators, hashPredicates, cleanup, simplify], maxRounds: 4 },
     unminify,
 ];

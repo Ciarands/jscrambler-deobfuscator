@@ -215,16 +215,22 @@ const keyReferences = (program: Node, runtime: RuntimeModel, matcher: StorageMat
 };
 
 /**
- * Why a reference to the holder key `path[0]` may reach the lock other than through `sites`: it is none of them, isn't
- * in the builder's own statement or the definition of a wrapper of the lock nothing uses, and may run once the
- * builder has (before it, `G.k` isn't the lock yet).
+ * Why a reference to the holder key `path[0]` may reach the lock `path` other than through calls whose callee objects
+ * (`G.k`) are `callees`: it is none of them, isn't in the builder's own statement or the definition of a wrapper of
+ * the lock nothing uses, and may run once the builder has (before it, `G.k` isn't the lock yet).
  */
-const strayReference = (lock: Lock, program: Node, runtime: RuntimeModel, matcher: StorageMatcher, effects: StorageEffects): Node | undefined => {
-    const { path, sites, builder } = lock;
+export const strayReference = (
+    path: PropertyPath,
+    callees: ReadonlySet<Node>,
+    builder: Statement,
+    program: Node,
+    runtime: RuntimeModel,
+    matcher: StorageMatcher,
+    effects: StorageEffects
+): Node | undefined => {
     const wrappers = [...runtime.wrappers.values()].filter((wrapper) => wrapper.target.length === path.length && wrapper.target.every((key, i) => key === path[i]));
     const references = keyReferences(program, runtime, matcher, new Set([path[0] as string, ...wrappers.map((wrapper) => wrapper.key)]));
     const unused = new Set(wrappers.filter((wrapper) => (references.get(wrapper.key) ?? []).every((reference) => reference.root === wrapper.definition)).map((wrapper) => wrapper.definition));
-    const callees = new Set(sites.map(({ call }) => (call.callee as MemberExpression).object as Node));
     return references
         .get(path[0] as string)
         ?.find(({ node, root, site }) => !callees.has(node) && root !== builder && (root === undefined || !unused.has(root)) && (site === undefined || !effects.runsBefore(site, builder)))?.node;
@@ -270,7 +276,8 @@ const fullModeRefusal = (lock: Lock, context: LockContext): { reason: string; no
     if (used !== -1) return { reason: staleness[used]?.reason ?? "a call whose value is used runs in the prelude, where it may be the first call", node: (sites[used] as CallSite).call };
     const dynamic = uses.dynamic.find(({ node, site }) => !effects.runsBefore(site, builder) && !effects.keptAsGlobal(node));
     if (dynamic !== undefined) return { reason: `${runtime.storage} is used as a value or read with a computed key once the lock is built, which may reach it`, node: dynamic.node };
-    const stray = strayReference(lock, program, runtime, matcher, effects);
+    const callees = new Set(sites.map(({ call }) => (call.callee as MemberExpression).object as Node));
+    const stray = strayReference(path, callees, builder, program, runtime, matcher, effects);
     if (stray !== undefined) return { reason: `${runtime.storage}.${path[0]} is used other than by its calls, its builder and unused wrappers`, node: stray };
     return undefined;
 };
