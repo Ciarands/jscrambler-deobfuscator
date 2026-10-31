@@ -573,21 +573,35 @@ const isPlainPrimitive = (node: Node | null): boolean => {
     return literal?.type === "Literal" && !(literal.value instanceof RegExp) && typeof literal.value !== "bigint" && !("bigint" in literal && literal.bigint !== undefined && literal.bigint !== null);
 };
 
-/** `x = <primitive>;`, `x += <primitive>;`, `x++;` as a statement: what it does to its local. */
-const storeOf = (statement: Node): { target: Node; update: boolean } | undefined => {
+/**
+ * `x = <primitive>;`, `x += <primitive>;`, `x++;` or `x = y;` (`y` a `var`, function, parameter or catch binding:
+ * reading it runs no code and can't throw) as a statement: what it does to its local, and whether it stores a
+ * primitive.
+ */
+const storeOf = (statement: Node, scopes: ScopeInfo): { target: Node; update: boolean; primitive: boolean } | undefined => {
     if (statement.type !== "ExpressionStatement") return undefined;
     const e = statement.expression;
-    if (e.type === "UpdateExpression") return e.argument.type === "Identifier" ? { target: e.argument, update: true } : undefined;
-    if (e.type !== "AssignmentExpression" || e.left.type !== "Identifier" || !isPlainPrimitive(e.right)) return undefined;
-    return { target: e.left, update: e.operator !== "=" };
+    if (e.type === "UpdateExpression") return e.argument.type === "Identifier" ? { target: e.argument, update: true, primitive: true } : undefined;
+    if (e.type !== "AssignmentExpression" || e.left.type !== "Identifier") return undefined;
+    if (isPlainPrimitive(e.right)) return { target: e.left, update: e.operator !== "=", primitive: true };
+    return e.operator === "=" && e.right.type === "Identifier" && isPlainBinding(scopes.variableOf(e.right)) ? { target: e.left, update: false, primitive: false } : undefined;
 };
 
+/** A binding whose reads run no code and can't throw: a `var`, a function, a parameter or a catch binding. */
+const isPlainBinding = (variable: Variable | undefined): boolean =>
+    variable !== undefined &&
+    variable.defs.length > 0 &&
+    variable.defs.every(
+        (def) => def.type === "FunctionName" || def.type === "Parameter" || def.type === "CatchClause" || (def.type === "Variable" && (def.parent as { kind?: string } | null)?.kind === "var")
+    );
+
 /**
- * Stores to locals nothing reads: jscrambler's leftover flattening state (`a = 576049076; S = 2; Z0 += 2; u4++;`).
- * A local qualifies when it has one declaration with a primitive (or no) initializer and every other reference is a
- * statement of its own that stores a primitive (`x = 1;`) or updates it with one (`x += 2;`, `x++`). Its value is
- * then always a primitive, so the reads the updates make run no code, and nothing else ever sees it: the statements
- * go, and the declaration is left with no use for `removeUnusedLocals`.
+ * Stores to locals nothing reads: jscrambler's leftover flattening state (`a = 576049076; S = 2; Z0 += 2; u4++;`) and
+ * copies of tables (`t = table;`). A local qualifies when it has one declaration with a primitive (or no) initializer
+ * and every other reference is a statement of its own that stores a primitive (`x = 1;`) or a plain binding's value
+ * (`x = y;`), or updates it with a primitive (`x += 2;`, `x++`) when it only ever holds primitives. The reads the
+ * updates make then run no code, and nothing else ever sees it: the statements go, and the declaration is left with
+ * no use for `removeUnusedLocals`.
  */
 const removeDeadStores = (program: Node, scopes: ScopeInfo, log: PassContext["log"]): number => {
     if (scopes.manager.scopes.some((s) => s.type === "with")) return 0;
@@ -595,7 +609,7 @@ const removeDeadStores = (program: Node, scopes: ScopeInfo, log: PassContext["lo
     const stores = new Map<Variable, Node[]>();
     traverse(program, {
         ExpressionStatement(path) {
-            const store = storeOf(path.node);
+            const store = storeOf(path.node, scopes);
             const variable = store === undefined ? undefined : scopes.variableOf(store.target);
             if (variable === undefined) return;
             const list = stores.get(variable);
@@ -610,7 +624,10 @@ const removeDeadStores = (program: Node, scopes: ScopeInfo, log: PassContext["lo
         if (!isLocalScope(v.scope.type) || v.defs.length !== 1 || def?.type !== "Variable" || (def.parent as { kind?: string } | null)?.kind !== "var" || hiddenUses(v)) continue;
         const declarator = def.node as unknown as { init: Node | null };
         if (declarator.init !== null && !isPlainPrimitive(declarator.init)) continue;
-        const targets = new Set(statements.map((statement) => (storeOf(statement) as { target: Node }).target));
+        const parsed = statements.map((statement) => storeOf(statement, scopes) as { target: Node; update: boolean; primitive: boolean });
+        // An update of an object would convert it (`valueOf`): updates only of primitives.
+        if (parsed.some((store) => store.update) && !parsed.every((store) => store.primitive)) continue;
+        const targets = new Set(parsed.map((store) => store.target));
         if (!v.references.every((reference) => reference.init === true || targets.has(reference.identifier as unknown as Node))) continue;
         for (const statement of statements) dead.add(statement);
         log.debug(`removed ${statements.length} store(s) to ${v.name}, which nothing reads`, statements[0]);

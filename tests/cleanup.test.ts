@@ -247,6 +247,15 @@ describe("cleanup: dead stores", () => {
         for (const name of ["seen += n", "kept += 2", "box++"]) expect(code).toContain(name);
     });
 
+    it("drops locals only given the values of other bindings, unless they are updated or read from a let", async () => {
+        const input =
+            'var log = [];\nvar table = [1, 2];\nvar hooked = { valueOf: function () { log.push("converted"); return 1; } };\nfunction f(n) { var copy; copy = table; copy = n; copy = f; var bumped; bumped = hooked; bumped += 1; var added; added = 1; added += hooked; return n; }\nfunction g() { var late; late = later; let later = 2; }\ntry { g(); } catch (e) { log.push(e.name); }\nresult = [f(4), log];\n';
+        const { code } = await deobfuscate(input, { passes: ["cleanup"] });
+        expect(observed(code)).toBe(observed(input));
+        expect(observed(input)).toBe('[4,["ReferenceError","converted","converted"]]');
+        expect(code).not.toContain("copy");
+    });
+
     it("keeps unused locals a direct eval can see, and removes those it can't", async () => {
         const input = 'function f() { var seen = 1; return (function () { return eval("seen"); })(); }\nfunction g() { var unseen = 2; return 3; }\nresult = [f(), g()];\n';
         const { code } = await deobfuscate(input, { passes: ["cleanup"] });

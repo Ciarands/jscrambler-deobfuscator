@@ -8,7 +8,7 @@ export const value = (v: Value): Evaluation => ({ ok: true, value: v });
 
 export interface EvaluateEnv {
     /**
-     * Whether an identifier named `undefined`, `NaN` or `Infinity` really is the global (not shadowed).
+     * Whether an identifier named `undefined`, `NaN`, `Infinity` or `atob` really is the global (not shadowed).
      * Without this, those names are not evaluated.
      */
     readonly isGlobal?: (identifier: Node) => boolean;
@@ -190,9 +190,30 @@ export const evaluate = (node: Node, env: EvaluateEnv = {}): Evaluation => {
                 if (typeof key.value === "number" && Number.isInteger(key.value) && key.value >= 0) return value(object.value[key.value]);
                 return FAIL;
             }
+            case "CallExpression": {
+                // `atob("bmF2aWdhdG9y")`: the host's base64 decoder (models 7 and 10: the host's builtins exist and are
+                // intact), folded only to printable text: decoded binary reads worse than its base64.
+                const [argument] = n.arguments;
+                if (n.optional || n.callee.type !== "Identifier" || n.callee.name !== "atob" || n.arguments.length !== 1 || argument?.type === "SpreadElement") return FAIL;
+                if (env.isGlobal === undefined || !env.isGlobal(n.callee)) return FAIL;
+                const text = visit(argument as Node);
+                if (!text.ok || typeof text.value !== "string") return FAIL;
+                const decoded = decodeBase64(text.value);
+                return decoded === undefined ? FAIL : value(decoded);
+            }
             default:
                 return FAIL;
         }
     };
     return visit(node);
+};
+
+/** What `atob(text)` gives when that is printable ASCII; `undefined` when it throws (not base64) or isn't printable. */
+const decodeBase64 = (text: string): string | undefined => {
+    try {
+        const decoded = atob(text);
+        return /^[\x20-\x7e]*$/.test(decoded) ? decoded : undefined;
+    } catch {
+        return undefined;
+    }
 };

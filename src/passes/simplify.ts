@@ -15,7 +15,17 @@ import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
 const MAX_PROPAGATED_STRING = 64;
 
 /** Expression types worth trying to fold (others either can't evaluate or are already literals). */
-const FOLDABLE = new Set(["Identifier", "BinaryExpression", "UnaryExpression", "LogicalExpression", "ConditionalExpression", "TemplateLiteral", "MemberExpression", "SequenceExpression"]);
+const FOLDABLE = new Set([
+    "Identifier",
+    "BinaryExpression",
+    "UnaryExpression",
+    "LogicalExpression",
+    "ConditionalExpression",
+    "TemplateLiteral",
+    "MemberExpression",
+    "SequenceExpression",
+    "CallExpression",
+]);
 
 /** Whether `node` already is the canonical expression for `value` (`3`, `-1`, `undefined`, `NaN`, `Infinity`). */
 const isCanonical = (node: Node, value: Value): boolean => {

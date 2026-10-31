@@ -167,6 +167,11 @@ describe("calculators", () => {
         // No other function names z or the slot array: whatever a conversion runs, they read the same after it.
         const stable = await sameBehaviour(later("  var z = 2;\n  S[2] = 3;\n  var o = { valueOf: function () { return 7; } };\n  G.s(4);\n  result = [G.c(o, 1, z), G.c(o, 1, S[2])];"));
         expect(stable).toContain("result = [(o - 1) * z, (o - 1) * S[2]];");
+        // An argument that only ever holds primitives converts without running code, so a later one reads the same.
+        const primitive = await sameBehaviour(
+            later("  var z = 2;\n  var touch = function () { z = 5; };\n  var n = 3 * 2;\n  var m = 3 * 2;\n  m = touch;\n  G.s(4);\n  result = [G.c(n, 1, z), G.c(m, 1, z)];")
+        );
+        expect(primitive).toContain("result = [(n - 1) * z, G.c(m, 1, z)];");
     });
 
     it("puts getter arguments in when each is read once, in the order they were passed", async () => {

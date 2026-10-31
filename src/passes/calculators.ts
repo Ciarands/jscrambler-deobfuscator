@@ -1156,10 +1156,45 @@ class CalculatorRewrite {
     }
 
     /**
+     * Whether `node` only ever has a primitive value: literals and operator results, and a function's `var`s whose
+     * every write stores one (a `var` read before its first write is `undefined`; a script's are globals other code
+     * may write). `seen` guards against cycles.
+     */
+    #primitive(node: Node, seen: Set<Variable> = new Set()): boolean {
+        switch (node.type) {
+            case "Literal":
+                return !("regex" in node && node.regex !== undefined && node.regex !== null);
+            case "TemplateLiteral":
+            case "UnaryExpression":
+            case "BinaryExpression":
+            case "UpdateExpression":
+                return true;
+            case "LogicalExpression":
+                return this.#primitive(node.left, seen) && this.#primitive(node.right, seen);
+            case "ConditionalExpression":
+                return this.#primitive(node.consequent, seen) && this.#primitive(node.alternate, seen);
+            case "Identifier": {
+                if (evaluate(node, this.env).ok) return true;
+                const variable = this.scopes.variableOf(node);
+                if (variable === undefined || variable.scope.dynamic || variable.scope.type === "global" || !variable.defs.every((def) => def.type === "Variable" && def.parent.kind === "var"))
+                    return false;
+                if (seen.has(variable)) return true;
+                seen.add(variable);
+                return this.scopes
+                    .staticReferences(variable)
+                    .every((reference) => !reference.isWrite() || (reference.writeExpr !== null && reference.writeExpr !== undefined && this.#primitive(reference.writeExpr as unknown as Node, seen)));
+            }
+            default:
+                return false;
+        }
+    }
+
+    /**
      * Why the case's expression can't take the arguments in place of `a[i]`: in the calculation every argument is
      * read before the expression runs; in place, a non-constant one is read where the expression reaches it. That is
-     * the same as long as no conversion that could run code (an operator applied to a possible object) comes first,
-     * or the argument reads the same after any code (`#stableAcrossCalls`).
+     * the same as long as no conversion that could run code (an operator applied to a possible object: not to one that
+     * only ever holds primitives, `#primitive`) comes first, or the argument reads the same after any code
+     * (`#stableAcrossCalls`).
      */
     #orderProblem(formula: Expression, args: readonly Expression[], calculator: Calculator): string | undefined {
         let converted = false;
@@ -1171,7 +1206,7 @@ class CalculatorRewrite {
                     const arg = args[Number(propertyKey(node))];
                     if (arg === undefined || this.#isOwnSelector(arg, calculator) || evaluate(arg, this.env).ok) return false;
                     if (converted && !this.#stableAcrossCalls(arg)) problem ??= "an argument would be read after a conversion that may run code";
-                    return true;
+                    return !this.#primitive(arg);
                 }
                 case "UnaryExpression": {
                     const object = visit(node.argument);

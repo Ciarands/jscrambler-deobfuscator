@@ -241,14 +241,17 @@ describe("constants written by several statements in one list", () => {
   r += "x";
   r = "A";
   r += "B";
-  log.push(s, t, u, r);
+  var d = "";
+  var d = "dis";
+  d += "able";
+  log.push(s, t, u, r, d);
   return log;
 }
 result = f([]);
 `;
         const output = await simplified(program);
         expect(observed(output)).toBe(observed(program));
-        expect(output).toContain('log.push("abcd1", "AB", "xy", "AB");');
+        expect(output).toContain('log.push("abcd1", "AB", "xy", "AB", "disable");');
     });
 
     it("keeps reads before the last write, in closures made before it and in declarations called before it", async () => {

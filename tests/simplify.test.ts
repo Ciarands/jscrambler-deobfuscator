@@ -27,8 +27,8 @@ t(beforeInit());
 result = log;
 `;
 
-const run = (code: string): string => {
-    const context: Record<string, unknown> = { host: { flag: false } };
+const run = (code: string, globals: Record<string, unknown> = {}): string => {
+    const context: Record<string, unknown> = { host: { flag: false }, ...globals };
     runInNewContext(code, context);
     return JSON.stringify(context.result);
 };
@@ -144,6 +144,15 @@ describe("simplify", () => {
         expect(code).toContain("var looped;");
         // A read before the initializer runs is not a constant use.
         expect(code).toContain("t(x);");
+    });
+
+    it("decodes base64 literals the host's atob turns into printable text, not binary, invalid or shadowed ones", async () => {
+        const program =
+            'var out = [atob("bmF2aWdhdG9y"), atob("tNmJdQ=="), (function (atob) { return atob("eA=="); })(function (s) { return s + "!"; })];\ntry { out.push(atob("*")); } catch (e) { out.push(e.name); }\nresult = out;\n';
+        const { code } = await deobfuscate(program, { passes: ["simplify"] });
+        expect(run(code, { atob })).toBe(run(program, { atob }));
+        expect(code).toContain('"navigator"');
+        for (const kept of ['atob("tNmJdQ==")', 'atob("eA==")', 'atob("*")']) expect(code).toContain(kept);
     });
 
     it("propagates constants and arguments slots only where they are already set", async () => {

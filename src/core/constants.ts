@@ -101,7 +101,15 @@ interface ProgramFacts {
  * assignment (`a[k] = v;` as a statement) and a property (a destructuring target). Other parents are never read, so
  * leaving them out of the map (most of the program) changes no answer.
  */
-const PARENT_ASKED: Record<string, true> = { Identifier: true, MemberExpression: true, VariableDeclaration: true, AssignmentExpression: true, ExpressionStatement: true, Property: true };
+const PARENT_ASKED: Record<string, true> = {
+    Identifier: true,
+    MemberExpression: true,
+    VariableDeclaration: true,
+    VariableDeclarator: true,
+    AssignmentExpression: true,
+    ExpressionStatement: true,
+    Property: true,
+};
 
 /** Unresolved names that hold the global object (or, for `top`/`parent`, may: in a top-level window). */
 const GLOBAL_OBJECT_NAMES: Record<string, true> = { globalThis: true, window: true, self: true, frames: true, top: true, parent: true };
@@ -473,24 +481,28 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
 
     /**
      * A binding's value and where it gets it: `var x = v;` (the declarator), or `var x;` written once, by a statement
-     * `x = v;` (that statement). Or a binding written several times, all by its declarator and statements `x = w;` and
-     * `x += w;` in one statement list (a string built in pieces: `var s = "ab"; s += "cd";`), the first of them in
-     * document order an initializer or an `=`: reads after the last write (`after`) see what they compute in order;
-     * reads before it aren't answered. The list runs its statements in order and is only entered at its start, so a
-     * pass through it that reaches `after` ran each write once, in order, from the first.
+     * `x = v;` (that statement). Or a binding written several times, all by its declarators (`var x = ""; var x =
+     * "ab";` declares one binding) and statements `x = w;` and `x += w;` in one statement list (a string built in
+     * pieces: `var s = "ab"; s += "cd";`), the first of them in document order an initializer or an `=`: reads after the
+     * last write (`after`) see what they compute in order; reads before it aren't answered. The list runs its
+     * statements in order and is only entered at its start, so a pass through it that reaches `after` ran each write
+     * once, in order, from the first.
      */
     const builtDefinition = (variable: Variable): Definition | undefined => {
         const [def] = variable.defs;
-        if (variable.defs.length !== 1 || def === undefined || def.type !== "Variable") return undefined;
+        if (def === undefined || (variable.defs.length > 1 && !variable.defs.every((other) => other.type === "Variable" && (other.parent as { kind?: string } | null)?.kind === "var")))
+            return undefined;
+        if (def.type !== "Variable") return undefined;
         const declarator = def.node as unknown as Node;
         const declaration = def.parent as unknown as Node | null;
         if (declarator.type !== "VariableDeclarator" || declarator.id.type !== "Identifier" || declaration?.type !== "VariableDeclaration") return undefined;
-        /** The writes as statements (the declarator's in its declaration), with what each assigns. */
+        /** The writes as statements (a declarator's in its declaration), with what each assigns. */
         const writes: { operator: "=" | "+="; value: Expression; definition: Node; statement: Node }[] = [];
         for (const write of scopes.staticReferences(variable)) {
             if (!write.isWrite()) continue;
-            if (write.init === true && declarator.init !== null) {
-                writes.push({ operator: "=", value: declarator.init, definition: declarator, statement: declaration });
+            const initialized = write.init === true ? parentOf(write.identifier as unknown as Node) : undefined;
+            if (initialized?.type === "VariableDeclarator" && initialized.init !== null) {
+                writes.push({ operator: "=", value: initialized.init, definition: initialized, statement: parentOf(initialized) as Node });
                 continue;
             }
             const operator = assigningStatement(write, "=") !== undefined ? "=" : assigningStatement(write, "+=") !== undefined ? "+=" : undefined;
