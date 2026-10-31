@@ -22,9 +22,15 @@ export const TRANSFORMS = [
     "returnVoid",
     "sequences",
     "objectLiterals",
+    "objectAssignments",
     "regexEscapes",
+    "regexClasses",
     "labeledBlocks",
     "yoda",
+    "booleanTails",
+    "directCalls",
+    "nestedIife",
+    "emptyBranches",
 ] as const;
 
 export type Transform = (typeof TRANSFORMS)[number];
@@ -34,12 +40,24 @@ export class UnminifyContext {
     readonly log: PassLog;
     readonly counts: Record<Transform, number>;
     readonly #hasWith: boolean;
+    readonly #hasEval: boolean;
 
     constructor(scopes: ScopeInfo, log: PassLog) {
         this.scopes = scopes;
         this.log = log;
         this.counts = Object.fromEntries(TRANSFORMS.map((name) => [name, 0])) as Record<Transform, number>;
         this.#hasWith = scopes.manager.scopes.some((scope) => scope.type === "with");
+        this.#hasEval = scopes.manager.scopes.some((scope) => scope.type !== "global" && scope.dynamic);
+    }
+
+    /** Whether the program has a `with` statement (which can answer any name, `this` for calls included). */
+    get hasWith(): boolean {
+        return this.#hasWith;
+    }
+
+    /** Whether some function has a direct `eval` (which can read and write the names it sees). */
+    get hasEval(): boolean {
+        return this.#hasEval;
     }
 
     /** Count a rewrite of `node` and log it. */

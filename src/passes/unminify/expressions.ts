@@ -165,31 +165,74 @@ const inlineTemplateStrings = (node: TemplateLiteral): TemplateLiteral | undefin
 const isPlainPatternChar = (code: number): boolean => (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95 || code === 32;
 
 /**
- * `/\x70\x72\u006fgress/` -> `/progress/`: `\xHH` and `\uHHHH` escapes of letters, `_` and space written as the
- * characters. Those mean the same in and out of classes and with any flag, and can't join what's around them into
- * something else, except after `\c` (`\c\x41` is `\c` and `A` apart, `\cA` a control character), which stays. Digits
- * stay escaped (`\1\x31` would become the reference `\11`), as do other escapes.
+ * Punctuation that means itself anywhere in a pattern without the `v` flag (where `&&`, `!!`, ... inside classes are
+ * reserved). Not `,` (`{1\x2c2}` is literal text, `{1,2}` a quantifier), digits (`\1\x31` would become `\11`), nor any
+ * syntax character.
  */
-const readablePattern = (pattern: string): string | undefined => {
+const PLAIN_PUNCTUATION: ReadonlySet<number> = new Set([..."!\"#%&':;<=>@`~"].map((char) => char.charCodeAt(0)));
+
+/** How many capturing groups a pattern has: each `(` not followed by `?`, and each named group `(?<name>`. */
+const capturingGroups = (pattern: string): number => {
+    let count = 0;
+    let inClass = false;
+    for (let i = 0; i < pattern.length; i++) {
+        const char = pattern[i];
+        if (char === "\\") {
+            i++;
+        } else if (inClass) {
+            if (char === "]") inClass = false;
+        } else if (char === "[") {
+            inClass = true;
+        } else if (char === "(" && (pattern[i + 1] !== "?" || (pattern[i + 2] === "<" && pattern[i + 3] !== "=" && pattern[i + 3] !== "!"))) {
+            count++;
+        }
+    }
+    return count;
+};
+
+/**
+ * `/\x70\x72\u006fgress/` -> `/progress/`, `/\163\137\164h\072/` -> `/s_th:/`: escapes of letters, `_`, space (and,
+ * without the `v` flag, plain punctuation) written as the characters. `\xHH` and `\uHHHH` mean the same in and out
+ * of classes with any flag. A three-digit legacy octal escape (`\163`, only without `u`/`v`) is a character in a
+ * class and, outside one, when it starts with 0 or its number is past the pattern's capturing groups (else it would
+ * be a backreference); one followed by another digit stays (`\1634`: the digits read as one number). Nothing is
+ * unescaped after `\c` (`\c\x41` is `\c` and `A` apart, `\cA` a control character).
+ */
+const readablePattern = (pattern: string, flags: string): string | undefined => {
+    const unicode = flags.includes("u") || flags.includes("v");
+    const readable = (code: number): boolean => isPlainPatternChar(code) || (!flags.includes("v") && PLAIN_PUNCTUATION.has(code));
+    let groups: number | undefined;
     let out = "";
     let changed = false;
     let afterControl = false;
+    let inClass = false;
     for (let i = 0; i < pattern.length;) {
         if (pattern[i] !== "\\") {
+            if (pattern[i] === "[" && !inClass) inClass = true;
+            else if (pattern[i] === "]" && inClass) inClass = false;
             out += pattern[i];
             afterControl = false;
             i++;
             continue;
         }
-        const kind = pattern[i + 1];
+        const kind = pattern[i + 1] ?? "";
         const digits = kind === "x" ? 2 : kind === "u" ? 4 : 0;
         const hex = pattern.slice(i + 2, i + 2 + digits);
-        const code = digits > 0 && hex.length === digits && /^[\dA-Fa-f]+$/.test(hex) ? Number.parseInt(hex, 16) : undefined;
-        if (code !== undefined && isPlainPatternChar(code) && !afterControl) {
+        let code = digits > 0 && hex.length === digits && /^[\dA-Fa-f]+$/.test(hex) ? Number.parseInt(hex, 16) : undefined;
+        let length = 2 + digits;
+        const octal = /^[0-3][0-7]{2}(?!\d)/.exec(pattern.slice(i + 1))?.[0];
+        if (code === undefined && octal !== undefined && !unicode) {
+            groups ??= capturingGroups(pattern);
+            if (inClass || octal.startsWith("0") || Number(octal) > groups) {
+                code = Number.parseInt(octal, 8);
+                length = 4;
+            }
+        }
+        if (code !== undefined && readable(code) && !afterControl) {
             out += String.fromCharCode(code);
             changed = true;
             afterControl = false;
-            i += 2 + digits;
+            i += length;
             continue;
         }
         out += pattern.slice(i, i + 2);
@@ -199,8 +242,80 @@ const readablePattern = (pattern: string): string | undefined => {
     return changed ? out : undefined;
 };
 
+const isAlphanumeric = (char: string | undefined): boolean => char !== undefined && /^[\dA-Za-z]$/.test(char);
+
+/**
+ * A class's letters, digits and ranges between them as one sorted list of ranges (`L-MKN-ZA-DF-JE-E` -> `A-Z`), or
+ * undefined when it holds anything else (escapes, punctuation): which characters it has is all a class means, the
+ * `i` flag folding each the same either way. Runs end at letters or digits: they are what the class has.
+ */
+const canonicalClass = (body: string): string | undefined => {
+    const codes = new Set<number>();
+    for (let i = 0; i < body.length;) {
+        const start = body[i] as string;
+        if (!isAlphanumeric(start)) return undefined;
+        if (body[i + 1] === "-" && i + 2 < body.length) {
+            const end = body[i + 2] as string;
+            if (!isAlphanumeric(end) || end < start) return undefined;
+            for (let code = start.charCodeAt(0); code <= end.charCodeAt(0); code++) codes.add(code);
+            i += 3;
+        } else {
+            codes.add(start.charCodeAt(0));
+            i++;
+        }
+    }
+    const sorted = [...codes].toSorted((a, b) => a - b);
+    let out = "";
+    for (let i = 0; i < sorted.length;) {
+        let j = i;
+        while (j + 1 < sorted.length && sorted[j + 1] === (sorted[j] as number) + 1) j++;
+        const first = String.fromCharCode(sorted[i] as number);
+        const last = String.fromCharCode(sorted[j] as number);
+        out += j - i >= 2 ? `${first}-${last}` : j === i ? first : `${first}${last}`;
+        i = j + 1;
+    }
+    return out;
+};
+
+/**
+ * `[L-MKN-ZA-DF-JE-E]` -> `[A-Z]` (see `canonicalClass`), and the long quantifier spellings `{0,}`, `{1,}`,
+ * `{0,1}` -> `*`, `+`, `?` outside classes (an unescaped `{0,}` there is always a quantifier: anything else is a
+ * syntax error). Not with the `v` flag (its classes nest and have set operations).
+ */
+const canonicalPattern = (pattern: string, flags: string): string | undefined => {
+    if (flags.includes("v")) return undefined;
+    let out = "";
+    for (let i = 0; i < pattern.length;) {
+        const char = pattern[i] as string;
+        if (char === "\\") {
+            out += pattern.slice(i, i + 2);
+            i += 2;
+            continue;
+        }
+        if (char === "[") {
+            let end = i + 1;
+            while (end < pattern.length && pattern[end] !== "]") end += pattern[end] === "\\" ? 2 : 1;
+            const negated = pattern[i + 1] === "^";
+            const body = pattern.slice(i + (negated ? 2 : 1), end);
+            const canonical = body.length === 0 ? undefined : canonicalClass(body);
+            out += canonical === undefined ? pattern.slice(i, end + 1) : `[${negated ? "^" : ""}${canonical}]`;
+            i = end + 1;
+            continue;
+        }
+        const quantifier = /^\{(0,|1,|0,1)\}/.exec(pattern.slice(i))?.[1];
+        if (quantifier !== undefined) {
+            out += quantifier === "0," ? "*" : quantifier === "1," ? "+" : "?";
+            i += quantifier.length + 2;
+            continue;
+        }
+        out += char;
+        i++;
+    }
+    return out === pattern ? undefined : out;
+};
+
 /** Whether `node` mentions the name `name`, or (`ownThis`) uses `this`/`arguments` outside functions that bind their own. */
-const uses = (node: Node | null | undefined, name: string, ownThis: boolean): boolean => {
+export const uses = (node: Node | null | undefined, name: string, ownThis: boolean): boolean => {
     if (node === null || node === undefined) return false;
     if (node.type === "Identifier") return node.name === name || (ownThis && node.name === "arguments");
     if (node.type === "ThisExpression" || node.type === "MetaProperty" || node.type === "Super") return ownThis;
@@ -210,6 +325,28 @@ const uses = (node: Node | null | undefined, name: string, ownThis: boolean): bo
         found ||= uses(child, name, inner);
     });
     return found;
+};
+
+/**
+ * `name.k = v;`, `name["k"] = v;` or `name[1] = v;` as a statement, where `v` doesn't name `name` (nor, with
+ * `ownThis`, uses `this`/`arguments`): the property `k: v` for an object literal. Not `__proto__`, which a literal
+ * reads as the prototype; not computed keys other than literals (an assignment converts its key after the value).
+ */
+export const storedProperty = (statement: Statement, name: string, ownThis: boolean): Node | undefined => {
+    const e = statement.type === "ExpressionStatement" ? statement.expression : undefined;
+    if (e?.type !== "AssignmentExpression" || e.operator !== "=" || e.left.type !== "MemberExpression") return undefined;
+    const { object, property, computed } = e.left;
+    if (object.type !== "Identifier" || object.name !== name || uses(e.right, name, ownThis)) return undefined;
+    const key = computed
+        ? property.type === "Literal" && (typeof property.value === "string" || typeof property.value === "number")
+            ? property.value
+            : undefined
+        : property.type === "Identifier"
+          ? property.name
+          : undefined;
+    if (key === undefined || key === "__proto__") return undefined;
+    const keyNode = typeof key === "string" && isIdentifierName(key) ? at<Expression>({ type: "Identifier", name: key }, property) : valueToNode(key, property);
+    return at<Node>({ type: "Property", kind: "init", key: keyNode, value: e.right, computed: false, method: false, shorthand: false }, statement) as Node;
 };
 
 /**
@@ -253,20 +390,9 @@ const objectFromBuilder = (node: Node, context: UnminifyContext): ObjectExpressi
     if (last?.type !== "ReturnStatement" || last.argument?.type !== "Identifier" || last.argument.name !== name) return undefined;
     const properties: Node[] = [];
     for (const statement of rest.slice(0, -1)) {
-        const e = statement.type === "ExpressionStatement" ? statement.expression : undefined;
-        if (e?.type !== "AssignmentExpression" || e.operator !== "=" || e.left.type !== "MemberExpression") return undefined;
-        const { object, property, computed } = e.left;
-        if (object.type !== "Identifier" || object.name !== name || uses(e.right, name, ownThis)) return undefined;
-        const key = computed
-            ? property.type === "Literal" && (typeof property.value === "string" || typeof property.value === "number")
-                ? property.value
-                : undefined
-            : property.type === "Identifier"
-              ? property.name
-              : undefined;
-        if (key === undefined || key === "__proto__") return undefined;
-        const keyNode = typeof key === "string" && isIdentifierName(key) ? at<Expression>({ type: "Identifier", name: key }, property) : valueToNode(key, property);
-        properties.push(at<Node>({ type: "Property", kind: "init", key: keyNode, value: e.right, computed: false, method: false, shorthand: false }, statement) as Node);
+        const property = storedProperty(statement, name, ownThis);
+        if (property === undefined) return undefined;
+        properties.push(property);
     }
     return at<ObjectExpression>({ type: "ObjectExpression", properties }, node);
 };
@@ -280,15 +406,46 @@ export const rewriteExpression = (path: Path, context: UnminifyContext): Node | 
     switch (node.type) {
         case "Literal": {
             if (!("regex" in node) || node.regex === undefined || node.regex === null) return undefined;
-            const pattern = readablePattern(node.regex.pattern);
+            const { flags } = node.regex;
+            const unescaped = readablePattern(node.regex.pattern, flags);
+            const canonical = canonicalPattern(unescaped ?? node.regex.pattern, flags);
+            const pattern = canonical ?? unescaped;
             if (pattern === undefined) return undefined;
-            context.did("regexEscapes", node);
-            return { ...node, regex: { pattern, flags: node.regex.flags }, raw: `/${pattern}/${node.regex.flags}` } as Node;
+            if (unescaped !== undefined) context.did("regexEscapes", node);
+            if (canonical !== undefined) context.did("regexClasses", node);
+            return { ...node, regex: { pattern, flags }, raw: `/${pattern}/${flags}` } as Node;
         }
         case "CallExpression": {
+            // `(1, f)(x)` -> `f(x)`: both call `f` with no `this`, unless a `with` could answer `f` (then `f()`
+            // passes its object) or `f` is `eval` (the direct call reads the caller's scope, the indirect one not).
+            const callee = node.callee;
+            if (callee.type === "SequenceExpression" && callee.expressions.slice(0, -1).every((e) => e.type === "Literal")) {
+                const target = callee.expressions.at(-1);
+                if (target?.type === "Identifier" && target.name !== "eval" && !context.hasWith) {
+                    context.did("directCalls", node);
+                    return at<Expression>({ ...node, callee: target }, node);
+                }
+            }
             const object = objectFromBuilder(node, context);
             if (object !== undefined) context.did("objectLiterals", node);
             return object;
+        }
+        case "LogicalExpression": {
+            if (node.operator === "??") return undefined;
+            // The operand that can't change the outcome: `false` for `||`, `true` for `&&`.
+            const neutral = node.operator !== "||";
+            const isNeutral = (side: Node): boolean => side.type === "Literal" && side.value === neutral;
+            // `false || a`, `true && a`: the value is `a`'s.
+            if (isNeutral(node.left)) {
+                context.did("booleanTails", node);
+                return node.right;
+            }
+            // `a || false`, `a && true`: only truthiness can tell them from `a`.
+            if (isNeutral(node.right) && isTestedForTruth(path)) {
+                context.did("booleanTails", node);
+                return node.left;
+            }
+            return undefined;
         }
         case "UnaryExpression": {
             if (node.operator !== "!") return undefined;

@@ -1,10 +1,10 @@
-import type { BlockStatement, Expression, ForStatement, IfStatement, LabeledStatement, Node, Statement, VariableDeclaration, VariableDeclarator } from "../../core/ast.js";
+import type { BlockStatement, Expression, ForStatement, IfStatement, LabeledStatement, Node, ObjectExpression, Statement, VariableDeclaration, VariableDeclarator } from "../../core/ast.js";
 import { isFunctionNode } from "../../core/ast.js";
 import { at } from "../../core/build.js";
-import { forEachChild } from "../../core/traverse.js";
+import { forEachChild, traverse } from "../../core/traverse.js";
 import type { Path } from "../../core/traverse.js";
 import type { UnminifyContext } from "./context.js";
-import { not } from "./expressions.js";
+import { not, storedProperty } from "./expressions.js";
 
 const block = (body: Statement[], origin: Node): BlockStatement => at<BlockStatement>({ type: "BlockStatement", body }, origin);
 const expressionStatement = (expression: Expression): Statement => at<Statement>({ type: "ExpressionStatement", expression }, expression);
@@ -184,6 +184,82 @@ export const expandStatements = (list: Statement[], context: UnminifyContext): v
         list.splice(i, 1, ...statements);
         i--;
     }
+    mergeObjectAssignments(list, context);
+};
+
+/** `var o = {};` (one declarator) or `o = {};`: the name and the empty literal. */
+const freshObject = (statement: Statement): { id: Node & { type: "Identifier"; name: string }; literal: ObjectExpression } | undefined => {
+    if (statement.type === "VariableDeclaration" && statement.declarations.length === 1 && statement.kind !== "using" && statement.kind !== "await using") {
+        const [declarator] = statement.declarations;
+        if (declarator?.id.type === "Identifier" && declarator.init?.type === "ObjectExpression" && declarator.init.properties.length === 0) return { id: declarator.id, literal: declarator.init };
+    }
+    const e = statement.type === "ExpressionStatement" ? statement.expression : undefined;
+    if (e?.type === "AssignmentExpression" && e.operator === "=" && e.left.type === "Identifier" && e.right.type === "ObjectExpression" && e.right.properties.length === 0)
+        return { id: e.left, literal: e.right };
+    return undefined;
+};
+
+/**
+ * `var o = {}; o.a = x; o["b"] = y;` -> `var o = { a: x, b: y };` (also after `o = {};`). The values run in the same
+ * order, and setting a property of a fresh plain object creates it as the literal does (model 7; never `__proto__`,
+ * see `storedProperty`). What differs is what `o` holds while the values run (the bare object, or its old value), so
+ * nothing may read `o` then: the values don't name it, no `with` or direct `eval` can, and every other reference to
+ * it is in the same function (which runs these statements in their order, not during them) or in a function created
+ * after them in this list (not a declaration: those exist from the start).
+ */
+const mergeObjectAssignments = (list: Statement[], context: UnminifyContext): void => {
+    if (context.hasWith || context.hasEval) return;
+    /** For identifiers in function expressions (not declarations) of the list: their statement in it. */
+    let created: Map<Node, Statement> | undefined;
+    /** Each statement's index in the list, rebuilt after a merge moves statements up. */
+    let positions: Map<Statement, number> | undefined;
+    const createdAt = (identifier: Node): number => {
+        if (created === undefined) {
+            const found = new Map<Node, Statement>();
+            for (const statement of list) {
+                traverse(statement, {
+                    enter(path) {
+                        if (path.node.type === "FunctionDeclaration") path.skip();
+                        else if (isFunctionNode(path.node)) {
+                            traverse(path.node, { Identifier: (inner) => void found.set(inner.node, statement) });
+                            path.skip();
+                        }
+                    },
+                });
+            }
+            created = found;
+        }
+        positions ??= new Map(list.map((statement, index) => [statement, index]));
+        const statement = created.get(identifier);
+        return statement === undefined ? -1 : (positions.get(statement) ?? -1);
+    };
+    for (let i = 0; i < list.length; i++) {
+        const fresh = freshObject(list[i] as Statement);
+        if (fresh === undefined) continue;
+        const properties: Node[] = [];
+        for (let j = i + 1; j < list.length; j++) {
+            const property = storedProperty(list[j] as Statement, fresh.id.name, false);
+            if (property === undefined) break;
+            properties.push(property);
+        }
+        if (properties.length === 0 || !unobservedDuring(i + properties.length, fresh.id, context, createdAt)) continue;
+        context.did("objectAssignments", list[i] as Statement);
+        fresh.literal.properties.push(...(properties as ObjectExpression["properties"]));
+        list.splice(i + 1, properties.length);
+        positions = undefined;
+    }
+};
+
+/**
+ * Whether no code but the run of statements ending at index `last` of its list (and code that runs in order with
+ * them) can read `id`'s binding while they run: every reference is in the same function, or in a function created
+ * by a statement after the run (`createdAt`: the index of the statement that creates it).
+ */
+const unobservedDuring = (last: number, id: Node, context: UnminifyContext, createdAt: (identifier: Node) => number): boolean => {
+    const variable = context.scopes.variableOf(id);
+    const own = context.scopes.referenceOf(id)?.from.variableScope ?? variable?.scope.variableScope ?? null;
+    if (variable === undefined || own === null) return false;
+    return variable.references.every((reference) => reference.from.variableScope === own || createdAt(reference.identifier as unknown as Node) > last);
 };
 
 const BODY_SLOTS: Readonly<Record<string, readonly string[]>> = {
@@ -211,6 +287,26 @@ const blockBodies = (node: Node, context: UnminifyContext): void => {
 
 /** The unary operators whose result alone, as a statement, does nothing: `void x;`, `!x;`, `typeof x;` are `x;`. */
 const DISCARDABLE_UNARY: ReadonlySet<string> = new Set(["void", "!", "typeof"]);
+
+/**
+ * `function () { return (() => { B })(); }` -> `function () { B }`: the arrow runs right away, with the function's
+ * own `this`, `arguments` and `new.target`, and its returns (or its end) are the function's. Only when neither has
+ * parameters (a `var` of the arrow may share a parameter's name), the function is a plain one, and the arrow has no
+ * directives (`"use strict"` would change the function) and no `arguments` of its own.
+ */
+const inlineNestedIife = (node: Node, context: UnminifyContext): void => {
+    if ((node.type !== "FunctionExpression" && node.type !== "FunctionDeclaration") || node.body === null || node.params.length > 0 || node.async || node.generator) return;
+    const [only] = node.body.body;
+    if (node.body.body.length !== 1 || only?.type !== "ReturnStatement") return;
+    const call = only.argument;
+    if (call?.type !== "CallExpression" || call.arguments.length > 0 || call.optional) return;
+    const arrow = call.callee;
+    if (arrow.type !== "ArrowFunctionExpression" || arrow.async || arrow.params.length > 0 || arrow.body.type !== "BlockStatement") return;
+    if (arrow.body.body.some((statement) => statement.type === "ExpressionStatement" && "directive" in statement && typeof statement.directive === "string")) return;
+    if (context.scopes.scopeOf(arrow)?.set.has("arguments") !== false) return;
+    context.did("nestedIife", node);
+    node.body.body = arrow.body.body;
+};
 
 /**
  * Rewrite the statement at `path` (one step; the caller repeats on the result). Returns the replacement, `null` when
@@ -259,6 +355,13 @@ export const rewriteStatement = (path: Path, context: UnminifyContext): Node | n
             }
             return undefined;
         }
+        case "IfStatement": {
+            // `if (c) {} else { b }` -> `if (!c) { b }`: c runs either way and b exactly when c is falsy.
+            const empty = node.consequent.type === "EmptyStatement" || (node.consequent.type === "BlockStatement" && node.consequent.body.length === 0);
+            if (!empty || node.alternate === null) break;
+            context.did("emptyBranches", node);
+            return at<Statement>({ type: "IfStatement", test: not(node.test, node.test), consequent: node.alternate, alternate: null }, node);
+        }
         case "ReturnStatement": {
             const argument = node.argument;
             if (argument?.type !== "ConditionalExpression") return undefined;
@@ -269,6 +372,10 @@ export const rewriteStatement = (path: Path, context: UnminifyContext): Node | n
             if (node.init !== null || node.update !== null) break;
             context.did("forToWhile", node);
             return at<Statement>({ type: "WhileStatement", test: node.test ?? at<Expression>({ type: "Literal", value: true, raw: "true" }, node), body: node.body }, node);
+        case "FunctionExpression":
+        case "FunctionDeclaration":
+            inlineNestedIife(node, context);
+            return undefined;
         case "ArrowFunctionExpression": {
             // `() => (a, b)` -> `() => { a; return b; }`
             const body = node.body;

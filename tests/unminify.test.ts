@@ -21,10 +21,12 @@ const run = (code: string): unknown[] => {
     return trace;
 };
 
-/** Output of the pass, after checking that it behaves as the input does. */
+/** Output of the pass, after checking that it behaves as the input does (and that the input is a valid script). */
 const sameBehaviour = async (input: string): Promise<string> => {
     const output = await unminify(input);
-    expect(run(output)).toEqual(run(input));
+    const expected = run(input);
+    expect(expected.at(-1)).not.toEqual(["threw", "SyntaxError"]);
+    expect(run(output)).toEqual(expected);
     return output;
 };
 
@@ -145,6 +147,12 @@ describe("unminify", () => {
         expect(count(output, (node) => node.type === "ConditionalExpression")).toBe(0);
     });
 
+    it("inverts an if whose consequent is empty", async () => {
+        const output = await sameBehaviour("var f = t(1), o = t(2), log = [];\nif (f === o) {} else { f = o; log.push(f); }\nif (t(3)) ; else log.push(4);\nresult = log;\n");
+        expect(output).toContain("if (f !== o) {\n  f = o;");
+        expect(output).toContain("if (!t(3)) {\n  log.push(4);");
+    });
+
     it("truncates number operands of bitwise operators as the operators do", async () => {
         const output = await sameBehaviour(
             "var x = 12345; result = [x & 4294967297, x | 1.5, x ^ -4294967296, x << 33, x >> 4294967327, x >>> 32.5, 4294967295 >>> x, 4294967296 << x, 2147483648 | x, 8589934593 >> x];"
@@ -215,6 +223,83 @@ describe("unminify", () => {
             ].join("\n")
         );
         expect(output).toContain("/progress/i, /^(?:Ui|I)nt$/, /[a-f_]+/, /(a)\\1\\x31/, /\\x5bA\\x5d/, /\\c\\x41/");
+    });
+
+    it("writes legacy octal escapes and plain punctuation as characters, keeping backreferences and syntax", async () => {
+        // With 101 groups, `\101` is a backreference to the last one, not `A`.
+        const groups = "(a)".repeat(101);
+        const output = await sameBehaviour(
+            [
+                `var r = [/^\\163\\137\\164h\\072/, /(a)(b)\\2\\1634/, /[\\163\\055]+/, /[\\x3a]/, /[:\\x3a]/v, /a{1\\x2c2}/, /\\061/, /${groups}\\101/];`,
+                `result = r.map(function (x) { return [x.test("s_th:"), x.test("abbs4"), x.test("s-"), x.test(":"), x.test("a{1,2}"), x.test("1"), x.test("${"a".repeat(102)}"), x.test("${"a".repeat(101)}A")]; });`,
+            ].join("\n")
+        );
+        // `[::]` would be a syntax error with the `v` flag.
+        for (const pattern of ["/^s_th:/", "/(a)(b)\\2\\1634/", "/[s\\055]+/", "/[:]/", "/[:\\x3a]/v", "/a{1\\x2c2}/", "/\\061/", `${groups}\\101/`]) expect(output).toContain(pattern);
+    });
+
+    it("writes shuffled classes of letters and digits as sorted ranges and long quantifiers short, not in classes or with v", async () => {
+        const output = await sameBehaviour(
+            [
+                "var r = [/^on[L-MKN-ZA-DF-JE-E]/, /[fea-dDE-FB-CA-A7-960-5]{2}/gi, /[^cba]x{0,}y{1,}z{0,1}?/, /[{0,}]/, /[cba\\-]/, /[ba]/v];",
+                'result = r.map(function (x) { return ["onQ", "a9", "dxxyz", "{", "-", "b"].map(function (s) { x.lastIndex = 0; return x.test(s); }); });',
+            ].join("\n")
+        );
+        for (const pattern of ["/^on[A-Z]/", "/[0-9A-Fa-f]{2}/gi", "/[^a-c]x*y+z??/", "/[{0,}]/", "/[cba\\-]/", "/[ba]/v"]) expect(output).toContain(pattern);
+    });
+
+    it("merges property assignments into the empty literal they follow, unless something could read the object meanwhile", async () => {
+        const output = await sameBehaviour(
+            [
+                'function f(x) { var o = {}; o.a = t(x); o["b-c"] = 2; o[3] = function () { return o.a; }; var later = function () { return o; }; return [o, later()]; }',
+                // A function declared anywhere exists from the start: `peek` could run while `p`'s values do.
+                "function g() { var p = {}; p.a = peek(); p.b = 2; function peek() { return Object.keys(p).length; } return p; }",
+                // An earlier closure sees the variable too.
+                "function h() { var q; var look = function () { return typeof q; }; q = {}; q.a = look(); return q; }",
+                "var o2 = {}; o2.self = typeof o2; o2.x = 1;",
+                "result = [f(1)[0].a, f(2)[0][3](), g(), h(), o2];",
+            ].join("\n")
+        );
+        expect(output).toContain('var o = { a: t(x), "b-c": 2 };\n  o[3] = function () {');
+        expect(output).toContain("p.a = peek();");
+        expect(output).toContain("q.a = look();");
+        expect(output).toContain("o2.self = typeof o2;");
+    });
+
+    it("drops a neutral left operand anywhere, and a neutral right one where only truthiness counts", async () => {
+        const output = await sameBehaviour(
+            "var a = t(0), r = [];\nif (t(1) || false) r.push(1);\nif (a && true) r.push(2);\nr.push(false || t(3), true && t(4), a || false, t(5) && true);\nresult = r;\n"
+        );
+        expect(output).toContain("if (t(1)) {");
+        expect(output).toContain("if (a) {");
+        expect(output).toContain("r.push(t(3), t(4), a || false, t(5) && true);");
+    });
+
+    it("calls through (1, f) directly, not a method, eval, or inside a program with `with`", async () => {
+        const output = await sameBehaviour(
+            'var o = { m: function () { return this === o; } };\nfunction f(x) { return t(x); }\nfunction g() { var x = 1; return (0, eval)("typeof x"); }\nresult = [(1, f)(2), (0, o.m)(), g()];\n'
+        );
+        expect(output).toContain("result = [f(2), (0, o.m)(), g()];");
+        expect(output).toContain('(0, eval)("typeof x")');
+        const scoped = await sameBehaviour('var o = { f: function () { return this === o; } };\nfunction f() { return "global"; }\nwith (o) { result = [(1, f)()]; }\n');
+        expect(scoped).toContain("(1, f)()");
+    });
+
+    it("runs a parameterless function's lone arrow IIFE as its body, not with parameters, a directive or an own arguments", async () => {
+        const output = await sameBehaviour(
+            [
+                "var a = (function () { return (() => { var x = t(1); return [x, this === undefined, arguments.length]; })(); })();",
+                // The arrow's `y` is its own (undefined until set), not the parameter.
+                "var b = (function (y) { return (() => { var r = y; var y = 2; return r; })(); })(1);",
+                // Strict code would see no `this`.
+                'var c = (function () { return (() => { "use strict"; return this; })(); })();',
+                // The arrow's `arguments` is its own variable, not the function's arguments object.
+                "var d = (function () { return (() => { var r = typeof arguments; var arguments = 3; return r; })(); })();",
+                "result = [a, b, typeof c, d];",
+            ].join("\n")
+        );
+        expect(output).toContain("var a = function () {\n  var x = t(1);");
+        expect(count(output, (node) => node.type === "ArrowFunctionExpression")).toBe(3);
     });
 
     it("turns a block left with `break label` from ifs into an if/else chain, not when other jumps name the label", async () => {
