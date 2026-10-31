@@ -1140,9 +1140,26 @@ class CalculatorRewrite {
     }
 
     /**
+     * Whether reading `node`, an argument, after code it doesn't know has run still gives what reading it first did:
+     * a slot read `S[i]` or a `var` whose binding no other function refers to (code that runs while an operator
+     * converts a value is another function's: only a function that names the binding can change it; a recursive
+     * call of this one gets bindings of its own), in a function no `eval` or `with` can reach into.
+     */
+    #stableAcrossCalls(node: Node): boolean {
+        const binding = node.type === "Identifier" ? node : this.#isSlotRead(node) && node.type === "MemberExpression" ? node.object : undefined;
+        const variable = binding === undefined ? undefined : this.scopes.variableOf(binding);
+        if (variable === undefined || variable.scope.dynamic || variable.defs.length !== 1) return false;
+        const [def] = variable.defs;
+        if (def?.type !== "Variable" || def.parent.kind !== "var") return false;
+        const own = variable.scope.variableScope;
+        return this.scopes.staticReferences(variable).every((reference) => reference.from.variableScope === own);
+    }
+
+    /**
      * Why the case's expression can't take the arguments in place of `a[i]`: in the calculation every argument is
      * read before the expression runs; in place, a non-constant one is read where the expression reaches it. That is
-     * the same as long as no conversion that could run code (an operator applied to a possible object) comes first.
+     * the same as long as no conversion that could run code (an operator applied to a possible object) comes first,
+     * or the argument reads the same after any code (`#stableAcrossCalls`).
      */
     #orderProblem(formula: Expression, args: readonly Expression[], calculator: Calculator): string | undefined {
         let converted = false;
@@ -1153,7 +1170,7 @@ class CalculatorRewrite {
                 case "MemberExpression": {
                     const arg = args[Number(propertyKey(node))];
                     if (arg === undefined || this.#isOwnSelector(arg, calculator) || evaluate(arg, this.env).ok) return false;
-                    if (converted) problem ??= "an argument would be read after a conversion that may run code";
+                    if (converted && !this.#stableAcrossCalls(arg)) problem ??= "an argument would be read after a conversion that may run code";
                     return true;
                 }
                 case "UnaryExpression": {

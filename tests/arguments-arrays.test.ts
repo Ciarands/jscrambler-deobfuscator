@@ -190,19 +190,21 @@ result = [f(1, 2), f(), g(3)];
         expect(output).toContain("return arguments[1];");
     });
 
-    it("keeps arguments for non-simple parameter lists", async () => {
+    it("turns S[0][i] into plain-named parameters of non-simple parameter lists, keeping arguments for one with a default", async () => {
         const [before, after, output] = await observe(`
-function f(a = 5, b) {
+function f(a = 5, b, { c }) {
   var S = [arguments];
-  return [S[0][0], S[0][1]];
+  S[0][1] = S[0][1] + 1;
+  return [S[0][0], S[0][1], S[0][2].c];
 }
-result = [f(), f(1, 2)];
+result = [f(undefined, 1, { c: 2 }), f(7, 1, { c: 3 })];
 `);
         expect(after).toBe(before);
-        expect(output).toContain("return [arguments[0], arguments[1]];");
+        expect(output).toContain("b = b + 1;");
+        expect(output).toContain("return [arguments[0], b, arguments[2].c];");
     });
 
-    it("uses arguments in nested arrows and keeps the array where a nested function or class field has its own", async () => {
+    it("uses arguments in nested arrows and a local where a nested function or class field has its own", async () => {
         const [before, after, output] = await observe(`
 function f(a) {
   var S = [arguments];
@@ -215,26 +217,82 @@ result = [f(1), f(2, 3)];
 `);
         expect(after).toBe(before);
         expect(output).toContain("var viaArrow = () => arguments.length;");
-        expect(output).toContain("var S = [arguments];");
-        expect(output).toContain("return S[0][0];");
-        expect(output).toContain("n = S[0].length;");
+        expect(output).toContain("var S_0 = arguments;");
+        expect(output).toContain("return S_0[0];");
+        expect(output).toContain("n = S_0.length;");
+        expect(output).not.toContain("[arguments]");
     });
 
-    it("keeps S[0][i] where the parameter's name is shadowed", async () => {
+    it("reads a copy of the parameter where its name is shadowed", async () => {
         const [before, after, output] = await observe(`
 function f(a) {
   var S = [arguments];
-  return function (a) { return S[0][0] + a; }(5) + S[0][0];
+  return function (a) { return S[0][0] + a; }(5) + S[0][0] + (() => { let a = 3; return S[0][0] * a; })();
 }
 result = [f(1), f()];
 `);
         expect(after).toBe(before);
-        expect(output).toContain("var S = [arguments];");
-        expect(output).toContain("return S[0][0] + a;");
-        expect(output).toContain("}(5) + a;");
+        expect(output).toContain("var a_1 = a;");
+        expect(output).toContain("return a_1 + a;");
+        expect(output).toContain("}(5) + a +");
+        expect(output).toContain("return a_1 * a;");
+        expect(output).not.toContain("arguments");
     });
 
-    it("keeps the array for S[0] when S[0] is written", async () => {
+    it.each([
+        ["sloppy", ""],
+        ["strict", '"use strict";\n'],
+    ])("uses a local for S[0] where the parameter is written and arguments isn't visible (%s mode)", async (_, mode) => {
+        const [before, after, output] = await observe(`${mode}
+function f(a) {
+  var S = [arguments];
+  var read = function (a) { return S[0][0]; };
+  a = 2;
+  return [read(9), S[0][0], a];
+}
+result = [f(1), f()];
+`);
+        expect(after).toBe(before);
+        expect(output).toContain("var S_0 = arguments;");
+        expect(output).toContain("return S_0[0];");
+        expect(output).not.toContain("[arguments]");
+    });
+
+    it("doesn't copy a parameter whose name is shadowed where the array is created", async () => {
+        const [before, after, output] = await observe(`
+function f(a) {
+  block: {
+    let a = 9;
+    var S = [arguments];
+    return [a, S[0][0], function (a) { return S[0][0]; }(2)];
+  }
+}
+result = [f(1), f()];
+`);
+        expect(after).toBe(before);
+        expect(output).not.toContain("= a;");
+        expect(output).toMatch(/return \[\s*a,\s*arguments\[0\],\s*function \(a\) \{/);
+        expect(output).toContain("return S_0[0];");
+    });
+
+    it("names a parameter where only a converted nested array shadowed it", async () => {
+        const [before, after, output] = await observe(`
+function f(e, a) {
+  var S = [arguments];
+  return function () {
+    var a = [arguments];
+    a[1] = "inner";
+    return S[0][1] + a[1];
+  }();
+}
+result = [f(1, "outer"), f()];
+`);
+        expect(after).toBe(before);
+        expect(output).toContain('var a_1 = "inner";');
+        expect(output).toContain("return a + a_1;");
+    });
+
+    it("turns S[0] into a local when S[0] is written", async () => {
         const [before, after, output] = await observe(`
 function f(a) {
   var S = [arguments];
@@ -245,19 +303,90 @@ function f(a) {
 result = [f(1), f()];
 `);
         expect(after).toBe(before);
-        expect(output).toContain("S[0] = [7];");
-        expect(output).toContain("var S_1 = S[0][0];");
+        expect(output).toContain("var S_0 = arguments;");
+        expect(output).toContain("S_0 = [7];");
+        expect(output).toContain("var S_1 = S_0[0];");
     });
 
     it.each([
         ["arguments is reassigned", "function f(a) { var S = [arguments]; S[1] = 1; arguments = [9]; return [S[0][0], arguments[0], a, S[1]]; } result = [f(1), f()];"],
         ["element 0 is an enclosing function's arguments", "function outer() { return ((a) => { var S = [arguments]; S[1] = 1; return [S[0][0], a, S[1]]; })(5); } result = [outer(1), outer()];"],
-    ])("keeps the array for S[0] when %s", async (_, code) => {
+    ])("turns S[0] into a local when %s", async (_, code) => {
         const [before, after, output] = await observe(code);
         expect(after).toBe(before);
-        expect(output).toContain("var S = [arguments];");
-        expect(output).toContain("S[0][0]");
-        expect(output).not.toContain("S[1]");
+        expect(output).toContain("var S_0 = arguments;");
+        expect(output).toContain("S_0[0]");
+        expect(output).not.toContain("S[");
+    });
+
+    it("keeps arguments where S[0][i] is written and arguments is read directly, but not for its length or by a literal ignoring it", async () => {
+        const [before, after, output] = await observe(`
+function read(a) {
+  var S = [arguments];
+  S[0][0] = 5;
+  return [S[0][0], arguments[0]];
+}
+function length(a) {
+  var S = [arguments];
+  S[0][0] = 5;
+  return [S[0][0], arguments.length];
+}
+function applied(a) {
+  var S = [arguments];
+  S[0][0] = 5;
+  return [S[0][0], function (x) { return x; }.apply(null, arguments)];
+}
+function appliedOwn(a) {
+  var S = [arguments];
+  S[0][0] = 5;
+  return [S[0][0], function () { return arguments[0]; }.apply(null, arguments)];
+}
+function ignored(a) {
+  var S = [arguments];
+  S[0][0] = 5;
+  return [S[0][0], function () { return 1; }.apply(null, arguments), (() => 2).apply(null, arguments)];
+}
+function viaFrame(a) {
+  var S = [arguments];
+  S[0][0] = 5;
+  return [S[0][0], function () { var T = [arguments]; T[1] = 3; return T[1]; }.apply(null, arguments)];
+}
+function viaFrameRead(a) {
+  var S = [arguments];
+  S[0][0] = 5;
+  return [S[0][0], function () { var T = [arguments]; return T[0][0]; }.apply(null, arguments)];
+}
+function viaKeptFrame(a) {
+  var S = [arguments];
+  S[0][0] = 5;
+  return [S[0][0], function () { var T = [arguments]; return T; }.apply(null, arguments)[0][0]];
+}
+result = [
+  read(1), read(), length(1), length(), applied(1), applied(), appliedOwn(1), appliedOwn(),
+  ignored(1), ignored(), viaFrame(1), viaFrame(), viaFrameRead(1), viaFrameRead(), viaKeptFrame(1), viaKeptFrame(),
+];
+`);
+        expect(after).toBe(before);
+        expect(output).toContain("arguments[0] = 5;\n  return [arguments[0], arguments[0]];");
+        expect(output).toContain("a = 5;\n  return [a, arguments.length];");
+        expect(output).toMatch(/arguments\[0\] = 5;\s*return \[\s*arguments\[0\],\s*function \(x\) \{/);
+        expect(output).toMatch(/arguments\[0\] = 5;\s*return \[\s*arguments\[0\],\s*function \(\) \{\s*return arguments\[0\];/);
+        expect(output).toMatch(/a = 5;\s*return \[\s*a,\s*function \(\) \{\s*return 1;/);
+        expect(output).toMatch(/a = 5;\s*return \[\s*a,\s*function \(\) \{\s*var T_1 = 3;/);
+        // read, applied, appliedOwn, viaFrameRead and viaKeptFrame.
+        expect(output.match(/arguments\[0\] = 5;/g)).toHaveLength(5);
+    });
+
+    it("keeps arguments when a parameter name is declared twice", async () => {
+        const [before, after, output] = await observe(`
+function f(a, a) {
+  var S = [arguments];
+  return [S[0][0], S[0][1]];
+}
+result = [f(1, 2), f(1)];
+`);
+        expect(after).toBe(before);
+        expect(output).toContain("return [arguments[0], arguments[1]];");
     });
 
     it("keeps arguments for S[0][i] that is deleted or called on", async () => {
@@ -294,11 +423,70 @@ result = [deleted(1), called(function () { return this.length; })];
         ["it is declared again", "function f() { var S = [arguments]; S[1] = 1; var S = [0, 2]; return S[1]; } result = f();"],
         ["it is a const", "function f(x) { const S = [arguments]; if (x) S[1] = 1; return S[1]; } result = [f(1), f()];"],
         ["it is declared in a block", 'function f(x) { if (x) { var S = [arguments]; S[1] = 1; } try { return S[1]; } catch (e) { return "threw"; } } result = [f(1), f()];'],
+        ["it is assigned in a loop", "function f(n) { var S; for (var i = 0; i < n; i++) { S = [arguments]; S[1] = (S[1] || 0) + i; } return n ? S[1] : 0; } result = [f(0), f(3)];"],
+        ["it is assigned twice", "function f(x) { var S; S = [arguments]; S[1] = 1; var g = function () { return S[1]; }; if (x) S = [arguments]; return [g(), S[1]]; } result = [f(0), f(1)];"],
+        ["it is read before it is assigned", "function f() { var S; var r = typeof S; S = [arguments]; S[1] = 1; return [r, S[1]]; } result = f();"],
+        ["it is assigned as part of an expression", "function f() { var S; var T = S = [arguments]; S[1] = 1; return [T[1], S[1]]; } result = f();"],
+        ["it is assigned in an if test", "function f(x) { var S; if (S = [arguments]) { S[1] = x; } return S[1]; } result = [f(1), f()];"],
+        [
+            "a break before it can leave a labeled block around it",
+            'function f(x) { out: { if (x) break out; var S = [arguments]; S[1] = 1; } try { return S[1]; } catch (e) { return "threw"; } } result = [f(0), f(1)];',
+        ],
+        [
+            "a labeled block around it declares a function",
+            'function f(x) { out: { var r = g(); var S = [arguments]; S[1] = 1; function g() { try { return S[1]; } catch (e) { return "threw"; } } } return [r, S[1]]; } result = f();',
+        ],
+        ["its bare declaration is in a for head", "function f() { for (var S, i = 0; i < 1; i++); S = [arguments]; S[1] = 1; return S[1]; } result = f();"],
     ])("leaves the array alone when %s", async (_, code) => {
         const [before, after, output] = await observe(code);
         expect(after).toBe(before);
         expect(output).toContain("S = [arguments");
         expect(output).toContain("S[1]");
+    });
+
+    it("converts the assignment form: a bare var, then the statement S = [arguments] in a labeled block", async () => {
+        const [before, after, output] = await observe(`
+function f(a, b) {
+  var S, n;
+  n = 2;
+  out: {
+    S = [arguments, 1];
+    S[3] = S[0][0] + S[1];
+    if (!b) break out;
+    S[4] = function () { return S[3] + S[0][1]; };
+  }
+  return [S[3], S[4] ? S[4].call() : 0, n];
+}
+function empty(a) {
+  var S;
+  S = [arguments];
+  return a;
+}
+result = [f(1), f(1, 2), empty(3)];
+`);
+        expect(after).toBe(before);
+        expect(output).not.toContain("arguments");
+        expect(output).toContain("var n;");
+        expect(output).toContain("var S_1 = 1;");
+        expect(output).toContain("var S_3 = a + S_1;");
+        expect(output).toContain("return S_3 + b;");
+        expect(output).toMatch(/function empty\(a\) \{\s*return a;\s*\}/);
+    });
+
+    it("lets hoisted functions reference each other before the array is created", async () => {
+        const [before, after, output] = await observe(`
+function f(a) {
+  function walk(n) { return n > 0 ? walk(n - 1) + 1 : read(); }
+  function read() { read = function () { return -1; }; return S[1] + S[0][0]; }
+  var S = [arguments];
+  S[1] = 10;
+  return [walk(2), walk(1)];
+}
+result = [f(1), f()];
+`);
+        expect(after).toBe(before);
+        expect(output).not.toContain("[arguments]");
+        expect(output).toContain("return S_1 + a;");
     });
 
     it("converts arrays whose hoisted functions are only called after the declaration", async () => {

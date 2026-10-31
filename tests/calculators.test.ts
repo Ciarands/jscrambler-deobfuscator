@@ -164,6 +164,9 @@ describe("calculators", () => {
         expect(observed(later(body))).toBe("12");
         const output = await sameBehaviour(later(body));
         expect(output).toContain("result = G.c(o, 1, z);");
+        // No other function names z or the slot array: whatever a conversion runs, they read the same after it.
+        const stable = await sameBehaviour(later("  var z = 2;\n  S[2] = 3;\n  var o = { valueOf: function () { return 7; } };\n  G.s(4);\n  result = [G.c(o, 1, z), G.c(o, 1, S[2])];"));
+        expect(stable).toContain("result = [(o - 1) * z, (o - 1) * S[2]];");
     });
 
     it("puts getter arguments in when each is read once, in the order they were passed", async () => {
@@ -255,5 +258,15 @@ describe("calculators", () => {
     it("keeps calculations whose methods may be replaced after the prelude", async () => {
         const output = await sameBehaviour(later("  G.K.calc = function () { return 42; };\n  G.s(0);\n  result = G.c(3, 1);"));
         expect(output).toContain("result = G.c(3, 1);");
+    });
+});
+
+describe("calculators in the whole pipeline", () => {
+    it("replaces calculations whose arguments become plain parameters once the arguments array goes", async () => {
+        // `S[0][1]` read before `S[0][0]` may be a getter read out of turn; as parameters they are plain reads.
+        const program = `${calculator()}function f(p, q) {\n  var S = [arguments];\n  G.K.sel(1);\n  return G.K.calc(S[0][0], S[0][1]);\n}\nsetTimeout(function () { result = [f(2, 3), f(1, 8)]; });\n`;
+        const { code } = await deobfuscate(program);
+        expect(observed(code)).toBe(observed(program));
+        expect(code).toContain("return q << p;");
     });
 });

@@ -58,6 +58,17 @@ describe("cleanup", () => {
         expect(code).toContain("function G() {}");
         expect(code).toContain("G.D = ");
     });
+
+    it("removes stores of the runtime as a global the program never names, and keeps one it reads back", async () => {
+        const program = `${RUNTIME}globalThis.Kept = G;\nf(host);\nresult = out;\n`;
+        const { code } = await deobfuscate(program);
+        expect(run(code)).toBe(run(program));
+        expect(code).not.toMatch(/\bG\b|Kept/);
+        const readBack = `${RUNTIME}globalThis.Kept = G;\nf(host);\nresult = [out, typeof globalThis.Kept];\n`;
+        const kept = await deobfuscate(readBack);
+        expect(run(kept.code)).toBe(run(readBack));
+        expect(kept.code).toContain("globalThis.Kept = G;");
+    });
 });
 
 /** What a script leaves in `result`; `setTimeout` callbacks (code after the prelude) run once it has finished. */

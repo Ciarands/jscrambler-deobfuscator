@@ -190,3 +190,42 @@ describe("code-locks full removal", () => {
         }
     });
 });
+
+/** A self-defending check: every return answers 48; the checks' other outcome is a trap that never returns. */
+const constantLock = (checks = "") => `
+function G() {}
+var seen = false;
+G.L = function () {
+  var c = [arguments];
+  c[6] = undefined;
+  c[3] = {};
+  c[3].check = function () {
+    var d = [arguments];
+    if (c[6]) { return 48; }
+    d[1] = function () { return "x".toUpperCase(); };
+    if (/X/.test(d[1] + [])) { while (78) {} }${checks}
+    c[6] = 48;
+    return 48;
+  };
+  return c[3];
+}();
+var first = G.L.check();
+setTimeout(function () { result = [first, G.L.check(), G.L.check() + 1, seen]; });
+`;
+
+describe("code-locks: constant locks", () => {
+    it("answers every call, the prelude's included, when the checks touch only their own objects", async () => {
+        const program = constantLock();
+        const output = await run(program);
+        expect(observed(output)).toBe(observed(program));
+        expect(output).not.toContain("G.L.check()");
+        expect(output).toContain("var first = 48;");
+    });
+
+    it("keeps every call when the checks change something outside their own objects", async () => {
+        const program = constantLock("\n    seen = true;");
+        const output = await run(program);
+        expect(observed(output)).toBe(observed(program));
+        expect(output).toContain("var first = G.L.check();");
+    });
+});

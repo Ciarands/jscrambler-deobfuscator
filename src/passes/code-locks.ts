@@ -6,6 +6,8 @@ import type { ScopeInfo } from "../core/scope.js";
 import type { Path } from "../core/traverse.js";
 import { replaceNodes, traverse } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
+import { factKey } from "../pipeline/facts.js";
+import type { ResolveResult } from "./emulate/guest.js";
 import type { Slot } from "./emulate/builders.js";
 import { bodyOf, builderOf, definitionOf, returnsOf, sameSlot, slotOf, slotsOnly } from "./emulate/builders.js";
 import { storageAnalysis } from "./emulate/effects.js";
@@ -18,7 +20,15 @@ import { onlyTested, rootStatements } from "./emulate/storage.js";
 import { localityOf } from "./locality.js";
 
 type FastPath =
-    | { readonly ok: true; readonly answer: Primitive; readonly method: FunctionNode; readonly cache: Slot; readonly parents: ReadonlyMap<Node, Node> }
+    | {
+          readonly ok: true;
+          readonly answer: Primitive;
+          readonly method: FunctionNode;
+          readonly cache: Slot;
+          readonly parents: ReadonlyMap<Node, Node>;
+          /** Every return gives the answer: a call answers it whether the cache is set or not (when it returns). */
+          readonly constant: boolean;
+      }
     | { readonly ok: false; readonly reason: string; readonly node: Node };
 
 const refused = (reason: string, node: Node): FastPath => ({ ok: false, reason, node });
@@ -81,11 +91,14 @@ const fastPathOf = (iife: FunctionNode, method: string, scopes: ScopeInfo): Fast
         },
     });
     if (clearable !== undefined) return refused(`${method}'s cache may be cleared`, clearable);
-
-    // The other returns can't give the answer: answering it means the cache was read.
-    const other = returnsOf(fn).find((r) => r !== taken && (r.type !== "ReturnStatement" || !isPrimitiveLiteral(r.argument) || Object.is(r.argument.value, answer)));
+    // The other returns: literals other than the answer (answering it then means the cache was read), or all the
+    // answer itself (a self-defending check: it answers that or never returns).
+    const others = returnsOf(fn).filter((r) => r !== taken);
+    const isAnswer = (r: Node): boolean => r.type === "ReturnStatement" && isPrimitiveLiteral(r.argument) && Object.is(r.argument.value, answer);
+    if (others.length > 0 && others.every(isAnswer)) return { ok: true, answer, method: fn, cache, parents: builder.parents, constant: true };
+    const other = others.find((r) => r.type !== "ReturnStatement" || !isPrimitiveLiteral(r.argument) || isAnswer(r));
     if (other !== undefined) return refused(`${method} may answer ${String(answer)} without its cache`, other);
-    return { ok: true, answer, method: fn, cache, parents: builder.parents };
+    return { ok: true, answer, method: fn, cache, parents: builder.parents, constant: false };
 };
 
 /**
@@ -237,16 +250,22 @@ const isGlobalRead = (call: Node, runtime: RuntimeModel, matcher: StorageMatcher
     return key !== undefined && runtime.globalReads.has(key) && matcher.isStorage(call.callee.object) && effects.staleAt(call.callee.object, [key]) === undefined;
 };
 
-/** Why the whole lock can't go (its first call included), if anything stops it. */
-const fullModeRefusal = (
-    lock: Lock,
-    context: { program: Node; runtime: RuntimeModel; scopes: ScopeInfo; matcher: StorageMatcher; effects: StorageEffects; uses: Survey }
-): { reason: string; node: Node } | undefined => {
-    const { path, sites, full, staleness, fast, builder } = lock;
-    const { program, runtime, scopes, matcher, effects, uses } = context;
-    if (path.length !== 2) return { reason: "its holder isn't a key of the storage object itself", node: builder };
+type LockContext = { program: Node; runtime: RuntimeModel; scopes: ScopeInfo; matcher: StorageMatcher; effects: StorageEffects; uses: Survey };
+
+/** Why the lock's checks (its first call) may change more than objects they create and its cache, if they may. */
+const localityRefusal = (fast: FastPath & { ok: true }, context: LockContext): { reason: string; node: Node } | undefined => {
+    const { runtime, scopes, matcher, effects } = context;
     const effect = localityOf(fast.method, fast.cache, scopes, fast.parents, (call) => isGlobalRead(call, runtime, matcher, effects));
-    if (effect !== undefined) return { reason: `its checks may change more than their own objects: ${effect.reason}`, node: effect.node };
+    return effect === undefined ? undefined : { reason: `its checks may change more than their own objects: ${effect.reason}`, node: effect.node };
+};
+
+/** Why the whole lock can't go (its first call included), if anything stops it. */
+const fullModeRefusal = (lock: Lock, context: LockContext): { reason: string; node: Node } | undefined => {
+    const { path, sites, full, staleness, fast, builder } = lock;
+    const { program, runtime, matcher, effects, uses } = context;
+    if (path.length !== 2) return { reason: "its holder isn't a key of the storage object itself", node: builder };
+    const local = localityRefusal(fast, context);
+    if (local !== undefined) return local;
     const used = sites.findIndex(({ discarded }, i) => !discarded && full[i] !== "answer");
     if (used !== -1) return { reason: staleness[used]?.reason ?? "a call whose value is used runs in the prelude, where it may be the first call", node: (sites[used] as CallSite).call };
     const dynamic = uses.dynamic.find(({ node, site }) => !effects.runsBefore(site, builder) && !effects.keptAsGlobal(node));
@@ -269,6 +288,9 @@ export const rewriteCalls = (program: Node, replacements: ReadonlyMap<Node, Node
     });
 };
 
+/** Each lock's first probe in the guest, by path: later runs (the cleanup group's) reuse it. */
+const LOCK_PROBES = factKey<Map<string, ResolveResult | undefined>>("code-lock probes");
+
 /**
  * Code locks: jscrambler's environment checks (`G.k.m()`, usually through a wrapper the wrappers pass has inlined)
  * run once and then answer from a cache. The prelude makes the first call; every call after it takes the cached path:
@@ -288,6 +310,11 @@ export const rewriteCalls = (program: Node, replacements: ReadonlyMap<Node, Node
  * or to keep it as a global the program never names again (other scripts don't read it: model 2). So no call made
  * later finds the cache unset, and cleanup removes the builder and the wrappers nothing reads. Otherwise partial mode:
  * only calls that run after the prelude go, the prelude's stay, so the checks run when the original's did.
+ *
+ * Constant locks (self-defending checks): every return gives the answer, and the checks' other outcome is a trap
+ * that never returns (`while (78) {}`), which the environment never meets (model 5). Every call answers, cached or
+ * not, so only full mode applies, and any call may answer, the prelude's too. The guest isn't asked: there the checks
+ * may well fall into the trap.
  */
 export const codeLocks: Pass = {
     name: "code-locks",
@@ -301,6 +328,8 @@ export const codeLocks: Pass = {
         const scopes = scope();
         const { matcher, effects } = storageAnalysis(program, runtime, scopes, log);
         const programSurvey = survey(program, matcher, scopes);
+        const probes = facts.get(LOCK_PROBES) ?? new Map<string, ResolveResult | undefined>();
+        facts.set(LOCK_PROBES, probes);
 
         const replacements = new Map<Node, Node>();
         const removals = new Set<Node>();
@@ -315,25 +344,40 @@ export const codeLocks: Pass = {
                 log.debug(`${name} is no code lock: ${fast.reason}`, fast.node);
                 continue;
             }
-            const [probe] = runtime.guest.resolve([{ path, args: [] }]);
-            if (probe === undefined || !probe.ok || "nonPrimitive" in probe || !probe.repeatable || !Object.is(probe.value, fast.answer)) {
-                log.debug(`${name} looks like a code lock, but in the guest it doesn't answer ${String(fast.answer)} from its cache`, fast.method);
-                continue;
+            if (!fast.constant) {
+                // The probe runs the lock in the guest, setting its cache there if the prelude hadn't: a later run
+                // must see what the first probe saw, not the state that probe left.
+                const id = path.join("\u0000");
+                const probe = probes.get(id) ?? runtime.guest.resolve([{ path, args: [] }])[0];
+                probes.set(id, probe);
+                if (probe === undefined || !probe.ok || "nonPrimitive" in probe || !probe.repeatable || !Object.is(probe.value, fast.answer)) {
+                    log.debug(`${name} looks like a code lock, but in the guest it doesn't answer ${String(fast.answer)} from its cache`, fast.method);
+                    continue;
+                }
             }
             counts.locks++;
-            log.debug(`${name} is a code lock: after its first call it answers ${String(fast.answer)} and does nothing else`, fast.method);
+            log.debug(
+                fast.constant
+                    ? `${name} is a constant lock: every call that returns answers ${String(fast.answer)}`
+                    : `${name} is a code lock: after its first call it answers ${String(fast.answer)} and does nothing else`,
+                fast.method
+            );
 
             const staleness = sites.map(({ site }) => effects.staleAt(site, path));
             // A discarded call's answer is as good as no call; a used one may answer the cached value only after the prelude.
             const full = sites.map(({ statement, discarded, site }, i): Disposition =>
-                staleness[i] !== undefined ? "keep" : statement !== undefined ? "remove" : discarded || effects.runsAfterPrelude(site) ? "answer" : "keep"
+                staleness[i] !== undefined ? "keep" : statement !== undefined ? "remove" : discarded || fast.constant || effects.runsAfterPrelude(site) ? "answer" : "keep"
             );
+            // A constant lock's later calls may still be its first: no partial mode.
             const partial = sites.map(({ statement, site }, i): Disposition =>
-                staleness[i] !== undefined || !effects.runsAfterPrelude(site) ? "keep" : statement === undefined ? "answer" : "remove"
+                fast.constant || staleness[i] !== undefined || !effects.runsAfterPrelude(site) ? "keep" : statement === undefined ? "answer" : "remove"
             );
-            const refusal = fullModeRefusal({ path, sites, full, staleness, fast, builder: definition.statement }, { program, runtime, scopes, matcher, effects, uses: programSurvey });
+            // A constant lock's calls answer whoever else may call it: callers the analysis can't see run the checks
+            // themselves, which touch only their own objects.
+            const context = { program, runtime, scopes, matcher, effects, uses: programSurvey };
+            const refusal = fast.constant ? localityRefusal(fast, context) : fullModeRefusal({ path, sites, full, staleness, fast, builder: definition.statement }, context);
             if (refusal === undefined) counts.full++;
-            else log.debug(`${name}: partial mode, the prelude's calls stay: ${refusal.reason}`, refusal.node);
+            else log.debug(`${name}: ${fast.constant ? "kept" : "partial mode, the prelude's calls stay"}: ${refusal.reason}`, refusal.node);
 
             const dispositions = refusal === undefined ? full : partial;
             const lock = { removed: 0, answered: 0, kept: 0 };

@@ -61,21 +61,32 @@ const isLocalScope = (scopeType: string): boolean => scopeType !== "global" && s
  * - `stage`: a call into the runtime with constant arguments, or a bare read of it (decoder stages, code locks),
  *   affecting the state kept under `key`;
  * - `setup`: the call that defined the aliases;
- * - `fn`: a root function that may go when nothing that stays uses it.
+ * - `fn`: a root function that may go when nothing that stays uses it;
+ * - `store`: `globalThis.P = G`, keeping the runtime as a global the program never names (other scripts don't read
+ *   it: model 2), so nothing reads it.
  */
 type Role =
     | { kind: "def"; key: string; removable: boolean }
     | { kind: "stage"; key: string; probe: { call: ResolveRequest } | { read: readonly string[] } }
     | { kind: "setup" }
     | { kind: "fn"; name: string }
+    | { kind: "store" }
     | { kind: "other" };
 
-const isRemovable = (role: Role): boolean => (role.kind === "def" && role.removable) || role.kind === "stage" || role.kind === "setup" || role.kind === "fn";
+const isRemovable = (role: Role): boolean => (role.kind === "def" && role.removable) || role.kind === "stage" || role.kind === "setup" || role.kind === "fn" || role.kind === "store";
 
-const roleOf = (statement: Statement, runtime: RuntimeModel, isStorage: (n: Node) => boolean, scopes: ScopeInfo, detectorBuilders: ReadonlySet<Node> | undefined): Role => {
+const roleOf = (
+    statement: Statement,
+    runtime: RuntimeModel,
+    isStorage: (n: Node) => boolean,
+    keptAsGlobal: (n: Node) => boolean,
+    scopes: ScopeInfo,
+    detectorBuilders: ReadonlySet<Node> | undefined
+): Role => {
     if (runtime.setup.has(statement)) return { kind: "setup" };
     if (statement.type !== "ExpressionStatement") return { kind: "other" };
     const e = statement.expression;
+    if (e.type === "AssignmentExpression" && e.operator === "=" && isStorage(e.right) && keptAsGlobal(e.right)) return { kind: "store" };
     if (e.type === "AssignmentExpression" && e.operator === "=" && e.left.type === "MemberExpression" && isStorage(e.left.object)) {
         const key = propertyKey(e.left);
         if (key === undefined) return { kind: "other" };
@@ -294,7 +305,7 @@ const removeRuntime = (
     // read with a computed key) and where it still uses an alias or a global the setup added. Those only matter in
     // statements that stay: the decoder's own `G[name]` lookup goes with the decoder. Plain computed reads in code that
     // runs only during the prelude are kept apart (`computed`): see `selectable`.
-    const roles = body.map((statement) => roleOf(statement, runtime, isStorage, scopes, detectorBuilders));
+    const roles = body.map((statement) => roleOf(statement, runtime, isStorage, (node) => effects.keptAsGlobal(node), scopes, detectorBuilders));
     const reads = body.map(() => new Set<string>());
     const names = body.map(() => new Set<string>());
     const escapes: (Node | undefined)[] = body.map(() => undefined);
