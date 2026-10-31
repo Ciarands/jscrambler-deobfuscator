@@ -1,9 +1,9 @@
-import type { Expression, MemberExpression, Node } from "./ast.js";
+import type { ArrowFunctionExpression, Expression, Function as FunctionNode, MemberExpression, Node } from "./ast.js";
 import { isIndexKey, memberKey } from "./ast.js";
 import type { EvaluateEnv, Evaluation, Value } from "./evaluate.js";
-import { evaluate, FAIL, value } from "./evaluate.js";
+import { binary, evaluate, FAIL, value } from "./evaluate.js";
 import type { PassLog } from "./log.js";
-import type { ScopeInfo, Variable } from "./scope.js";
+import type { Reference, ScopeInfo, Variable } from "./scope.js";
 import { forEachChild } from "./traverse.js";
 
 /** Document order of one scope block, as the tree is now (after unflattening, that is execution order). */
@@ -19,6 +19,37 @@ const ORDERED: Record<string, true> = { Identifier: true, MemberExpression: true
 
 /** A constant and the node after which (in document order) it holds. */
 type Constant = { readonly value: Value; readonly after: Node };
+
+/**
+ * Where a binding gets its value: `value` at `definition` (in `statement`), then the `steps` (statements `x = w;` and
+ * `x += w;`) after it in the same statement list; the whole holds after `after` (the last of these writes).
+ */
+interface Definition {
+    readonly value: Node;
+    readonly definition: Node;
+    readonly statement: Node;
+    readonly steps: readonly { readonly operator: "=" | "+="; readonly value: Expression }[];
+    readonly after: Node;
+}
+
+export type FunctionLike = FunctionNode | ArrowFunctionExpression;
+
+/** A function a binding holds for good: from entry (`after` undefined: a declaration), or after `after` in `block`. */
+interface FunctionBinding {
+    readonly fn: FunctionLike;
+    readonly after: Node | undefined;
+    readonly block: Node;
+}
+
+/** `constantEnv`'s environment, plus what the functions it knows of are. */
+export interface ConstantEnv extends EvaluateEnv {
+    /**
+     * The function a reference (`f` of `f(x)`) holds for good where it is, if any: a function declaration, never
+     * written, or a function or arrow expression the binding gets once (like a constant),
+     * when the reference comes after that.
+     */
+    readonly functionAt: (identifier: Node) => FunctionLike | undefined;
+}
 
 /** A constant array: what each element evaluates to, and the definition (in `block`) after which the array holds. */
 interface Table {
@@ -70,7 +101,7 @@ interface ProgramFacts {
  * assignment (`a[k] = v;` as a statement) and a property (a destructuring target). Other parents are never read, so
  * leaving them out of the map (most of the program) changes no answer.
  */
-const PARENT_ASKED: Record<string, true> = { Identifier: true, MemberExpression: true, VariableDeclaration: true, AssignmentExpression: true, Property: true };
+const PARENT_ASKED: Record<string, true> = { Identifier: true, MemberExpression: true, VariableDeclaration: true, AssignmentExpression: true, ExpressionStatement: true, Property: true };
 
 /** Unresolved names that hold the global object (or, for `top`/`parent`, may: in a top-level window). */
 const GLOBAL_OBJECT_NAMES: Record<string, true> = { globalThis: true, window: true, self: true, frames: true, top: true, parent: true };
@@ -165,14 +196,16 @@ const escapingUse = (member: Node, above: Node | undefined): string | undefined 
  * An evaluation environment that sees through constant bindings, constant `arguments`-array slots and constant arrays:
  *
  * - `var n = 1259;` makes later reads of `n` evaluate to 1259;
+ * - `var s = "ab"; s += "cd";` makes reads of `s` after the append evaluate to "abcd";
  * - `var a = [arguments]; a[5] = "x";` makes later reads of `a[5]` evaluate to "x" (#13);
  * - `T = [(f(), "get"), "set"]; a[4] = T;` makes later reads of `a[4][1]` (and `T[1]`) evaluate to "set".
  *
- * A binding is constant when its only definition is a declarator whose initializer evaluates, it is never written
- * again, and the declaration is a statement directly in its function (or program) body, so it runs exactly once on
- * entry. A slot is constant when its array is only ever used as `a[constant]`, and the slot is written exactly once,
- * by such a top-level statement, with a constant. Reads get the value only when they come after the definition in
- * execution order (`reachesAfter`).
+ * A binding is constant when its only definition is a declarator whose initializer evaluates (or `var x;` and one
+ * statement `x = v;`), it is never written again but by statements `x += w;` (with `w` constant) after it in the same
+ * statement list, and the definition is a statement directly in its function (or program) body, so it runs exactly
+ * once on entry (or in a nested list, for reads inside it). A slot is constant when its array is only ever used as
+ * `a[constant]`, and the slot is written exactly once, by such a top-level statement, with a constant. Reads get the
+ * value only when they come after the last write in execution order (`reachesAfter`).
  *
  * A constant array is a binding written exactly once, with an array literal, by a declarator or a plain assignment
  * statement directly in its body; its elements are what they evaluate to (a sequence: its last expression; the
@@ -193,9 +226,10 @@ const escapingUse = (member: Node, above: Node | undefined): string | undefined 
  * direct `eval`, or reads or writes the global object (`globalThis`, `window`, `self`, top-level `this`...) with a key
  * that doesn't evaluate, or evaluates to the name. Other scripts don't touch them (semantic model 2).
  */
-export const constantEnv = (scopes: ScopeInfo, log?: PassLog): EvaluateEnv => {
+export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
     const orders = new Map<Node, BlockOrder>();
     const constants = new Map<Variable, Constant | undefined>();
+    const functionBindings = new Map<Variable, FunctionBinding | undefined>();
     const slotArrays = new Map<Variable, SlotArray | undefined>();
     const slotValues = new Map<Node, Constant | undefined>();
     const tables = new Map<Variable, Table | undefined>();
@@ -298,15 +332,18 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): EvaluateEnv => {
     /**
      * `use` runs after `definition`: it comes later in `block`'s document order (within the definition's statement
      * list, see `limits`) and, when it sits in a function declaration (hoisted), that function only runs after
-     * `definition` too (`runsAfter`).
+     * `definition` too (`runsAfter`). A use in a function declaration runs when the function is called, wherever it
+     * is declared: then only the calls count (a helper declared before the slot it reads is set). A definition inside
+     * a declaration is in a nested list, whose `limits` its calls from outside don't meet.
      */
     const reachesAfter = (block: Node, definition: Node, use: Node): boolean => {
         const order = orderOf(block);
         const at = order.index.get(definition);
         const position = order.index.get(use);
-        if (at === undefined || position === undefined || position <= at || position > (limits.get(definition) ?? Number.POSITIVE_INFINITY)) return false;
+        if (at === undefined || position === undefined) return false;
         const declaration = order.declaredIn.get(use);
-        return declaration === undefined || runsAfter(block, definition, declaration);
+        if (declaration !== undefined) return runsAfter(block, definition, declaration);
+        return position > at && position <= (limits.get(definition) ?? Number.POSITIVE_INFINITY);
     };
 
     /**
@@ -395,11 +432,28 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): EvaluateEnv => {
         const refusals: Refusal[] = [];
         for (const member of facts.globalMembers) {
             const key = evaluate(member.property, env);
-            if (!key.ok) refusals.push({ reason: "the global object is used with an unknown key", node: member });
-            else if (String(key.value) === variable.name) refusals.push({ reason: `the global object is used with the key ${variable.name}`, node: member });
+            if (key.ok) {
+                if (String(key.value) === variable.name) refusals.push({ reason: `the global object is used with the key ${variable.name}`, node: member });
+            } else if (!keyOfTable(member.property, variable.name)) {
+                refusals.push({ reason: "the global object is used with an unknown key", node: member });
+            }
             if (refusals.length > 0 && !all) break;
         }
         return refusals;
+    };
+
+    /**
+     * Whether `key` reads a constant array (`T[k]`, through an alias too) none of whose elements is `name`, whatever
+     * `k` is: an element, `undefined` past the end, or an inherited value (a function, `length`'s number, the
+     * prototype's empty join), none of which spells an identifier but `undefined`. Before the array is there the
+     * holder is `undefined`, and the read throws before any access.
+     */
+    const keyOfTable = (key: Node, name: string): boolean => {
+        if (key.type !== "MemberExpression" || !key.computed || name === "undefined") return false;
+        const holder = holderOf(key.object);
+        const assumed = validating !== undefined && (holder?.table === validating.variable || holdsOnly(key.object, validating.variable));
+        const table = assumed ? validating?.table : holder === undefined ? undefined : tableOf(holder.table);
+        return table !== undefined && table.elements.every((element) => element.ok && String(element.value) !== name);
     };
     const globalChecks = new Map<Variable, boolean | undefined>();
     const globalSafe = (variable: Variable): boolean | undefined =>
@@ -409,28 +463,129 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): EvaluateEnv => {
             return refusal === undefined;
         });
 
+    /** The statement `x OP v;` a write reference (to `x`) is the target of, if it is one. */
+    const assigningStatement = (write: Reference, operator: string): Node | undefined => {
+        const id = write.identifier as unknown as Node;
+        const assignment = parentOf(id);
+        const statement = assignment === undefined ? undefined : parentOf(assignment);
+        return assignment?.type === "AssignmentExpression" && assignment.operator === operator && assignment.left === id && statement?.type === "ExpressionStatement" ? statement : undefined;
+    };
+
+    /**
+     * A binding's value and where it gets it: `var x = v;` (the declarator), or `var x;` written once, by a statement
+     * `x = v;` (that statement). Or a binding written several times, all by its declarator and statements `x = w;` and
+     * `x += w;` in one statement list (a string built in pieces: `var s = "ab"; s += "cd";`), the first of them in
+     * document order an initializer or an `=`: reads after the last write (`after`) see what they compute in order;
+     * reads before it aren't answered. The list runs its statements in order and is only entered at its start, so a
+     * pass through it that reaches `after` ran each write once, in order, from the first.
+     */
+    const builtDefinition = (variable: Variable): Definition | undefined => {
+        const [def] = variable.defs;
+        if (variable.defs.length !== 1 || def === undefined || def.type !== "Variable") return undefined;
+        const declarator = def.node as unknown as Node;
+        const declaration = def.parent as unknown as Node | null;
+        if (declarator.type !== "VariableDeclarator" || declarator.id.type !== "Identifier" || declaration?.type !== "VariableDeclaration") return undefined;
+        /** The writes as statements (the declarator's in its declaration), with what each assigns. */
+        const writes: { operator: "=" | "+="; value: Expression; definition: Node; statement: Node }[] = [];
+        for (const write of scopes.staticReferences(variable)) {
+            if (!write.isWrite()) continue;
+            if (write.init === true && declarator.init !== null) {
+                writes.push({ operator: "=", value: declarator.init, definition: declarator, statement: declaration });
+                continue;
+            }
+            const operator = assigningStatement(write, "=") !== undefined ? "=" : assigningStatement(write, "+=") !== undefined ? "+=" : undefined;
+            const statement = operator === undefined ? undefined : parentOf(parentOf(write.identifier as unknown as Node) as Node);
+            if (operator === undefined || statement?.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression") return undefined;
+            writes.push({ operator, value: statement.expression.right, definition: statement, statement });
+        }
+        const [only] = writes;
+        if (writes.length === 1 && only?.operator === "=") {
+            // `var x; x = v;`: a `let` would be in its dead zone before the declaration, a `const` can't be assigned.
+            if (only.definition !== declarator && declaration.kind !== "var") return undefined;
+            return { value: only.value, definition: only.definition, statement: only.statement, steps: [], after: only.definition };
+        }
+        // (A `const` throws at its second write: nothing after that write runs.)
+        if (writes.length < 2) return undefined;
+        const list = parentOf(only?.statement as Node);
+        if (writes.some((write) => parentOf(write.statement) !== list)) return undefined;
+        const order = orderOf(variable.scope.block as unknown as Node).index;
+        writes.sort((a, b) => (order.get(a.definition) ?? 0) - (order.get(b.definition) ?? 0));
+        const [first, ...steps] = writes;
+        const last = steps.at(-1);
+        if (first === undefined || first.operator !== "=" || last === undefined) return undefined;
+        return { value: first.value, definition: first.definition, statement: first.statement, steps, after: last.definition };
+    };
+
+    /** A binding's one value (see `builtDefinition`), when it is written once. */
+    const singleDefinition = (variable: Variable): Definition | undefined => {
+        const built = builtDefinition(variable);
+        return built?.steps.length === 0 ? built : undefined;
+    };
+
+    /**
+     * Whether a definition's statement runs once per pass through its list: directly in the body, or in a nested
+     * statement list, where reads count only inside that list, after the definition (`limits`).
+     */
+    const placed = (block: Node, statement: Node, definition: Node): boolean => {
+        if (isTopLevel(block, statement)) return true;
+        const list = parentOf(statement);
+        const end = list === undefined ? undefined : orderOf(block).end.get(list);
+        const listed = list?.type === "SwitchCase" ? list.consequent : list?.type === "BlockStatement" || list?.type === "StaticBlock" ? list.body : [];
+        if (end === undefined || !(listed as readonly Node[]).includes(statement)) return false;
+        limits.set(definition, end);
+        return true;
+    };
+
     const constantOf = (variable: Variable): Constant | undefined =>
         memo(constants, variable, () => {
-            const [def] = variable.defs;
-            if (variable.defs.length !== 1 || def === undefined || def.type !== "Variable") return undefined;
-            const declarator = def.node as unknown as Node;
-            const declaration = def.parent as unknown as Node | null;
-            if (declarator.type !== "VariableDeclarator" || declarator.init === null || declarator.id.type !== "Identifier") return undefined;
-            if (scopes.staticReferences(variable).filter((reference) => reference.isWrite()).length !== 1) return undefined;
-            const block = variable.scope.block as unknown as Node;
-            if (declaration === null) return undefined;
-            if (!isTopLevel(block, declaration)) {
-                // Declared in a nested statement list: uses count only inside that list, after the declaration.
-                const list = parentOf(declaration);
-                const end = list === undefined ? undefined : orderOf(block).end.get(list);
-                const listed = list?.type === "SwitchCase" ? list.consequent : list?.type === "BlockStatement" || list?.type === "StaticBlock" ? list.body : [];
-                if (end === undefined || !(listed as readonly Node[]).includes(declaration)) return undefined;
-                limits.set(declarator, end);
+            // A read of the binding that evaluating its value needs makes the value fail to evaluate.
+            const built = builtDefinition(variable);
+            if (built === undefined || !placed(variable.scope.block as unknown as Node, built.statement, built.after)) return undefined;
+            // `x = w` gives `w`, whatever `x` held; `x += w` reads `x`, then evaluates `w`, then adds: on primitives,
+            // what `binary` computes.
+            let result = evaluate(built.value, env);
+            for (const step of built.steps) {
+                if (step.operator === "=") {
+                    result = evaluate(step.value, env);
+                    continue;
+                }
+                if (!result.ok) continue;
+                const appended = evaluate(step.value, env);
+                result = appended.ok ? binary("+", result.value, appended.value) : FAIL;
             }
-            const result = evaluate(declarator.init, env);
             if (!result.ok || globalSafe(variable) !== true) return undefined;
-            return { value: result.value, after: declarator };
+            if (built.steps.length > 0) log?.debug(`${variable.name} is written ${built.steps.length + 1} times in one statement list: constant after the last`, built.after);
+            return { value: result.value, after: built.after };
         });
+
+    /**
+     * The function a binding holds for good, and from where on: a function declaration, never written (from its
+     * scope's entry: a block's for one in a block, which only references inside the block resolve to), or a function
+     * or arrow expression it gets once, as constants do (after the definition).
+     */
+    const functionBindingOf = (variable: Variable): FunctionBinding | undefined =>
+        memo(functionBindings, variable, () => {
+            const block = variable.scope.block as unknown as Node;
+            const [def] = variable.defs;
+            if (variable.defs.length === 1 && def?.type === "FunctionName") {
+                const declaration = def.node as unknown as Node;
+                if (declaration.type !== "FunctionDeclaration") return undefined;
+                if (scopes.staticReferences(variable).some((reference) => reference.isWrite()) || globalSafe(variable) !== true) return undefined;
+                return { fn: declaration, after: undefined, block };
+            }
+            const single = singleDefinition(variable);
+            const fn = single?.value;
+            if (single === undefined || (fn?.type !== "FunctionExpression" && fn?.type !== "ArrowFunctionExpression")) return undefined;
+            if (!placed(block, single.statement, single.definition) || globalSafe(variable) !== true) return undefined;
+            return { fn, after: single.definition, block };
+        });
+
+    const functionAt = (identifier: Node): FunctionLike | undefined => {
+        const variable = identifier.type === "Identifier" ? scopes.variableOf(identifier) : undefined;
+        const binding = variable === undefined ? undefined : functionBindingOf(variable);
+        if (binding === undefined) return undefined;
+        return binding.after === undefined || reachesAfter(binding.block, binding.after, identifier) ? binding.fn : undefined;
+    };
 
     /** The slots of an `arguments`-style array, or `undefined` when the array is used any other way. */
     const slotArrayOf = (variable: Variable): SlotArray | undefined =>
@@ -643,19 +798,14 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): EvaluateEnv => {
             return table;
         });
 
-    /** `var A = T;` directly in its body, `A` never written again: an alias of the array `T` may name. */
+    /** `var A = T;` (or `var A;` and one later `A = T;`): an alias of the array `T` may name, for reads after it. */
     const aliasOf = (variable: Variable): Alias | undefined =>
         memo(aliases, variable, () => {
-            const [def] = variable.defs;
-            if (variable.defs.length !== 1 || def === undefined || def.type !== "Variable") return undefined;
-            const declarator = def.node as unknown as Node;
-            const declaration = def.parent as unknown as Node | null;
-            if (declarator.type !== "VariableDeclarator" || declarator.init?.type !== "Identifier") return undefined;
+            const single = singleDefinition(variable);
             const block = variable.scope.block as unknown as Node;
-            if (declaration === null || !isTopLevel(block, declaration)) return undefined;
-            if (scopes.staticReferences(variable).filter((reference) => reference.isWrite()).length !== 1) return undefined;
-            const table = scopes.staticVariableOf(declarator.init);
-            return table === undefined ? undefined : { table, after: declarator, block };
+            if (single?.value.type !== "Identifier" || !placed(block, single.statement, single.definition)) return undefined;
+            const table = scopes.staticVariableOf(single.value);
+            return table === undefined ? undefined : { table, after: single.definition, block };
         });
 
     /** The array an expression (`T`, an alias `A`, a slot alias `a[4]`) may hold, and the alias, if it is one. */
@@ -722,7 +872,7 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): EvaluateEnv => {
         return tableRead(node);
     };
 
-    const env: EvaluateEnv = { ...globalsEnv(scopes), lookup };
+    const env: ConstantEnv = { ...globalsEnv(scopes), lookup, functionAt };
     return env;
 };
 

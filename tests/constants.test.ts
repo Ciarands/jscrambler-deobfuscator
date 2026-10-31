@@ -56,6 +56,29 @@ result = G();
         expect(output).toContain("log.push(-7);");
     });
 
+    it("resolves reads in a declaration that comes before the definition but is only called after it", async () => {
+        const program = `var G = function () {
+  function read() { return t * 2; }
+  function early() { return typeof u; }
+  var before = early();
+  var t = 21;
+  var u = 1;
+  return [read(), before, early()];
+};
+result = G();
+`;
+        const output = await simplified(program);
+        expect(observed(output)).toBe(observed(program));
+        expect(output).toContain("return 42;");
+        // `early` also runs before `u` is set.
+        expect(output).toContain("return typeof u;");
+        // A definition inside the declaration itself: its earlier reads run first in each call.
+        const inside = `var F = function () {\n  var k;\n  function g() {\n    var r = typeof k;\n    k = 5;\n    return r;\n  }\n  return [g(), g()];\n};\nresult = F();\n`;
+        const kept = await simplified(inside);
+        expect(observed(kept)).toBe(observed(inside));
+        expect(kept).toContain("var r = typeof k;");
+    });
+
     it("refuses when a cycle member is called before the definition", async () => {
         const program = `var log = [];
 var G = function () {
@@ -158,6 +181,128 @@ result = log;
     });
 });
 
+describe("constants written once after a bare declaration", () => {
+    it("resolves reads after the only write, not before it or outside the write's statement list", async () => {
+        const program = `function f(c) {
+  var a;
+  var log = [typeof a];
+  a = "k";
+  log.push(a, a.length);
+  if (c) {
+    var b;
+    b = 3;
+    log.push(b * 2);
+  }
+  log.push(typeof b);
+  return log;
+}
+result = [f(true), f(false)];
+`;
+        const output = await simplified(program);
+        expect(observed(output)).toBe(observed(program));
+        expect(output).toContain("var log = [typeof a];");
+        expect(output).toContain('log.push("k", 1);');
+        expect(output).toContain("log.push(6);");
+        expect(output).toContain("log.push(typeof b);");
+    });
+
+    it("keeps reads of a variable written by a statement that reads it, and reads between two writes", async () => {
+        const program = `function f() {
+  var n;
+  n = typeof n;
+  var m;
+  m = 1;
+  var first = m;
+  m = 2;
+  return [n, first, m];
+}
+result = f();
+`;
+        const output = await simplified(program);
+        expect(observed(output)).toBe(observed(program));
+        expect(output).toContain("var first = m;");
+        expect(output).toContain("return [n, first, 2];");
+    });
+});
+
+describe("constants written by several statements in one list", () => {
+    it("resolves strings built in pieces, and reassigned ones, after the last write", async () => {
+        const program = `function f(log) {
+  var s = "ab";
+  s += "cd";
+  s += 1;
+  var t = "";
+  t = "A";
+  t += "B";
+  var u;
+  u = "x";
+  u += "y";
+  var r = log.push(0);
+  r += "x";
+  r = "A";
+  r += "B";
+  log.push(s, t, u, r);
+  return log;
+}
+result = f([]);
+`;
+        const output = await simplified(program);
+        expect(observed(output)).toBe(observed(program));
+        expect(output).toContain('log.push("abcd1", "AB", "xy", "AB");');
+    });
+
+    it("keeps reads before the last write, in closures made before it and in declarations called before it", async () => {
+        const program = `function f() {
+  var log = [];
+  var s = "a";
+  function early() { return s; }
+  log.push(early(), s);
+  var later = () => s;
+  s += "b";
+  log.push(s, later());
+  return log;
+}
+result = f();
+`;
+        const output = await simplified(program);
+        expect(observed(output)).toBe(observed(program));
+        expect(output).toContain("return s;");
+        expect(output).toContain("log.push(early(), s);");
+        expect(output).toContain("var later = () => s;");
+        expect(output).toContain('log.push("ab", later());');
+    });
+
+    it("keeps reads of a variable also written in another statement list, by another operator, or appended to first", async () => {
+        const program = `function f(c) {
+  var s = "a";
+  if (c) {
+    s += "b";
+  }
+  var t = "a";
+  for (var i = 0; i < 2; i++) t += "x";
+  var u = "a";
+  u -= 1;
+  var v = "a";
+  v += "b";
+  v = v + "c";
+  var out = [];
+  for (var k = 0; k < 2; k++) {
+    var w;
+    w += "a";
+    w += "b";
+    out.push(w);
+  }
+  return [s, t, u, v, out];
+}
+result = [f(true), f(false)];
+`;
+        const output = await simplified(program);
+        expect(observed(output)).toBe(observed(program));
+        expect(output).toContain("return [s, t, u, v, out];");
+        expect(output).toContain("out.push(w);");
+    });
+});
+
 describe("constant arrays", () => {
     it("resolves reads through slot aliases, variable aliases and the array itself", async () => {
         const program = `${TABLE}function a() {
@@ -176,6 +321,28 @@ a();
         expect(output).toContain(`result = ["set", "get", 4, undefined, 3, log];`);
         // Building the table still runs its calls.
         expect(output).toContain(`T = [(log.push("built"), "get"), "set", , 3];`);
+    });
+
+    it("resolves reads through an alias assigned once after a bare declaration, in its statement list", async () => {
+        const program = `${TABLE}function a(c) {
+  var A;
+  A = T;
+  return [A[1], A.length, b(c)];
+}
+function b(c) {
+  var B;
+  if (c) {
+    B = T;
+    return B[0];
+  }
+  return "none";
+}
+result = [a(true), a(false)];
+`;
+        const output = await simplified(program);
+        expect(observed(output)).toBe(observed(program));
+        expect(output).toContain(`return ["set", 4, b(c)];`);
+        expect(output).toContain(`return "get";`);
     });
 
     it("resolves reads of a function-local array", async () => {
@@ -279,6 +446,19 @@ result = [c, d];
         const output = await simplified(program);
         expect(observed(output)).toBe(observed(program));
         expect(output).toContain("result = [c, d];");
+    });
+
+    it("takes a global-object key read from a constant array for one of its elements, whatever the index", async () => {
+        // `window[T[k]]` reaches `x` or `undefined`, never `T` itself: T stays constant.
+        const safe = `var T = ["x", "beta"];\nvar x = 5;\nfunction pick(k) { return window[T[k]]; }\nresult = [pick(0), pick(7), T[1]];\n`;
+        const output = await simplified(safe);
+        expect(observed(output)).toBe(observed(safe));
+        expect(output).toContain('result = [pick(0), pick(7), "beta"];');
+        // An element naming the array reaches it (spelled in two parts: no literal says its name).
+        const named = `var TU = ["T" + "U", "beta"];\nfunction pick(k) { return window[TU[k]]; }\npick(0)[1] = "changed";\nresult = [TU[1]];\n`;
+        const kept = await simplified(named);
+        expect(observed(kept)).toBe(observed(named));
+        expect(kept).toContain("result = [TU[1]];");
     });
 
     it("refuses reads through a slot written twice, but not the array's own reads", async () => {

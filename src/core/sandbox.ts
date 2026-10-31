@@ -22,7 +22,8 @@ export interface SandboxLimits {
 
 export const DEFAULT_LIMITS: SandboxLimits = { memoryBytes: 256 * 1024 * 1024, stackBytes: 1024 * 1024, timeoutMs: 2000 };
 
-export type RunResult = { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly error: string; readonly timedOut: boolean };
+export type RunResult =
+    { readonly ok: true; readonly value: unknown } | { readonly ok: false; readonly error: string; readonly timedOut: boolean; readonly at?: { readonly line: number; readonly column: number } };
 
 /** A guest object only the host holds (see `Sandbox.hold`): no name in the guest reaches it. */
 export interface Held {
@@ -285,12 +286,16 @@ export class Sandbox {
         return entry;
     }
 
-    /** A guest exception as a failed result (disposing the handle when asked). */
+    /** A guest exception as a failed result (disposing the handle when asked), with where it was thrown when known. */
     #failure(handle: QuickJSHandle, dispose = false): RunResult {
         try {
             const thrown: unknown = this.#copy(handle);
             const message = typeof thrown === "object" && thrown !== null && "message" in thrown ? String(thrown.message) : String(thrown);
-            return { ok: false, error: message, timedOut: this.#interrupted };
+            // The innermost frame of the evaluated code (`sandbox.js:line:column`), from the error's stack text.
+            const stack = typeof thrown === "object" && thrown !== null && "stack" in thrown ? String(thrown.stack) : "";
+            const frame = /sandbox\.js:(\d+):(\d+)/.exec(stack);
+            const at = frame === null ? undefined : { line: Number(frame[1]), column: Number(frame[2]) };
+            return { ok: false, error: message, timedOut: this.#interrupted, ...(at === undefined ? {} : { at }) };
         } finally {
             if (dispose) handle.dispose();
         }

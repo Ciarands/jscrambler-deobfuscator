@@ -25,7 +25,7 @@ describe("sandbox", () => {
         expect(looped).toMatchObject({ ok: false, timedOut: true });
         expect(sandbox.run("1 + 1")).toEqual({ ok: true, value: 2 });
         // A guest error that merely says so is no timeout.
-        expect(sandbox.run('throw new Error("interrupted")')).toEqual({ ok: false, error: "interrupted", timedOut: false });
+        expect(sandbox.run('throw new Error("interrupted")')).toMatchObject({ ok: false, error: "interrupted", timedOut: false });
     });
 
     it("calls guest functions with data both ways, keeping what JSON can't carry", () => {
@@ -34,10 +34,16 @@ describe("sandbox", () => {
         expect(sandbox.invoke(["echo", "back"], payload)).toEqual({ ok: true, value: [payload, "undefined", true, 3] });
     });
 
-    it("reports a guest exception from an invoked function as a failure", () => {
+    it("reports a guest exception as a failure, with where the evaluated code threw", () => {
         sandbox.run(`globalThis.boom = function () { throw new TypeError("nope"); };`);
-        expect(sandbox.invoke(["boom"], null)).toEqual({ ok: false, error: "nope", timedOut: false });
+        expect(sandbox.invoke(["boom"], null)).toMatchObject({ ok: false, error: "nope", timedOut: false });
         expect(sandbox.invoke(["missing", "fn"], null)).toMatchObject({ ok: false });
+        expect(sandbox.execute("var o = {};\nfunction f() { return o.a.b; }\nf();")).toEqual({
+            ok: false,
+            error: "cannot read property 'b' of undefined",
+            timedOut: false,
+            at: { line: 2, column: 26 },
+        });
     });
 
     it("calls functions of a held object, which no guest name reaches", () => {
