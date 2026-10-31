@@ -39,13 +39,17 @@ const rootBody = (program: Program): { body: Statement[]; owner: Node } => {
     return block === undefined ? { body: program.body, owner: program } : { body: block.body, owner: fn };
 };
 
-/** `G[k] = ...` / `G.k = ...` as a statement: the storage identifier, the key and the value. */
+/**
+ * `G[k] = ...` / `G.k = ...` as a statement: the storage identifier, the key and the value. Also `(X = G).k = ...`,
+ * which stores `G` somewhere first (jscrambler keeps the runtime as a global this way): the member is still `G`'s.
+ */
 const storageAssignment = (statement: Statement): { object: string; key: string; right: Expression } | undefined => {
     if (statement.type !== "ExpressionStatement") return undefined;
     const e = statement.expression;
-    if (e.type !== "AssignmentExpression" || e.operator !== "=" || e.left.type !== "MemberExpression" || e.left.object.type !== "Identifier") return undefined;
-    const key = propertyKey(e.left);
-    return key === undefined ? undefined : { object: e.left.object.name, key, right: e.right };
+    if (e.type !== "AssignmentExpression" || e.operator !== "=" || e.left.type !== "MemberExpression") return undefined;
+    const object = e.left.object.type === "AssignmentExpression" && e.left.object.operator === "=" ? e.left.object.right : e.left.object;
+    const key = object.type === "Identifier" ? propertyKey(e.left) : undefined;
+    return key === undefined || object.type !== "Identifier" ? undefined : { object: object.name, key, right: e.right };
 };
 
 /**
@@ -310,11 +314,14 @@ export const emulate: Pass = {
             const tracked: boolean = bound && marked;
             // What a setup call installs on the storage object: its getters (call aliases, probed or not).
             const callablesBefore = bound && isCall ? new Set(guest.ownCallables()) : undefined;
-            const result = guest.run(printStatement(statement), isRuntime ? RUNTIME_STATEMENT_TIMEOUT_MS : OTHER_STATEMENT_TIMEOUT_MS);
+            const source = printStatement(statement);
+            const result = guest.run(source, isRuntime ? RUNTIME_STATEMENT_TIMEOUT_MS : OTHER_STATEMENT_TIMEOUT_MS);
             marked = false;
             if (!result.ok) {
                 counts.failed++;
-                log.debug(`failed: ${result.error}`, statement);
+                // Where in the statement (as printed for the guest) it threw, when the guest says.
+                const where = result.at === undefined ? "" : ` at \`${(source.split("\n")[result.at.line - 1] ?? "").slice(Math.max(0, result.at.column - 21), result.at.column + 40).trim()}\``;
+                log.debug(`failed: ${result.error}${where}`, statement);
                 // Calls it made before failing moved the runtime's state in a way no real run does; so may what it
                 // wrote before failing (or before its deadline), if it can reach the runtime at all.
                 const madeCalls = guest.takeCalls();

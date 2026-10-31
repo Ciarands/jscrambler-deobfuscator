@@ -498,7 +498,10 @@ const GUEST_RUNTIME = String.raw`(function () {
 /**
  * The browser globals a prelude touches while the page loads, modelled as far as a synchronous run can observe them:
  * `window` and `self` are the global object; timers take their callbacks and never run them (no callback fires
- * before the script that scheduled it has finished). Everything else a browser has stays absent: code that needs
+ * before the script that scheduled it has finished); `console` is a console nobody watches (model 5: the script
+ * isn't debugged; model 10: the host globals it uses exist): its methods do nothing the script can see, read none of
+ * their arguments, and look native (bound functions: no `prototype`, `[native code]` text, their own names), as the
+ * real ones do to the native-code checks scripts make. Everything else a browser has stays absent: code that needs
  * it fails in the guest, visibly, instead of seeing a made-up value.
  */
 const HOST_MODEL = String.raw`(function () {
@@ -514,6 +517,13 @@ const HOST_MODEL = String.raw`(function () {
     globalThis.clearInterval = cancel;
     globalThis.cancelAnimationFrame = cancel;
     globalThis.queueMicrotask = cancel;
+    var console = {};
+    ["assert", "clear", "count", "countReset", "debug", "dir", "dirxml", "error", "group", "groupCollapsed", "groupEnd", "info", "log", "profile", "profileEnd", "table", "time", "timeEnd", "timeLog", "timeStamp", "trace", "warn"].forEach(function (name) {
+        var method = function () {}.bind(console);
+        Object.defineProperty(method, "name", { value: name, configurable: true });
+        console[name] = method;
+    });
+    Object.defineProperty(globalThis, "console", { value: console, writable: true, configurable: true, enumerable: false });
 })();`;
 
 export const pathName = (path: PropertyPath): string => (path.length === 0 ? "globalThis" : path.join("."));
