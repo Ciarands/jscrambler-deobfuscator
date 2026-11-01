@@ -120,6 +120,7 @@ describe("hash-predicates", () => {
             writesOutside: hashCode("q", "calls++;"),
             readsChangingOuter: hashCode("q + salt"),
             random: hashCode("Math.random() < 2 ? q : 0"),
+            approximated: hashCode("Math.sin(q) < 2 ? q : 0"),
         };
         const builder = "var calls = 0; var salt = 0; G.salt = function (x) { salt = x; }; G.calls = function () { return calls; };";
         for (const [name, hashSource] of Object.entries(hashes)) {
@@ -128,6 +129,13 @@ describe("hash-predicates", () => {
             expect(observed(output), name).toBe(observed(input));
             expect(output, name).toContain("G.U.h(");
         }
+    });
+
+    it("keeps predicates on a hash that runs past its step budget", async () => {
+        const input = program({ body: lonePredicate, hashSource: hashCode("q", "for (var k = 0; k < 400000; k++) {}") });
+        const output = await run(input);
+        expect(observed(output)).toBe(observed(input));
+        expect(output).toContain("G.U.h(");
     });
 
     it("keeps loops that run more than once doing more than counting", async () => {

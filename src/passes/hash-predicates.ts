@@ -1,8 +1,22 @@
-import type { Expression, ForStatement, IfStatement, Node, Statement, VariableDeclaration, WhileStatement } from "../core/ast.js";
+import type {
+    ArrowFunctionExpression,
+    Expression,
+    ForStatement,
+    Function as FunctionNode,
+    IdentifierReference,
+    IfStatement,
+    Node,
+    Statement,
+    VariableDeclaration,
+    WhileStatement,
+} from "../core/ast.js";
 import { memberPath } from "../core/ast.js";
 import { at, valueToNode } from "../core/build.js";
 import type { EvaluateEnv, Evaluation, Value } from "../core/evaluate.js";
 import { evaluate, FAIL, value } from "../core/evaluate.js";
+import type { OuterBinding } from "../core/interpret.js";
+import { argumentsKey, Interpreter } from "../core/interpret.js";
+import { pushAll, spliceList } from "../core/list.js";
 import type { ScopeInfo, Variable } from "../core/scope.js";
 import { forEachChild, traverse } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
@@ -14,7 +28,16 @@ import type { RuntimeModel } from "./emulate/model.js";
 import { RUNTIME } from "./emulate/model.js";
 import { PurityProver } from "./hash-purity.js";
 
+type FunctionLike = FunctionNode | ArrowFunctionExpression;
+
 const MAX_ITERATIONS = 10_000;
+
+/** Interpreter steps one hash call may take, and all of one run's calls together (past it: partial output). */
+const CALL_STEPS = 1_000_000;
+const TOTAL_STEPS = 20_000_000;
+
+/** The globals `PurityProver` lets a hash read (`Math`'s exact members, `String.prototype.charCodeAt.bind`). */
+const HASH_GLOBALS: ReadonlySet<string> = new Set(["undefined", "NaN", "Infinity", "Math", "String"]);
 
 const COMPOUND: ReadonlyMap<string, string> = new Map(["+=", "-=", "*=", "/=", "%=", "**=", "<<=", ">>=", ">>>=", "&=", "|=", "^="].map((op) => [op, op.slice(0, -1)]));
 
@@ -78,7 +101,7 @@ const onceUnrolled = (loop: ForStatement | WhileStatement): Statement[] | string
     const statements: Statement[] = init === null ? [] : [init.type === "VariableDeclaration" ? init : statementOf(init)];
     const body = loop.body;
     const scoped = body.type === "BlockStatement" && body.body.some((s) => (s.type === "VariableDeclaration" && s.kind !== "var") || s.type === "ClassDeclaration" || s.type === "FunctionDeclaration");
-    statements.push(...(body.type === "BlockStatement" && !scoped ? body.body : [body]));
+    pushAll(statements, body.type === "BlockStatement" && !scoped ? body.body : [body]);
     if (loop.type === "ForStatement" && loop.update !== null) statements.push(statementOf(loop.update));
     return statements;
 };
@@ -89,7 +112,7 @@ const onceUnrolled = (loop: ForStatement | WhileStatement): Statement[] | string
  *     for (var d = 1; G.U.h(d.toString(), d.toString().length, 77300) !== a; d++) { S += 2; }
  *
  * The hash is a prelude-built storage method, read where nothing changes it after the prelude, proven pure
- * (`PurityProver`) and run in the guest; its answer must repeat. Locals' values come from a forward pass over the
+ * (`PurityProver`) and interpreted over its AST on the host (`Interpreter`). Locals' values come from a forward pass over the
  * statement list; only locals no closure captures are followed, so a call in between can't change them, and none
  * in a program with `with`. Some builds add clauses comparing the runtime's cyclic-array rows by identity. Relies on
  * model 7 (builtins intact).
@@ -158,6 +181,13 @@ const anyPureMethod = (runtime: RuntimeModel, scopes: ScopeInfo): boolean => {
     return false;
 };
 
+/** A storage path holding a builder's pure hash, interpreted over its builder's bindings. */
+interface Target {
+    readonly path: PropertyPath;
+    readonly fn: FunctionLike;
+    readonly interpreter: Interpreter;
+}
+
 /** Calls of the runtime's pure hash functions: which callees are such, and their values for known arguments. */
 class HashFunctions {
     readonly #runtime: RuntimeModel;
@@ -165,9 +195,10 @@ class HashFunctions {
     readonly #scopes: ScopeInfo;
     readonly #log: PassContext["log"];
     readonly #prover: PurityProver;
-    /** By callee path: the hash's path on the storage object, or why the callee isn't one. */
-    readonly #targets = new Map<string, PropertyPath | string>();
+    /** By callee path: the hash, or why the callee isn't one. */
+    readonly #targets = new Map<string, Target | string>();
     readonly #results = new Map<string, Evaluation>();
+    #steps = 0;
 
     constructor(runtime: RuntimeModel, analysis: StorageAnalysis, scopes: ScopeInfo, log: PassContext["log"]) {
         this.#runtime = runtime;
@@ -187,7 +218,7 @@ class HashFunctions {
         return found;
     }
 
-    targetOf(callee: Node): PropertyPath | string {
+    targetOf(callee: Node): Target | string {
         const path = memberPath(callee);
         if (path === undefined || !this.#analysis.matcher.isStorage(path.root)) return "not a call on the storage object";
         const id = JSON.stringify(path.keys);
@@ -201,7 +232,7 @@ class HashFunctions {
         return target;
     }
 
-    #resolveTarget(keys: PropertyPath): PropertyPath | string {
+    #resolveTarget(keys: PropertyPath): Target | string {
         const [first] = keys;
         const wrapper = keys.length === 1 && first !== undefined ? this.#runtime.wrappers.get(first) : undefined;
         const target = wrapper?.target ?? keys;
@@ -217,15 +248,31 @@ class HashFunctions {
         const built = this.#runtime.built.get(definition.statement)?.methods.get(name);
         if (built === undefined || this.#runtime.guest.stateKey(target) !== `o:${built}`) return "the guest no longer holds the builder's function there";
         const impure = this.#prover.impurity(fn, definition.iife);
-        return impure === undefined ? target : `it isn't pure: ${impure}`;
+        if (impure !== undefined) return `it isn't pure: ${impure}`;
+        return { path: target, fn, interpreter: new Interpreter({ outer: (identifier) => this.#builderBinding(identifier, definition.iife) }) };
     }
 
-    /** The call's reads (wrapper, hash) must see the snapshot's values, and the guest's answer must repeat. */
+    /** A name a proven hash (or a builder local it uses) doesn't declare: a builder local bound once for good, or a global. */
+    #builderBinding(identifier: IdentifierReference, builder: FunctionNode): OuterBinding | string {
+        const variable = this.#scopes.staticVariableOf(identifier);
+        if (variable === undefined) return HASH_GLOBALS.has(identifier.name) ? { global: identifier.name } : `it reads the global ${identifier.name}`;
+        const refusal = this.#prover.bound(variable, builder);
+        if (refusal !== undefined) return refusal;
+        const def = variable.defs[0]?.node as Node | undefined;
+        if (def === undefined) return `it reads ${identifier.name}, which may change`;
+        if (def.type === "FunctionDeclaration") return { function: def };
+        const init = def.type === "VariableDeclarator" ? def.init : null;
+        if (init?.type === "FunctionExpression" || init?.type === "ArrowFunctionExpression") return { function: init };
+        if (init?.type === "Literal" && (init.value === null || typeof init.value === "string" || typeof init.value === "number" || typeof init.value === "boolean")) return { value: init.value };
+        return `it reads ${identifier.name}, which may change`;
+    }
+
+    /** The call's reads (wrapper, hash) must see the snapshot's values; the hash is interpreted on the arguments. */
     valueOf(call: Node & { type: "CallExpression" }, evaluateIn: (node: Node) => Evaluation, reason: (why: string) => void): Evaluation {
         const target = this.targetOf(call.callee);
         const path = memberPath(call.callee);
         if (typeof target === "string" || path === undefined) return FAIL;
-        const stale = this.#analysis.effects.staleAt(path.root, path.keys) ?? this.#analysis.effects.staleAt(path.root, target);
+        const stale = this.#analysis.effects.staleAt(path.root, path.keys) ?? this.#analysis.effects.staleAt(path.root, target.path);
         if (stale !== undefined) {
             reason(stale.reason);
             return FAIL;
@@ -239,14 +286,22 @@ class HashFunctions {
             }
             args.push(known.value);
         }
-        const id = JSON.stringify([target, args]);
+        const id = `${JSON.stringify(target.path)}(${argumentsKey(args)})`;
         let result = this.#results.get(id);
         if (result === undefined) {
-            const [answer] = this.#runtime.guest.resolve([{ path: target, args }]);
-            result = answer !== undefined && answer.ok && "value" in answer && answer.repeatable ? value(answer.value) : FAIL;
+            const left = TOTAL_STEPS - this.#steps;
+            if (left <= 0) {
+                reason("the hashes' step budget is used up");
+                return FAIL;
+            }
+            const answer = target.interpreter.call(target.fn, args, Math.min(CALL_STEPS, left));
+            this.#steps += answer.steps;
+            if (!answer.ok && answer.exhausted && this.#steps >= TOTAL_STEPS) this.#log.warn(`the hashes' step budget of ${TOTAL_STEPS} is used up: later hash predicates stay as they are`);
+            if (!answer.ok) this.#log.debug(`the hash doesn't answer: ${answer.reason}`, call);
+            result = answer.ok ? value(answer.value) : FAIL;
             this.#results.set(id, result);
         }
-        if (!result.ok) reason("the guest's hash doesn't answer");
+        if (!result.ok) reason("the hash doesn't answer");
         return result;
     }
 }
@@ -487,7 +542,7 @@ class Folder {
         const replacement = counting ? this.#finals(loop, local) : onceUnrolled(loop);
         if (typeof replacement === "string") return this.#refuse(replacement, loop);
         this.#facts.replaced([loop], replacement);
-        list.splice(list.indexOf(loop), 1, ...replacement);
+        spliceList(list, list.indexOf(loop), 1, replacement);
         this.counts.unrolled++;
         this.#log.debug(`the loop runs ${iterations} time(s): replaced by ${counting ? "its final values" : "its one iteration"}`, loop);
         if (!counting) return { walk: true };
@@ -513,7 +568,7 @@ class Folder {
     #finals(loop: ForStatement | WhileStatement, local: Env): Statement[] | string {
         const finalOf = (node: Node): Expression | undefined => {
             const variable = this.#variableOf(node);
-            return variable === undefined || !local.has(variable) ? undefined : valueToNode(local.get(variable), node);
+            return variable === undefined || !local.has(variable) ? undefined : valueToNode(local.get(variable), node, this.#scopes);
         };
         const declared = new Set<string>();
         const init = loop.type === "ForStatement" ? loop.init : null;

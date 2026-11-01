@@ -158,7 +158,7 @@ result = [outside(), frozen()];
         expect(output).toContain("result = [outside(), frozen()];");
     });
 
-    it("keeps calls where one name means different bindings, or the result's name is declared", async () => {
+    it("resolves calls where one name means different bindings; a result whose name is declared is written as a literal", async () => {
         const program = `function big() { return Infinity; }
 result = (function () {
   var Infinity = 5;
@@ -168,8 +168,8 @@ result = (function () {
 `;
         const output = await resolved(program);
         expect(observed(output)).toBe(observed(program));
-        expect(output).toContain("return big() + Infinity;");
-        expect(output).toContain("return both();");
+        expect(output).toContain("return 1e999 + Infinity;");
+        expect(output).toContain("return 1e999;");
     });
 
     it("keeps calls of functions with engine-dependent or deferred work", async () => {

@@ -1,11 +1,10 @@
 import type { ArrowFunctionExpression, Function as FunctionNode, MemberExpression, Node, Statement } from "../core/ast.js";
+import { MATH_MEMBERS } from "../core/builtins.js";
 import type { Scope, ScopeInfo, Variable } from "../core/scope.js";
 import { traverse } from "../core/traverse.js";
 import { returnsOf } from "./emulate/builders.js";
 
 type FunctionLike = FunctionNode | ArrowFunctionExpression;
-
-const PURE_MATH: ReadonlySet<string> = new Set(Object.getOwnPropertyNames(Math).filter((name) => name !== "random"));
 
 const GLOBAL_VALUES: ReadonlySet<string> = new Set(["undefined", "NaN", "Infinity"]);
 
@@ -71,14 +70,14 @@ const memberImpurity = (node: MemberExpression, parent: Node | null, key: string
 const globalImpurity = (name: string, parent: Node | null, key: string | null): string | undefined => {
     if (GLOBAL_VALUES.has(name)) return undefined;
     if (name !== "Math" || parent?.type !== "MemberExpression" || key !== "object" || parent.computed || parent.property.type !== "Identifier") return `it reads the global ${name}`;
-    return PURE_MATH.has(parent.property.name) ? undefined : `it uses Math.${parent.property.name}`;
+    return MATH_MEMBERS.has(parent.property.name) ? undefined : `it uses Math.${parent.property.name}`;
 };
 
 /**
  * Proves builder functions pure: result depends only on arguments, no outside writes, same choices every run.
- * Termination is the caller's to see (a guest run). With primitive arguments every value is a primitive or a
- * `charCodeAt.bind(x)` function; names are own locals, builder locals bound once for good, and a few read-only
- * globals. Relies on model 7 (builtins intact).
+ * Termination is the interpreter's to see (its step budget). With primitive arguments every value is a primitive or
+ * a `charCodeAt.bind(x)` function; names are own locals, builder locals bound once for good, and a few read-only
+ * globals (`Math` with its exact members only). Relies on model 7 (builtins intact).
  */
 export class PurityProver {
     readonly #scopes: ScopeInfo;
@@ -114,7 +113,8 @@ export class PurityProver {
                 else if (node.type === "Literal" && typeof node.value === "object" && node.value !== null) reason = "it makes an object (a regular expression)";
                 else if (node.type === "Literal" && typeof node.value === "bigint") reason = "it uses a bigint";
                 else if (node.type === "UnaryExpression" && node.operator === "delete") reason = "it deletes";
-                else if (node.type === "BinaryExpression" && (node.operator === "in" || node.operator === "instanceof")) reason = `it uses ${node.operator}`;
+                else if (node.type === "BinaryExpression" && (node.operator === "in" || node.operator === "instanceof" || node.operator === "**")) reason = `it uses ${node.operator}`;
+                else if (node.type === "AssignmentExpression" && node.operator === "**=") reason = "it uses **=";
                 else if (node.type === "AssignmentExpression" && node.left.type !== "Identifier") reason = "it assigns to something other than a name";
                 else if (node.type === "UpdateExpression" && node.argument.type !== "Identifier") reason = "it updates something other than a name";
                 else if (node.type === "VariableDeclarator" && node.id.type !== "Identifier") reason = "it destructures";
@@ -146,10 +146,11 @@ export class PurityProver {
         if (reference === undefined) return this.#scopes.variableOf(node) === undefined ? `it names ${name}, which the analysis doesn't know` : undefined;
         const variable = this.#scopes.staticVariableOf(node);
         if (variable !== undefined && isWithin(variable.scope, fn)) return undefined;
-        return variable === undefined ? globalImpurity(name, parent, key) : this.#bound(variable, builder);
+        return variable === undefined ? globalImpurity(name, parent, key) : this.bound(variable, builder);
     }
 
-    #bound(variable: Variable, builder: FunctionNode): string | undefined {
+    /** Why a hash may not read the builder local `variable` (bound once, for good, before the builder returns). */
+    bound(variable: Variable, builder: FunctionNode): string | undefined {
         const outside = `it reads ${variable.name}, which may change`;
         const [def] = variable.defs;
         if ((variable.scope.block as unknown as Node) !== builder || def === undefined || variable.defs.length !== 1) return outside;

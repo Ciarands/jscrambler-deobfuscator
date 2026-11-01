@@ -79,6 +79,27 @@ export const binary = (operator: string, left: Value, right: Value): Evaluation 
 
 const typeOf = (v: Value): string => (v === null ? "object" : typeof v);
 
+/** JS unary operators (not `delete`) on a primitive. */
+export const unary = (operator: string, v: Value): Evaluation => {
+    const n = v as number; // primitive, see `binary`
+    switch (operator) {
+        case "-":
+            return value(-n);
+        case "+":
+            return value(+n);
+        case "!":
+            return value(!n);
+        case "~":
+            return value(~n);
+        case "typeof":
+            return value(typeOf(v));
+        case "void":
+            return value(undefined);
+        default:
+            return FAIL;
+    }
+};
+
 /** Primitive value of a side-effect-free expression over known values, without running anything. */
 export const evaluate = (node: Node, env: EvaluateEnv = {}): Evaluation => {
     const { cache } = env;
@@ -110,23 +131,7 @@ export const evaluate = (node: Node, env: EvaluateEnv = {}): Evaluation => {
                 // `![]`, `!{}`, `!function () {}`: a fresh object, made without running anything, is truthy.
                 if (n.operator === "!" && isInertObject(n.argument)) return value(false);
                 const arg = visit(n.argument);
-                if (!arg.ok) return FAIL;
-                const v = arg.value as number; // primitive, see `binary`
-                switch (n.operator) {
-                    case "-":
-                        return value(-v);
-                    case "+":
-                        return value(+v);
-                    case "!":
-                        return value(!v);
-                    case "~":
-                        return value(~v);
-                    case "typeof":
-                        return value(typeOf(arg.value));
-                    case "void":
-                        return value(undefined);
-                }
-                return FAIL;
+                return arg.ok ? unary(n.operator, arg.value) : FAIL;
             }
             case "BinaryExpression": {
                 if (n.left.type === "PrivateIdentifier") return FAIL;

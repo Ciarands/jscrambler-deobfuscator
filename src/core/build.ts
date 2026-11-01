@@ -27,14 +27,27 @@ export const callOf = (callee: Expression, args: readonly Argument[], position: 
 
 export type Primitive = string | number | boolean | null | undefined;
 
-export const valueToNode = (value: Primitive, position: At): Expression => {
+/** What the program declares: `undefined`, `NaN` and `Infinity` are written as names only where none is declared. */
+export interface DeclaredNames {
+    declaresName(name: string): boolean;
+}
+
+/**
+ * `undefined`, `NaN` and `Infinity` are written as their global names unless `names` says the program declares a
+ * binding of that name; then as `void 0`, `0 / 0` and `1e999` (literals), which no binding can change.
+ */
+export const valueToNode = (value: Primitive, position: At, names?: DeclaredNames): Expression => {
     const pos = positionOf(position);
-    if (value === undefined) return { type: "Identifier", name: "undefined", ...pos };
+    const free = (name: string): boolean => names === undefined || !names.declaresName(name);
+    if (value === undefined) {
+        if (free("undefined")) return { type: "Identifier", name: "undefined", ...pos };
+        return { type: "UnaryExpression", operator: "void", prefix: true, argument: { type: "Literal", value: 0, raw: null, ...pos }, ...pos } as Expression;
+    }
     if (typeof value === "number") {
-        if (Number.isNaN(value)) return { type: "Identifier", name: "NaN", ...pos };
-        if (value === Infinity) return { type: "Identifier", name: "Infinity", ...pos };
+        if (Number.isNaN(value)) return free("NaN") ? { type: "Identifier", name: "NaN", ...pos } : ({ type: "Literal", value, raw: null, ...pos } as Expression);
+        if (value === Infinity) return free("Infinity") ? { type: "Identifier", name: "Infinity", ...pos } : ({ type: "Literal", value, raw: null, ...pos } as Expression);
         if (value < 0 || Object.is(value, -0)) {
-            return { type: "UnaryExpression", operator: "-", prefix: true, argument: valueToNode(-value, position), ...pos } as Expression;
+            return { type: "UnaryExpression", operator: "-", prefix: true, argument: valueToNode(-value, position, names), ...pos } as Expression;
         }
         return { type: "Literal", value, raw: null, ...pos } as Expression;
     }
