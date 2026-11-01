@@ -1,7 +1,7 @@
 import { analyze } from "eslint-scope";
 import type { Reference, Scope, ScopeManager, Variable } from "eslint-scope";
 import { visitorKeys } from "oxc-parser";
-import type { Node, Program } from "./ast.js";
+import type { MemberExpression, Node, Program } from "./ast.js";
 import { forEachChild } from "./traverse.js";
 
 export type { Reference, Scope, Variable };
@@ -11,53 +11,64 @@ type EstreeNode = Parameters<ScopeManager["acquire"]>[0];
 const asEstree = (node: Node): EstreeNode => node as unknown as EstreeNode;
 
 /**
- * Child keys eslint-scope needs beyond its own (estraverse 5.3's, ESTree up to ES2021). Node types estraverse doesn't
- * know are walked by iteration (`fallback`), and eslint-scope handles classes, imports and exports itself, so the only
- * JS shape it would walk short is `import(source, options)`: the options can hold references. Kept this small on
- * purpose: esrecurse copies the merged keys into every visitor it creates, one per pattern, which made passing all
- * of oxc's keys the slowest part of the analysis. (Known gap, as before: eslint-scope doesn't visit decorators.)
+ * Child keys eslint-scope lacks: only `import(source, options)` would be walked short (options can hold references).
+ * Kept minimal: esrecurse copies these keys into every visitor, so passing all of oxc's keys is slow.
+ * Known gap: eslint-scope doesn't visit decorators.
  */
 export const SCOPE_CHILD_KEYS: Readonly<Record<string, readonly string[]>> = { ImportExpression: visitorKeys["ImportExpression"] ?? ["source", "options"] };
 
 /**
- * Parent pointers live on the nodes themselves, under symbols (no printer, comparison or `structuredClone` sees them),
- * with the stamp of the walk that set them: a node whose stamp isn't its analysis' latest one wasn't in the program
- * that walk saw. One walk per refresh, writing three fields per node, instead of a map of every node. A copy made
- * with a spread (`{ ...node }`) takes the fields along; `SELF` tells it apart (a node created since, so no parent).
+ * Parent pointers live on nodes under symbols (invisible to printer, comparison, `structuredClone`), stamped with the
+ * walk that set them. A spread copy carries the fields along; `SELF` tells it apart from the original.
  */
 const PARENT: unique symbol = Symbol("parent");
 const STAMP: unique symbol = Symbol("stamp");
 const SELF: unique symbol = Symbol("self");
 type Marked = Node & { [PARENT]?: Node; [STAMP]?: number; [SELF]?: Node };
-/** Stamps are unique across analyses: one analysis' walk never passes for another's. */
 let stamps = 0;
 
-/** Point every node in `program` at its parent, from one walk in document order; returns the walk's stamp. */
-const mark = (program: Node): number => {
-    const stamp = ++stamps;
-    let parent = program;
-    const visit = (child: Node): void => {
-        const above = parent;
-        const marked = child as Marked;
-        marked[PARENT] = above;
-        marked[STAMP] = stamp;
-        marked[SELF] = child;
-        parent = child;
-        forEachChild(child, visit);
-        parent = above;
-    };
-    forEachChild(program, visit);
-    return stamp;
-};
-
-/** Whether `node` was in the program the walk with `stamp` saw (not a copy of such a node). */
 const markedBy = (node: Node, stamp: number | undefined): node is Marked => (node as Marked)[STAMP] === stamp && (node as Marked)[SELF] === node;
 
+/** Unresolved names that hold the global object (or, for `top`/`parent`, may: in a top-level window). */
+const GLOBAL_OBJECT_NAMES: Record<string, true> = { globalThis: true, window: true, self: true, frames: true, top: true, parent: true };
+
+/** Nodes whose code gets its own `this`: functions (not arrows), class fields and static blocks. */
+const BINDS_THIS: Record<string, true> = { FunctionDeclaration: true, FunctionExpression: true, PropertyDefinition: true, AccessorProperty: true, StaticBlock: true };
+
+/** Comparisons whose operands' values go nowhere. */
+const EQUALITY: Record<string, true> = { "===": true, "!==": true, "==": true, "!=": true };
+
+const spelledName = (node: Node): string | undefined => {
+    switch (node.type) {
+        case "Literal":
+            return typeof node.value === "string" ? node.value : undefined;
+        case "TemplateElement":
+            return node.value.cooked ?? undefined;
+        case "MemberExpression":
+            return !node.computed && node.property.type === "Identifier" ? node.property.name : undefined;
+        case "Property":
+        case "MethodDefinition":
+        case "PropertyDefinition":
+        case "AccessorProperty":
+            return !node.computed && node.key.type === "Identifier" ? node.key.name : undefined;
+        default:
+            return undefined;
+    }
+};
+
+/** How code can reach the global object's properties other than by a binding's name, as of the last walk. */
+export interface GlobalReach {
+    /** Strings, template texts and static property names: a global so named may be reached as a property. */
+    readonly spelled: ReadonlySet<string>;
+    /** Computed members on an expression that may be the global object (`window[k]`, `this[k]` where `this` may be it). */
+    readonly members: readonly MemberExpression[];
+    /** Where the global object's value goes somewhere (`var g = window`, `f(this)`): any key may be read there. */
+    readonly escapes: readonly Node[];
+}
+
 /**
- * Scope analysis for one program, as it is right now.
- *
- * Any pass that changes bindings or references must ask for a fresh `ScopeInfo` afterwards (the pipeline does this).
- * Lookups are by node identity, so they only work for nodes that were in the program when it was analyzed.
+ * Callers must ask for a fresh `ScopeInfo` after changing bindings or references (the pipeline does this).
+ * Lookups are by node identity, so only nodes present at analysis time are known.
  */
 export class ScopeInfo {
     readonly manager: ScopeManager;
@@ -65,8 +76,11 @@ export class ScopeInfo {
     readonly #declarations = new Map<Node, Variable>();
     #generation = 0;
     #program: Program;
-    /** The stamp of the last walk that marked the program for this analysis (`mark`), if one did. */
     #stamp: number | undefined;
+    /** What the last walk found (`GlobalReach`); spelled names counted, so `forget` can take removed ones away. */
+    #spelled = new Map<string, number>();
+    #members: MemberExpression[] = [];
+    #escapes: Node[] = [];
 
     constructor(program: Program) {
         this.#program = program;
@@ -82,44 +96,102 @@ export class ScopeInfo {
         }
     }
 
-    /** How many times the analysis was refreshed: what it knows changes only with this (or a new analysis). */
+    /** Changes only on refresh/forget; callers may cache against it. */
     get generation(): number {
         return this.#generation;
     }
 
-    /**
-     * Forget references whose identifier is no longer in `program`, after passes that only replaced expressions (no
-     * binding added, removed or moved). The analysis is then what a fresh one would give, except that it doesn't know
-     * the nodes created since: their identifiers resolve to nothing.
-     */
+    /** Drop references no longer in `program`; valid only when no binding was added, removed or moved. Nodes created since resolve to nothing. */
     refresh(program: Program): void {
         this.#generation++;
         this.#program = program;
-        const stamp = mark(program);
-        this.#stamp = stamp;
+        const stamp = this.#mark();
         const dropped = new Set<Reference>();
         for (const [identifier, reference] of this.#references) if (!markedBy(identifier, stamp)) dropped.add(reference);
         this.#drop(dropped);
     }
 
-    /**
-     * A node's parent in the program as the analysis last saw it (marked by `refresh`, or on first ask): none for the
-     * program, for nodes created since, and for nodes taken out before (or `forget`-ten). A pass's own changes after
-     * the walk aren't seen.
-     */
+    /** Parent as of the last walk; none for nodes created or removed since. */
     parentOf(node: Node): Node | undefined {
-        this.#stamp ??= mark(this.#program);
-        return markedBy(node, this.#stamp) ? node[PARENT] : undefined;
+        const stamp = this.#stamp ?? this.#mark();
+        return markedBy(node, stamp) ? node[PARENT] : undefined;
+    }
+
+    /** See `GlobalReach`; from the last walk, without what `forget` took away since. */
+    globalReach(): GlobalReach {
+        const stamp = this.#stamp ?? this.#mark();
+        const spelled = new Set<string>();
+        for (const [name, count] of this.#spelled) if (count > 0) spelled.add(name);
+        return { spelled, members: this.#members.filter((member) => markedBy(member, stamp)), escapes: this.#escapes.filter((node) => markedBy(node, stamp)) };
+    }
+
+    /** Whether `node` is the global object: `this` where it is (`thisIsGlobal`), or an unresolved global name for it. */
+    #isGlobalObject(node: Node, thisIsGlobal: boolean): boolean {
+        if (node.type === "ThisExpression") return thisIsGlobal;
+        return node.type === "Identifier" && GLOBAL_OBJECT_NAMES[node.name] === true && this.#references.has(node) && this.staticVariableOf(node) === undefined;
     }
 
     /**
-     * Forget the references inside `removed` (subtrees taken out of the program, nothing else changed): what `refresh`
-     * would do after such removals, without walking the whole program.
+     * Point every node at its parent, in one walk in document order, collecting the global reach along: `this` may be
+     * the global object at a script's top level and in a sloppy function (called unbound); its value goes nowhere as a
+     * member's object, under `typeof` or in an equality.
      */
+    #mark(): number {
+        const program = this.#program;
+        const stamp = ++stamps;
+        this.#stamp = stamp;
+        const spelled = new Map<string, number>();
+        const members: MemberExpression[] = [];
+        const escapes: Node[] = [];
+        let parent: Node = program;
+        let thisIsGlobal = program.sourceType === "script";
+        let first: Node | undefined;
+        let second: Node | undefined;
+        const visit = (child: Node): void => {
+            const above = parent;
+            const marked = child as Marked;
+            marked[PARENT] = above;
+            marked[STAMP] = stamp;
+            marked[SELF] = child;
+            const name = spelledName(child);
+            if (name !== undefined) spelled.set(name, (spelled.get(name) ?? 0) + 1);
+            if (child.type === "ThisExpression" || child.type === "Identifier") {
+                if (child !== first && child !== second && this.#isGlobalObject(child, thisIsGlobal)) escapes.push(child);
+            } else if (child.type === "MemberExpression" && child.computed && this.#isGlobalObject(child.object, thisIsGlobal)) members.push(child);
+            const outerThis = thisIsGlobal;
+            const outerFirst = first;
+            const outerSecond = second;
+            if (child.type === "FunctionDeclaration" || child.type === "FunctionExpression") thisIsGlobal = this.scopeOf(child)?.isStrict === false;
+            else if (BINDS_THIS[child.type] === true) thisIsGlobal = false;
+            first = child.type === "MemberExpression" ? child.object : child.type === "UnaryExpression" && child.operator === "typeof" ? child.argument : undefined;
+            second = undefined;
+            if (child.type === "BinaryExpression" && EQUALITY[child.operator] === true) {
+                first = child.left;
+                second = child.right;
+            }
+            parent = child;
+            forEachChild(child, visit);
+            parent = above;
+            thisIsGlobal = outerThis;
+            first = outerFirst;
+            second = outerSecond;
+        };
+        forEachChild(program, visit);
+        this.#spelled = spelled;
+        this.#members = members;
+        this.#escapes = escapes;
+        return stamp;
+    }
+
+    /** `refresh` for removed subtrees only, without walking the whole program. */
     forget(removed: Iterable<Node>): void {
         this.#generation++;
         const dropped = new Set<Reference>();
         const collect = (node: Node): void => {
+            if (markedBy(node, this.#stamp)) {
+                const name = spelledName(node);
+                if (name !== undefined) this.#spelled.set(name, (this.#spelled.get(name) ?? 1) - 1);
+            }
             (node as Marked)[STAMP] = 0;
             if (node.type === "Identifier") {
                 const reference = this.#references.get(node);
@@ -155,17 +227,14 @@ export class ScopeInfo {
         this.#staticReferences = undefined;
     }
 
-    /** The reference for an identifier that reads or writes a variable. */
     referenceOf(identifier: Node): Reference | undefined {
         return this.#references.get(identifier);
     }
 
-    /** The variable an identifier declares or refers to. `undefined` for globals and names that resolve to nothing. */
     variableOf(identifier: Node): Variable | undefined {
         return this.#declarations.get(identifier) ?? this.#references.get(identifier)?.resolved ?? undefined;
     }
 
-    /** True when the identifier is a reference that doesn't resolve to any declaration in the program. */
     isGlobalReference(identifier: Node): boolean {
         const reference = this.#references.get(identifier);
         return reference !== undefined && reference.resolved === null;
@@ -173,10 +242,7 @@ export class ScopeInfo {
 
     #globals: Map<string, Reference[]> | undefined;
 
-    /**
-     * References to `name` that no declaration in the program binds (host globals, implicit globals), anywhere in the
-     * program. A script's top-level declarations resolve like any other: their references are on the variable.
-     */
+    /** Unbound references to `name`; script top-level declarations are bound, not global. */
     globalReferences(name: string): readonly Reference[] {
         if (this.#globals === undefined) {
             this.#globals = new Map();
@@ -191,16 +257,12 @@ export class ScopeInfo {
 
     #declared: Set<string> | undefined;
 
-    /** Whether any scope in the program declares `name` (e.g. a parameter called `undefined`). */
     declaresName(name: string): boolean {
         this.#declared ??= new Set(this.manager.scopes.flatMap((scope) => scope.variables.map((variable) => variable.name)));
         return this.#declared.has(name);
     }
 
-    /**
-     * Whether `name` is declared around the reference `site` (in its scope or one enclosing it), so the global of that
-     * name isn't what `name` would mean there. `undefined` when `site` isn't a reference the analysis knows.
-     */
+    /** Whether `name` is declared in scope at reference `site`; `undefined` when `site` is unknown. */
     nameBoundAt(site: Node, name: string): boolean | undefined {
         const from = this.#references.get(site)?.from;
         if (from === undefined) return undefined;
@@ -208,7 +270,6 @@ export class ScopeInfo {
         return false;
     }
 
-    /** The variable `reference` names under static scoping (see `staticVariableOf`). */
     #resolveStatically(reference: Reference): Variable | undefined {
         const name = reference.identifier.name;
         for (let scope: Scope | null = reference.from; scope !== null; scope = scope.upper) {
@@ -219,11 +280,7 @@ export class ScopeInfo {
         return undefined;
     }
 
-    /**
-     * The variable an identifier refers to under static scoping: also where eslint-scope leaves it unresolved because a
-     * direct `eval` made the scope dynamic. For analyses that take code an eval runs not to use this script's names
-     * (it is another script's code). `undefined` for real globals, and through `with`.
-     */
+    /** Like `variableOf`, but also resolves names eslint-scope left dynamic due to direct `eval`. `undefined` through `with`. */
     staticVariableOf(identifier: Node): Variable | undefined {
         const known = this.variableOf(identifier);
         if (known !== undefined) return known;
@@ -232,7 +289,6 @@ export class ScopeInfo {
     }
 
     #staticReferences: Map<Variable, Reference[]> | undefined;
-    /** Each variable's references with its statically resolved ones, built on first ask (until the next refresh). */
     #mergedReferences = new Map<Variable, readonly Reference[]>();
 
     /** Every reference to `variable` under static scoping (see `staticVariableOf`). */
@@ -256,7 +312,6 @@ export class ScopeInfo {
         return references;
     }
 
-    /** The scope a function, block or program node creates, if any. */
     scopeOf(node: Node): Scope | null {
         return this.manager.acquire(asEstree(node));
     }

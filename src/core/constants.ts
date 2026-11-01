@@ -3,19 +3,14 @@ import { isIndexKey, memberKey } from "./ast.js";
 import type { EvaluateEnv, Evaluation, Value } from "./evaluate.js";
 import { binary, evaluate, FAIL, value } from "./evaluate.js";
 import type { PassLog } from "./log.js";
-import type { Reference, ScopeInfo, Variable } from "./scope.js";
+import type { GlobalReach, Reference, ScopeInfo, Variable } from "./scope.js";
 import { forEachChild } from "./traverse.js";
 
-/** Nodes whose document order the analysis compares (definitions and reads). */
 const ORDERED: Record<string, true> = { Identifier: true, MemberExpression: true, VariableDeclarator: true, ExpressionStatement: true };
 
-/** A constant and the node after which (in document order) it holds. */
 type Constant = { readonly value: Value; readonly after: Node };
 
-/**
- * Where a binding gets its value: `value` at `definition` (in `statement`), then the `steps` (statements `x = w;` and
- * `x += w;`) after it in the same statement list; the whole holds after `after` (the last of these writes).
- */
+/** `value` at `definition`, then `steps` (`x = w;`/`x += w;`) in the same statement list; holds after `after`. */
 interface Definition {
     readonly value: Node;
     readonly definition: Node;
@@ -26,20 +21,15 @@ interface Definition {
 
 export type FunctionLike = FunctionNode | ArrowFunctionExpression;
 
-/** A function a binding holds for good: from entry (`after` undefined: a declaration), or after `after` in `block`. */
+/** `after` undefined: a declaration, held from scope entry. */
 interface FunctionBinding {
     readonly fn: FunctionLike;
     readonly after: Node | undefined;
     readonly block: Node;
 }
 
-/** `constantEnv`'s environment, plus what the functions it knows of are. */
 export interface ConstantEnv extends EvaluateEnv {
-    /**
-     * The function a reference (`f` of `f(x)`) holds for good where it is, if any: a function declaration, never
-     * written, or a function or arrow expression the binding gets once (like a constant),
-     * when the reference comes after that.
-     */
+    /** The function a reference holds for good where it is, if any. */
     readonly functionAt: (identifier: Node) => FunctionLike | undefined;
     /**
      * Whether code can reach the binding only by its name: always for one inside a function; for a script global,
@@ -49,53 +39,34 @@ export interface ConstantEnv extends EvaluateEnv {
     readonly onlyByName: (variable: Variable) => boolean;
 }
 
-/** A constant array: what each element evaluates to, and the definition (in `block`) after which the array holds. */
+/** `after`: the definition (in `block`) after which the array holds. */
 interface Table {
     readonly elements: readonly Evaluation[];
     readonly after: Node;
     readonly block: Node;
 }
 
-/** A holder (variable or `arguments`-array slot) written once, by a statement directly in `block`, with an array. */
 interface Alias {
     readonly table: Variable;
     readonly after: Node;
     readonly block: Node;
 }
 
-/** The only write of an `arguments`-array slot, when it is a plain statement `a[k] = value;` directly in the body. */
 interface SlotWrite {
     readonly value: Expression;
     readonly statement: Node;
 }
 
-/** How an `arguments`-style array (only ever used as `a[index]`) is used, slot by slot. */
 interface SlotArray {
     readonly block: Node;
-    /** The only write of each slot, `undefined` when it has several, or one that isn't a plain top-level statement. */
+    /** `undefined` when a slot has several writes, or one that isn't a plain top-level statement. */
     readonly writes: Map<string, SlotWrite | undefined>;
-    /** What every write of each slot assigns: `undefined` for initializer elements and writes other than `=`. */
+    /** `undefined` entries: initializer elements and writes other than `=`. */
     readonly assigned: Map<string, (Expression | undefined)[]>;
-    /** The members reading each slot. */
     readonly reads: Map<string, Node[]>;
 }
 
-/** Why a candidate isn't constant, at which node. */
 type Refusal = { readonly reason: string; readonly node: Node };
-
-/** What the whole program spells out, for script globals; collected in one walk when a script global is first asked about. */
-interface ProgramNames {
-    /** Every string literal, template text and static property name: a global so named may be reached as a property. */
-    readonly spelled: Set<string>;
-    /** Computed members on an expression that is the global object (`window[k]`, top-level `this[k]`). */
-    readonly globalMembers: MemberExpression[];
-}
-
-/** Unresolved names that hold the global object (or, for `top`/`parent`, may: in a top-level window). */
-const GLOBAL_OBJECT_NAMES: Record<string, true> = { globalThis: true, window: true, self: true, frames: true, top: true, parent: true };
-
-/** Nodes whose code gets its own `this`: functions (not arrows), class fields and static blocks. */
-const BINDS_THIS: Record<string, true> = { FunctionDeclaration: true, FunctionExpression: true, PropertyDefinition: true, AccessorProperty: true, StaticBlock: true };
 
 const functionBody = (block: Node): readonly Node[] | undefined =>
     block.type === "Program"
@@ -104,24 +75,13 @@ const functionBody = (block: Node): readonly Node[] | undefined =>
           ? block.body.body
           : undefined;
 
-/** The name a node spells out as a string or a static property key, if any. */
-const spelledName = (node: Node): string | undefined => {
-    switch (node.type) {
-        case "Literal":
-            return typeof node.value === "string" ? node.value : undefined;
-        case "TemplateElement":
-            return node.value.cooked ?? undefined;
-        case "MemberExpression":
-            return !node.computed && node.property.type === "Identifier" ? node.property.name : undefined;
-        case "Property":
-        case "MethodDefinition":
-        case "PropertyDefinition":
-        case "AccessorProperty":
-            return !node.computed && node.key.type === "Identifier" ? node.key.name : undefined;
-        default:
-            return undefined;
-    }
-};
+/** The function a definition gives its binding: a declaration, or a declarator's function or arrow. */
+const functionOf = (definition: Node): Node | undefined =>
+    definition.type === "FunctionDeclaration"
+        ? definition
+        : definition.type === "VariableDeclarator" && (definition.init?.type === "FunctionExpression" || definition.init?.type === "ArrowFunctionExpression")
+          ? definition.init
+          : undefined;
 
 /**
  * Whether `member` (its parent `above`, and `above`'s parent `outer`) is written: assigned (also by `+=`, `++`,
@@ -148,7 +108,6 @@ const isWritten = (member: Node, above: Node | undefined, outer: Node | undefine
     }
 };
 
-/** A static index key of a member (`a[3]`, never `a.x` or `a[k]`), as a string. */
 const literalIndex = (member: MemberExpression): string | undefined => {
     const key = memberKey(member);
     return key === undefined || !isIndexKey(String(key)) || (member.computed && member.property.type !== "Literal") ? undefined : String(key);
@@ -211,8 +170,9 @@ const escapingUse = (member: Node, above: Node | undefined): string | undefined 
  *
  * Script globals (`var` at the top of a script) are also properties of the global object, so they are refused when
  * code could reach one as a property: the program spells its name (`window.T`, `G[k].T`, `"T"`), uses `with` or a
- * direct `eval`, or reads or writes the global object (`globalThis`, `window`, `self`, top-level `this`...) with a key
- * that doesn't evaluate, or evaluates to the name. Other scripts don't touch them (semantic model 2).
+ * direct `eval`, reads or writes the global object (`globalThis`, `window`, `self`, `this` at the top or in a sloppy
+ * function) with a key that doesn't evaluate or evaluates to the name, or hands it on (`var g = window`, `f(this)`).
+ * Other scripts don't touch them (semantic model 2).
  */
 export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
     const cached = envs.get(scopes);
@@ -226,15 +186,9 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
     return env;
 };
 
-/**
- * One environment per scope analysis and generation: passes that run on a program nothing changed since share it,
- * with what it worked out (the analysis is refreshed, starting a generation, whenever a pass changed the program).
- * The log follows the pass asking.
- */
 const envs = new WeakMap<ScopeInfo, { readonly generation: number; readonly env: ConstantEnv; readonly logRef: { log: PassLog | undefined } }>();
 
 const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | undefined }): ConstantEnv => {
-    /** Each node's children in document order, by position: built per parent when an order question reaches it. */
     const childPositions = new Map<Node, Map<Node, number>>();
     const constants = new Map<Variable, Constant | undefined>();
     const functionBindings = new Map<Variable, FunctionBinding | undefined>();
@@ -247,11 +201,9 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
     /** The array whose uses are being checked, read as unchanged by the keys the check evaluates (see above). */
     let validating: { readonly variable: Variable; readonly table: Table } | undefined;
 
-    const program = scopes.manager.globalScope?.block as unknown as Node | undefined;
     const dynamic = scopes.manager.scopes.find((scope) => scope.type === "with" || scope.directCallToEvalScope);
     const hasWith = scopes.manager.scopes.some((scope) => scope.type === "with");
 
-    /** Statements directly in a block's body (they run once per entry), by block. */
     const topLevels = new Map<Node, ReadonlySet<Node>>();
     const isTopLevel = (block: Node, statement: Node | undefined): boolean => {
         if (statement === undefined) return false;
@@ -262,13 +214,11 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
         }
         return set.has(statement);
     };
-    /** `node`'s ancestors from its parent up to the program (empty for nodes the analysis doesn't know). */
     const ancestorsOf = (node: Node): Node[] => {
         const chain: Node[] = [];
         for (let above = scopes.parentOf(node); above !== undefined; above = scopes.parentOf(above)) chain.push(above);
         return chain;
     };
-    /** Whether `node` lies strictly inside `ancestor`. */
     const isWithin = (ancestor: Node, node: Node): boolean => {
         for (let above = scopes.parentOf(node); above !== undefined; above = scopes.parentOf(above)) if (above === ancestor) return true;
         return false;
@@ -298,7 +248,6 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
             const at = index.get(parent);
             if (at !== undefined) return at > 0 && positionOf(parent, aChain[at - 1] as Node) < positionOf(parent, child);
         }
-        // `b` contains `a`, or they share no ancestor the analysis knows.
         return false;
     };
     /** The nearest function declaration around `use` inside `block`: hoisted, so callable before what precedes it. */
@@ -307,33 +256,9 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
         return undefined;
     };
 
-    /** Whether `node` is the global object: `this` where it is (`thisIsGlobal`), or an unresolved global name for it. */
-    const isGlobalObject = (node: Node, thisIsGlobal: boolean): boolean =>
-        node.type === "ThisExpression"
-            ? thisIsGlobal
-            : node.type === "Identifier" && GLOBAL_OBJECT_NAMES[node.name] === true && scopes.referenceOf(node) !== undefined && scopes.staticVariableOf(node) === undefined;
+    let reach: GlobalReach | undefined;
+    const namesOf = (): GlobalReach => (reach ??= scopes.globalReach());
 
-    /** Spelled names and global-object members of the whole program, from one walk when first needed. */
-    let programNames: ProgramNames | undefined;
-    const namesOf = (): ProgramNames => {
-        if (programNames !== undefined) return programNames;
-        const names: ProgramNames = { spelled: new Set(), globalMembers: [] };
-        if (program === undefined) return (programNames = names);
-        // One callback for the whole walk (no closure per node): `thisIsGlobal` describes the node whose children are
-        // being visited (a script's top-level code, no function around it binding its own `this`).
-        let thisIsGlobal = program.type === "Program" && program.sourceType === "script";
-        const visit = (child: Node): void => {
-            const name = spelledName(child);
-            if (name !== undefined) names.spelled.add(name);
-            if (child.type === "MemberExpression" && child.computed && isGlobalObject(child.object, thisIsGlobal)) names.globalMembers.push(child);
-            const outerThis = thisIsGlobal;
-            thisIsGlobal = outerThis && BINDS_THIS[child.type] !== true;
-            forEachChild(child, visit);
-            thisIsGlobal = outerThis;
-        };
-        forEachChild(program, visit);
-        return (programNames = names);
-    };
     /** A node's parent; none for the name of `o.name`, which is no reference. */
     const parentOf = (node: Node): Node | undefined => {
         const above = scopes.parentOf(node);
@@ -345,9 +270,7 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
      * only ever make a check succeed.
      */
     const verdicts = new Map<Node, Map<Node, boolean>>();
-    /** Per definition, the declarations `runsAfter` is checking for it. */
     const checking = new Map<Node, Set<Node>>();
-    /** How many checks are running, and the declarations they found to run after (proven once all are done). */
     let depth = 0;
     let reached: { readonly known: Map<Node, boolean>; readonly declaration: Node }[] = [];
 
@@ -456,17 +379,41 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
         if (dynamic !== undefined) return [{ reason: "the program uses with or direct eval", node: dynamic.block as unknown as Node }];
         const names = namesOf();
         if (names.spelled.has(variable.name)) return [{ reason: `the program spells ${variable.name} as a property or a string`, node }];
+        // The code of a function nothing reads runs only once something reaches it: for its own binding's check, the
+        // global object it would reach doesn't count.
+        const unrun = scopes.staticReferences(variable).some((reference) => reference.isRead())
+            ? []
+            : variable.defs.map((def) => functionOf(def.node as unknown as Node)).filter((fn) => fn !== undefined);
+        const counts = (place: Node): boolean => !unrun.some((fn) => isWithin(fn, place));
+        const escape = names.escapes.find(counts);
+        if (escape !== undefined) return [{ reason: "the global object's value goes somewhere, where any key may be read", node: escape }];
         const refusals: Refusal[] = [];
-        for (const member of names.globalMembers) {
-            const key = evaluate(member.property, env);
-            if (key.ok) {
-                if (String(key.value) === variable.name) refusals.push({ reason: `the global object is used with the key ${variable.name}`, node: member });
+        for (const member of names.members) {
+            if (!counts(member)) continue;
+            const key = globalMemberKey(member);
+            if (key !== undefined) {
+                if (key === variable.name) refusals.push({ reason: `the global object is used with the key ${variable.name}`, node: member });
             } else if (!keyOfTable(member.property, variable.name)) {
                 refusals.push({ reason: "the global object is used with an unknown key", node: member });
             }
             if (refusals.length > 0 && !all) break;
         }
         return refusals;
+    };
+
+    /**
+     * Each global member's key, where it evaluates: kept once known (a failure may be a lookup still in progress, and
+     * an answer under a table being validated holds only for that check).
+     */
+    const globalMemberKeys = new Map<Node, string>();
+    const globalMemberKey = (member: MemberExpression): string | undefined => {
+        const known = validating === undefined ? globalMemberKeys.get(member) : undefined;
+        if (known !== undefined) return known;
+        const key = evaluate(member.property, env);
+        if (!key.ok) return undefined;
+        const name = String(key.value);
+        if (validating === undefined) globalMemberKeys.set(member, name);
+        return name;
     };
 
     /**
@@ -490,7 +437,6 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
             return refusal === undefined;
         });
 
-    /** The statement `x OP v;` a write reference (to `x`) is the target of, if it is one. */
     const assigningStatement = (write: Reference, operator: string): Node | undefined => {
         const id = write.identifier as unknown as Node;
         const assignment = parentOf(id);
@@ -515,7 +461,6 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
         const declarator = def.node as unknown as Node;
         const declaration = def.parent as unknown as Node | null;
         if (declarator.type !== "VariableDeclarator" || declarator.id.type !== "Identifier" || declaration?.type !== "VariableDeclaration") return undefined;
-        /** The writes as statements (a declarator's in its declaration), with what each assigns. */
         const writes: { operator: "=" | "+="; value: Expression; definition: Node; statement: Node }[] = [];
         for (const write of scopes.staticReferences(variable)) {
             if (!write.isWrite()) continue;
@@ -547,7 +492,6 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
     };
 
     const definitions = new Map<Variable, Definition | undefined>();
-    /** `findDefinition`, once per binding (constants and tables both ask). */
     const builtDefinition = (variable: Variable): Definition | undefined => {
         if (definitions.has(variable)) return definitions.get(variable);
         const found = findDefinition(variable);
@@ -555,7 +499,6 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
         return found;
     };
 
-    /** A binding's one value (see `builtDefinition`), when it is written once. */
     const singleDefinition = (variable: Variable): Definition | undefined => {
         const built = builtDefinition(variable);
         return built?.steps.length === 0 ? built : undefined;
@@ -625,7 +568,6 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
         return binding.after === undefined || reachesAfter(binding.block, binding.after, identifier) ? binding.fn : undefined;
     };
 
-    /** The slots of an `arguments`-style array, or `undefined` when the array is used any other way. */
     const slotArrayOf = (variable: Variable): SlotArray | undefined =>
         memo(slotArrays, variable, () => {
             const [def] = variable.defs;
@@ -674,7 +616,6 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
             return { block, writes: only, assigned, reads };
         });
 
-    /** The single write of slot `key` of the array `object` names, if `object` names a slot array. */
     const slotWriteOf = (object: Node, key: string): { array: SlotArray; write: SlotWrite | undefined } | undefined => {
         const variable = object.type === "Identifier" ? scopes.staticVariableOf(object) : undefined;
         const array = variable === undefined ? undefined : slotArrayOf(variable);
@@ -687,7 +628,6 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
             return result.ok ? { value: result.value, after: write.statement } : undefined;
         });
 
-    /** An array literal assigned to `variable` exactly once, directly in its body: the array and the assigning node. */
     const arrayDefinition = (variable: Variable): { array: Node; after: Node; id: Node } | undefined => {
         const [def] = variable.defs;
         if (variable.defs.length !== 1 || def === undefined || def.type !== "Variable") return undefined;
@@ -710,7 +650,6 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
         return { array: assignment.right, after: statement, id };
     };
 
-    /** What each element of an array literal evaluates to; `undefined` when it spreads (its length is unknown). */
     const elementsOf = (array: Node): Evaluation[] | undefined => {
         if (array.type !== "ArrayExpression") return undefined;
         const elements: Evaluation[] = [];
@@ -741,7 +680,6 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
         return use === undefined ? undefined : { reason: `read with a key that isn't a known index, its value ${use}`, node: member };
     };
 
-    /** Every read of the holder variable `variable` is a `checkRead` read. */
     const checkHolder = (variable: Variable): Refusal | undefined => {
         for (const reference of scopes.staticReferences(variable)) {
             if (!reference.isRead()) continue;
@@ -753,7 +691,6 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
         return undefined;
     };
 
-    /** Every one of `reads` (members reading a holder slot) is the object of a `checkRead` read. */
     const checkSlotReads = (reads: readonly Node[]): Refusal | undefined => {
         for (const read of reads) {
             const member = parentOf(read);
@@ -875,7 +812,6 @@ const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | u
         return values !== undefined && values.every((assigned) => assigned?.type === "Identifier" && scopes.staticVariableOf(assigned) === variable);
     };
 
-    /** `T[k]` on a constant array (directly or through an alias): element k, when the read sees the array. */
     const tableRead = (member: MemberExpression): Evaluation => {
         const holder = holderOf(member.object);
         const assumed = validating !== undefined && (holder?.table === validating.variable || holdsOnly(member.object, validating.variable));

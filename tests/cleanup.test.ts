@@ -322,17 +322,33 @@ describe("cleanup: dead stores", () => {
         for (const kept of ['log.push("call")', "outer.v = 1;", "o.k = 2;", '"argument"', '"default"', '"return"', "o.__proto__ = o;", "o = null;"]) expect(code).toContain(kept);
     });
 
-    it("drops a script global's dead table and declaration when only its name could reach it, not when the program spells it or uses the global object with an unknown key", async () => {
+    it("drops a script global's dead table and declaration when only its name could reach it, not when the program spells it or may read the global object with an unknown key", async () => {
         const dead = 'var table;\ntable = ["a", "b"];\nfunction unusedHelper() { return 1; }\nresult = 2;\n';
         const { code } = await deobfuscate(dead, { passes: ["cleanup"] });
         expect(run(code)).toBe(run(dead));
         expect(code).toBe("result = 2;\n");
-        for (const reach of ['result = "table";', 'var key = host.side() ? "table" : "x";\nresult = typeof globalThis[key];']) {
+        const reaches = [
+            'result = "table";',
+            'var key = host.side() ? "table" : "x";\nresult = typeof globalThis[key];',
+            // `this` in a sloppy function called unbound is the global object.
+            'function leak(p) { return typeof this[p + "ble"]; }\nresult = leak("ta");',
+            // The global object handed on: to a parameter, or as `this` to a strict function.
+            'function read(o, p) { return typeof o[p + "ble"]; }\nresult = read(globalThis, "ta");',
+            'function strict(p) { "use strict"; return typeof this[p + "ble"]; }\nresult = strict.call(this, "ta");',
+        ];
+        for (const reach of reaches) {
             const program = `var table;\ntable = ["a", "b"];\n${reach}\n`;
             const kept = await deobfuscate(program, { passes: ["cleanup"] });
             expect(run(kept.code)).toBe(run(program));
             expect(kept.code).toContain('table = ["a", "b"];');
         }
+    });
+
+    it("drops a script global's dead table once the code handing the global object on is itself removed", async () => {
+        const program = 'var table;\ntable = ["a", "b"];\nfunction unusedHelper() { return window; }\nresult = 2;\n';
+        const { code } = await deobfuscate(program, { passes: ["cleanup"] });
+        expect(run(code)).toBe(run(program));
+        expect(code).toBe("result = 2;\n");
     });
 
     it("keeps unused locals a direct eval can see, and removes those it can't", async () => {
