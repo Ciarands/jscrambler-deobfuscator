@@ -2,10 +2,8 @@ import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 
-// Both setup variants jscrambler uses: aliases defined on the builtins themselves, and getters on the storage object
-// that hand out a function (no arguments: the builtin; with arguments: a call through it). Those calls come in three
-// shapes: static (`Owner.name.apply(Owner, args)`), dispatch on the receiver (`r[name](...rest)`, what some
-// runtime does) and apply on the receiver (`Owner.prototype.name.apply(r, rest)`).
+// Both setup variants: aliases on the builtins, and storage getters handing out a function. Calls come static
+// (`Owner.name.apply(Owner, args)`), as receiver dispatch (`r[name](...rest)`), or as receiver apply.
 const PRELUDE = `
 function G() {}
 G[3] = (function () { return globalThis; })();
@@ -85,7 +83,6 @@ const withHost = (
 setTimeout(function () { ${later} });
 `;
 
-/** What a script leaves in `result` once its timers ran, with `host` as extra globals. */
 const observed = (code: string, host: Record<string, unknown>): string => {
     const timers: (() => void)[] = [];
     const context: Record<string, unknown> = { ...host, setTimeout: (callback: () => void) => timers.push(callback) };

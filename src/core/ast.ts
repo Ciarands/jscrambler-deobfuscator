@@ -4,22 +4,16 @@ export type * from "oxc-parser";
 
 export const isFunctionNode = (node: Node | null | undefined): boolean => node?.type === "FunctionExpression" || node?.type === "FunctionDeclaration" || node?.type === "ArrowFunctionExpression";
 
-/** A statement that never completes normally: `return`, `throw`, `break`, `continue`. */
 export const isJump = (node: Node | null | undefined): boolean =>
     node?.type === "ReturnStatement" || node?.type === "ThrowStatement" || node?.type === "BreakStatement" || node?.type === "ContinueStatement";
 
 const LOOP_TYPES: ReadonlySet<string> = new Set(["ForStatement", "ForInStatement", "ForOfStatement", "WhileStatement", "DoWhileStatement"]);
 
-/** A loop: what an unlabelled `continue` (and `break`) binds to. */
 export const isLoopNode = (node: Node | null | undefined): boolean => node !== null && node !== undefined && LOOP_TYPES.has(node.type);
 
-/** What an unlabelled `break` binds to: a loop or a `switch`. */
 export const isBreakTarget = (node: Node | null | undefined): boolean => isLoopNode(node) || node?.type === "SwitchStatement";
 
-/**
- * The property key of a member expression when it is static: `a.b` and `a["b"]` give `"b"`, `a[3]` gives `3`.
- * Returns `undefined` for computed keys that aren't literals.
- */
+/** `a.b`/`a["b"]` give `"b"`, `a[3]` gives `3`; `undefined` for non-literal computed keys. */
 export const memberKey = (node: MemberExpression): string | number | undefined => {
     if (!("property" in node)) return undefined;
     if (!node.computed) return node.property.name;
@@ -28,10 +22,7 @@ export const memberKey = (node: MemberExpression): string | number | undefined =
     return undefined;
 };
 
-/**
- * The property key of a member expression when it is static, as JS sees it (`ToPropertyKey`): `a.b`, `a["b"]` give
- * `"b"`; `a[3]`, `a["3"]` give `"3"`. `undefined` for computed keys that aren't literals and for private names.
- */
+/** As `ToPropertyKey`: `a[3]` and `a["3"]` both give `"3"`. `undefined` for non-literal computed keys and private names. */
 export const propertyKey = (node: MemberExpression): string | undefined => {
     if (!("property" in node)) return undefined;
     const property = node.property;
@@ -42,7 +33,7 @@ export const propertyKey = (node: MemberExpression): string | undefined => {
     return undefined;
 };
 
-/** A static member chain `R.a[1].b` as its innermost object `R` and its keys (`["a", "1", "b"]`), outermost last. */
+/** `R.a[1].b` gives root `R` and keys `["a", "1", "b"]`. */
 export const memberPath = (node: Node): { root: Node; keys: string[] } | undefined => {
     const keys: string[] = [];
     let current = node;
@@ -55,10 +46,8 @@ export const memberPath = (node: Node): { root: Node; keys: string[] } | undefin
     return keys.length === 0 ? undefined : { root: current, keys: keys.toReversed() };
 };
 
-/** An ECMAScript IdentifierName (reserved words included: they're valid after a dot). */
 export const isIdentifierName = (name: string): boolean => /^[\p{ID_Start}$_][\p{ID_Continue}$\u200C\u200D]*$/u.test(name);
 
-/** A canonical array index or integer key (`"0"`, `"593908"`), printable as a numeric literal. */
 export const isIndexKey = (key: string): boolean => {
     const n = Number(key);
     return key !== "" && Number.isSafeInteger(n) && n >= 0 && String(n) === key;

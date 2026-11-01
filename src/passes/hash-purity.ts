@@ -5,17 +5,11 @@ import { returnsOf } from "./emulate/builders.js";
 
 type FunctionLike = FunctionNode | ArrowFunctionExpression;
 
-/** `Math`'s members a pure function may use: everything but `random`. */
 const PURE_MATH: ReadonlySet<string> = new Set(Object.getOwnPropertyNames(Math).filter((name) => name !== "random"));
 
-/** Global names a pure function may read. */
 const GLOBAL_VALUES: ReadonlySet<string> = new Set(["undefined", "NaN", "Infinity"]);
 
-/**
- * The node types a pure function may contain: statements and operators over primitives. Nothing that makes objects
- * or functions (so every value it handles is a primitive when its arguments are), and nothing that runs code it
- * doesn't show (`new`, getters through computed keys, iteration protocols, `with`, `yield`/`await`).
- */
+/** Nothing that makes objects or functions, or runs code it doesn't show (`new`, computed getters, iteration, `with`). */
 const ALLOWED: ReadonlySet<string> = new Set([
     "BlockStatement",
     "ExpressionStatement",
@@ -53,7 +47,6 @@ const isWithin = (scope: Scope | null, fn: Node): boolean => {
     return false;
 };
 
-/** Whether `inner` is in `outer`'s subtree. */
 const contains = (outer: Node, inner: Node): boolean => {
     let found = false;
     traverse(outer, {
@@ -75,7 +68,6 @@ const memberImpurity = (node: MemberExpression, parent: Node | null, key: string
     return `it ${called ? "calls" : "uses"} .${name}`;
 };
 
-/** A global the function reads: `undefined`, `NaN`, `Infinity`, or a member of `Math` but `random`. */
 const globalImpurity = (name: string, parent: Node | null, key: string | null): string | undefined => {
     if (GLOBAL_VALUES.has(name)) return undefined;
     if (name !== "Math" || parent?.type !== "MemberExpression" || key !== "object" || parent.computed || parent.property.type !== "Identifier") return `it reads the global ${name}`;
@@ -83,17 +75,10 @@ const globalImpurity = (name: string, parent: Node | null, key: string | null): 
 };
 
 /**
- * Proves functions of a runtime builder pure: their result depends only on their arguments, they change nothing
- * outside their own locals, and they make the same choices on every run. Termination is the caller's to see (a
- * guest run with the arguments in question).
- *
- * A pure function's code uses only the node types in `ALLOWED`; with primitive arguments every value it handles is
- * then a primitive, or a function giving a string's char codes (`String.prototype.charCodeAt.bind(x)`). Its names are
- * its own locals and parameters (written freely), the builder's locals that hold one value for good (bound once, before
- * the builder returns, to a literal or to a function that is pure itself), and the globals `undefined`, `NaN`,
- * `Infinity` and `Math` (all members but `random`). Members it reads are `length` and `Math`'s; the only methods it
- * calls are `Math`'s, `charCodeAt`, and that `bind`. Relies on model 7: builtins intact (those it calls are the
- * standard ones, as in the guest).
+ * Proves builder functions pure: result depends only on arguments, no outside writes, same choices every run.
+ * Termination is the caller's to see (a guest run). With primitive arguments every value is a primitive or a
+ * `charCodeAt.bind(x)` function; names are own locals, builder locals bound once for good, and a few read-only
+ * globals. Relies on model 7 (builtins intact).
  */
 export class PurityProver {
     readonly #scopes: ScopeInfo;
@@ -105,7 +90,6 @@ export class PurityProver {
         this.#scopes = scopes;
     }
 
-    /** Why `fn`, a function of the immediately invoked `builder`, isn't pure; `undefined` when it is. */
     impurity(fn: FunctionLike, builder: FunctionNode): string | undefined {
         if (this.#proven.has(fn)) return this.#proven.get(fn);
         this.#proven.set(fn, undefined); // a helper calling back into a function being proven: the outer proof decides
@@ -119,7 +103,6 @@ export class PurityProver {
         if (!fn.params.every((param) => param.type === "Identifier")) return "its parameters aren't plain names";
         if (fn.body === null) return "it has no body";
         let reason: string | undefined;
-        /** Nodes of `String.prototype.charCodeAt.bind(x)` callees, checked as a whole. */
         const accepted = new Set<Node>();
         traverse(fn.body, {
             enter: (path) => {
@@ -142,10 +125,7 @@ export class PurityProver {
         return reason;
     }
 
-    /**
-     * The nodes of `String.prototype.charCodeAt.bind` (with `String` the global), a callee giving a function that
-     * returns its receiver's char codes: pure like `charCodeAt` itself (model 7). Empty for any other callee.
-     */
+    /** `String.prototype.charCodeAt.bind`'s nodes: pure like `charCodeAt` itself (model 7). Empty for other callees. */
     #boundCharCodeAt(callee: Node): Node[] {
         if (callee.type !== "MemberExpression" || callee.computed || callee.property.type !== "Identifier" || callee.property.name !== "bind") return [];
         const method = callee.object;
@@ -157,11 +137,7 @@ export class PurityProver {
         return global ? [callee, method, prototype, owner] : [];
     }
 
-    /**
-     * Names: own locals, builder locals bound for good, and a few globals. Property names and labels aren't references.
-     * A write to an outer name is refused with it: such a name is bound more than once (a global by name: the writable
-     * ones aren't among those allowed, the allowed values are read-only).
-     */
+    /** A write to an outer name is refused: such a name is bound more than once (writable globals aren't allowed). */
     #name(node: Node, name: string, parent: Node | null, key: string | null, fn: FunctionLike, builder: FunctionNode): string | undefined {
         if (parent?.type === "MemberExpression" && key === "property") return undefined;
         if (parent?.type === "LabeledStatement" || parent?.type === "BreakStatement" || parent?.type === "ContinueStatement") return undefined;
@@ -173,7 +149,6 @@ export class PurityProver {
         return variable === undefined ? globalImpurity(name, parent, key) : this.#bound(variable, builder);
     }
 
-    /** A builder local that holds one value for good: a literal, or a pure function. */
     #bound(variable: Variable, builder: FunctionNode): string | undefined {
         const outside = `it reads ${variable.name}, which may change`;
         const [def] = variable.defs;

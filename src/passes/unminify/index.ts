@@ -7,40 +7,18 @@ import { UnminifyContext } from "./context.js";
 import { rewriteExpression } from "./expressions.js";
 import { expandStatements, mergeElseIf, removeDeclarators, rewriteStatement, unlabelStatements } from "./statements.js";
 
-/** Rewrites of one node in a row (each one step: `!(1 === x)` -> `1 !== x` -> `x !== 1`). More means a loop. */
+/** Each rewrite is one step (`!(1 === x)` -> `1 !== x` -> `x !== 1`); more than this means a loop. */
 const MAX_STEPS = 16;
 
 /**
- * Readability rewrites webcrack's unminify makes that our passes don't already, in one walk. Every rewrite is exact:
- *
- * - block-statements: `if (a) b();` -> `if (a) { b(); }` (if/loop bodies), `() => (a, b)` -> `() => { a; return b; }`
- * - split-variable-declarations: `var a = 1, b = 2;` -> `var a = 1; var b = 2;`
- * - split-for-loop-vars: `for (var a = 1, i = 0; i < n; i++)` -> `var a = 1; for (var i = 0; ...)` (leading `var`
- *   declarators the test and update don't use)
- * - computed keys: `{ "a": 1 }` -> `{ a: 1 }`, `x["a"]` -> `x.a` (not `__proto__`, not a class `constructor`, not
- *   `static prototype`)
- * - shorthand: `{ a: a }` -> `{ a }` (not `__proto__`)
- * - for-to-while: `for (; a;)` -> `while (a)`
- * - invert-boolean-logic: `!(a === b)` -> `a !== b`, `!(a && b)` -> `!a || !b` (equality only: NaN)
- * - logical-to-if: `a && b();` -> `if (a) { b(); }` (statements only)
- * - merge-else-if: `else { if (b) {} }` -> `else if (b) {}`
- * - remove-double-not: `!!x` -> `x` where only its truthiness is used
- * - string-literal-in-template-literal: `` `a${"b"}` `` -> `` `ab` `` (not tagged)
- * - ternary-to-if: `a ? b() : c();` and `return a ? b : c;` -> `if`/`else`
- * - truncate-number-literal: `x & 4294967297` -> `x & 1` (what the operator makes of the number)
- * - typeof-undefined: `typeof x > "u"` -> `typeof x === "undefined"`
- * - unary-expressions: `void x;`, `!x;`, `typeof x;` -> `x;` (not `typeof` of a maybe-undeclared global; `void 0;`
- *   goes); `return void x;` -> `x; return;`
- * - yoda: `1 === x` -> `x === 1` (constant on the left, not on the right)
- *
- * Covered before this pass: sequences (normalize), `!0`/`!1` (normalize), `void 0`, `1 / 0`, string and number
- * folding (simplify); literals print canonically (the printer ignores their source spelling). Not done:
- * `JSON.parse("...")` -> literal (exact only if nothing changes the builtin, which nothing here can prove).
+ * Exact readability rewrites webcrack's unminify makes that earlier passes don't, in one walk. Every refusal case
+ * (`__proto__`, class `constructor`, NaN for inverted logic, maybe-undeclared `typeof`, tagged templates) lives with
+ * its rewrite.
  *
  * Changing statement values (`a && b();` -> `if (a) { b(); }`, dropping `void 0;`) relies on the semantic model's
  * "the script's completion value is unused": only an eval of the whole script would see it.
  *
- * Runs last: it only changes how the code reads, and the passes before it expect the minified shapes.
+ * Runs last: the passes before it expect the minified shapes.
  */
 export const unminify: Pass = {
     name: "unminify",

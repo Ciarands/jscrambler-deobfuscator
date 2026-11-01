@@ -4,27 +4,21 @@ import type { Scope, ScopeInfo, Variable } from "../core/scope.js";
 import type { Slot } from "./emulate/builders.js";
 import { sameSlot, slotOf, slotsOnly } from "./emulate/builders.js";
 
-/** Something a function may do outside its own objects, and where. */
 export interface Effect {
     readonly reason: string;
     readonly node: Node;
 }
 
-// What a value may be. Objects the function creates are their allocation sites instead of one bit: the scoring code
-// keys records by strings it read out of its own arrays, and only per-site fields keep those keys exact.
-/** Non-string primitives: numbers, booleans, null, undefined, bigints, symbols the function makes. */
+// Own objects are tracked by allocation site so fields keyed by strings read from own arrays stay exact.
+/** Non-string primitives. */
 const OTHER = 1;
-/** Strings not known exactly. */
 const STRING = 2;
-/** Intrinsics (builtin prototypes, their methods, constructors): writing to them is an effect. */
 const BUILTIN = 8;
-/** Anything from outside the function: globals, outer variables, its own arguments and `this`, caught exceptions. */
+/** Globals, outer variables, the function's own arguments and `this`, caught exceptions. */
 const OUTSIDE = 16;
 /** A symbol that may be a well-known one (`Symbol.iterator`): as a key it may name an intrinsic. */
 const SYMBOL = 32;
-/** Exact strings kept per value before they become `STRING`. */
 const STRING_LIMIT = 32;
-/** Fixpoint rounds before the analysis gives up. */
 const MAX_ROUNDS = 32;
 
 /** Field buckets: one per exact key, one for keys a number (or boolean, null, undefined) gives, one for unknown keys. */
@@ -33,14 +27,11 @@ const UNKNOWN = "\u0000unknown";
 
 class Kinds {
     bits = 0;
-    /** Exact strings, while `STRING` is unset. */
     strings: Set<string> | undefined;
     /** Own objects, by allocation site (a node, or a function's prototype object). */
     sites: Set<object> | undefined;
-    /** The `arguments` objects of these functions. */
     args: Set<Node> | undefined;
 
-    /** Add `other`'s values; whether anything was new. */
     add(other: Kinds): boolean {
         let grew = this.addBits(other.bits);
         if (other.strings !== undefined) for (const value of other.strings) grew = this.addString(value) || grew;
@@ -109,7 +100,6 @@ const OTHER_KINDS = kinds(OTHER);
 const PRIMITIVE_KINDS = kinds(OTHER | STRING);
 const OUTSIDE_KINDS = kinds(OUTSIDE);
 
-/** Whether a value has objects the function didn't create (from outside, or intrinsics). */
 const foreign = (value: Kinds): number => value.bits & (OUTSIDE | BUILTIN);
 
 /** Whether a key may be any string: one the function doesn't know exactly, or an object's or a symbol's. */
@@ -124,7 +114,6 @@ const isPrimitiveKey = (key: string): boolean => key === "true" || key === "fals
 
 const bucketOf = (key: string): string => (isPrimitiveKey(key) ? INDEX : key);
 
-/** The buckets a write with `key` may go to. */
 const writeBuckets = (key: Kinds): string[] => {
     const buckets = [...(key.strings ?? [])].map(bucketOf);
     if ((key.bits & OTHER) !== 0) buckets.push(INDEX);
@@ -132,8 +121,7 @@ const writeBuckets = (key: Kinds): string[] => {
     return buckets;
 };
 
-// Property names of the intrinsic prototypes, from the host. Accessors count as functions: reading one may give an
-// intrinsic (`__proto__`). Relies on model 7: builtins intact (the program's own run has the host's prototypes).
+// Accessors count as functions: reading one may give an intrinsic (`__proto__`). Relies on model 7: builtins intact.
 const INTRINSIC_FUNCTIONS = new Set<string>();
 const INTRINSIC_VALUES = new Set<string>(["length", "name", "message", "stack", "lastIndex", "source", "flags", "prototype", "callee"]);
 for (const constructor of [Object, Function, Array, String, Number, Boolean, Symbol, BigInt, RegExp, Error, Date]) {
@@ -151,7 +139,6 @@ const PURE_FUNCTIONS: ReadonlyMap<string, Kinds> = new Map([
     ...["isNaN", "isFinite", "parseInt", "parseFloat", "Number", "Boolean", "Symbol", "BigInt"].map((name) => [name, OTHER_KINDS] as const),
 ]);
 
-/** What a pure static method gives: a primitive, a fresh array of strings, or a prototype. */
 type StaticResult = "other" | "string" | "keys" | "prototype";
 
 const mathFunctions = Object.getOwnPropertyNames(Math).filter((name) => typeof (Math as unknown as Record<string, unknown>)[name] === "function");
@@ -230,14 +217,12 @@ const isAnonymousFunction = (node: Node, scopes: ScopeInfo): boolean => {
     return (scopes.variableOf(node.id)?.references.length ?? 1) === 0;
 };
 
-/** The property name a non-computed object-literal key gives. */
 const literalKey = (key: Node): string | undefined => {
     if (key.type === "Identifier") return key.name;
     if (key.type === "Literal" && (typeof key.value === "string" || typeof key.value === "number")) return String(key.value);
     return undefined;
 };
 
-/** Whether a scope sits inside a `with` statement's body. */
 const insideWith = (scope: Scope | null): boolean => {
     for (let s = scope; s !== null; s = s.upper) if (s.type === "with") return true;
     return false;
@@ -257,7 +242,6 @@ class Analysis {
     readonly #isGlobalRead: (call: Node) => boolean;
     readonly #fnScope: Scope | null;
     readonly #within = new Map<Scope, boolean>();
-    /** Collected once; each run joins what its code may put where. */
     readonly #facts: (() => void)[] = [];
     #changed = false;
 
@@ -271,11 +255,7 @@ class Analysis {
     readonly #links = new Map<object, Kinds>();
     readonly #prototypes = new Map<Node, object>();
     readonly #functions = new Set<object>();
-    /**
-     * Functions that may run: the function itself, ones a call may reach, and ones stored in a field (host code may call
-     * those: a `valueOf` an operator converts with). A function only held in variables and turned into its source text
-     * (the checks' probes) never runs, so its body's facts don't count.
-     */
+    /** Functions that may run. A function only held in variables and stringified (the checks' probes) never runs. */
     readonly #live = new Set<Node>();
     readonly #argKinds = new Map<Node, Kinds>();
     readonly #thisKinds = new Map<Node, Kinds>();
@@ -283,7 +263,6 @@ class Analysis {
     /** Every own object but the slot arrays: what `this` may be when host code calls an own function implicitly. */
     readonly #allSites = new Kinds();
 
-    /** The function `this` and `arguments` belong to at the code being compiled, and the one its returns leave. */
     #thisOwner: Node;
     #returnOwner: Node;
 
@@ -320,7 +299,6 @@ class Analysis {
         if (target.add(value)) this.#changed = true;
     }
 
-    /** Store `value` in a field: functions in it may now be called by host code. */
     #growField(site: object, bucket: string, value: Kinds): void {
         this.#markLive(value);
         this.#grow(this.#field(site, bucket), value);
@@ -400,8 +378,6 @@ class Analysis {
         return this.#location(buckets, bucket);
     }
 
-    // ---- values ----
-
     /** What reading `key` of `receiver` may give. Reads (host getters included) have no effects. */
     #read(receiver: Kinds, key: Kinds): Kinds {
         const out = new Kinds();
@@ -427,7 +403,6 @@ class Analysis {
         return out;
     }
 
-    /** The fields `key` may name on `site` and the own objects it inherits from. */
     #collectFields(site: object, key: Kinds, out: Kinds, seen: Set<object>): void {
         if (seen.has(site)) return;
         seen.add(site);
@@ -479,9 +454,6 @@ class Analysis {
         return out;
     }
 
-    // ---- writes ----
-
-    /** Put `value` under `key` of `receiver`: allowed on own objects only. */
     #write(receiver: Kinds, key: Kinds, value: Kinds, node: Node): void {
         if ((receiver.bits & OUTSIDE) !== 0) refuse("writes a property of an object from outside", node);
         if ((receiver.bits & BUILTIN) !== 0) refuse("writes a property of a builtin object", node);
@@ -503,7 +475,6 @@ class Analysis {
         for (const bucket of writeBuckets(key)) this.#growField(site, bucket, value);
     }
 
-    /** Compile a write of `value` to `target`; the result gives what the assignment evaluates to. */
     #compileWrite(target: Node, value: Eval): Eval {
         if (target.type === "Identifier") {
             const variable = this.#scopes.staticVariableOf(target);
@@ -536,9 +507,6 @@ class Analysis {
         };
     }
 
-    // ---- calls ----
-
-    /** Calls of own functions: `this` and arguments flow to them, their returns come back. */
     #callOwn(callee: Kinds, self: Kinds, args: Kinds, node: CallNode): Kinds {
         const out = new Kinds();
         this.#markLive(callee);
@@ -606,7 +574,6 @@ class Analysis {
         return () => union(parts.map((part) => part()));
     }
 
-    /** The elements of an own iterable (for-of, spread): its fields, or characters of a string. */
     #compileSpread(node: Node): Eval {
         const value = this.#compile(node);
         return () => {
@@ -710,8 +677,6 @@ class Analysis {
             }
         };
     }
-
-    // ---- expressions ----
 
     #compileKey(node: Node & { type: "MemberExpression" }): Eval {
         if (node.property.type === "PrivateIdentifier") return refuse("uses a private name", node);
@@ -967,15 +932,12 @@ class Analysis {
         }
     }
 
-    /** Evaluate `parts` for their effects; give `result`. */
     #sequence(parts: readonly Eval[], result: Kinds): Eval {
         return () => {
             for (const part of parts) part();
             return result;
         };
     }
-
-    // ---- statements ----
 
     #compileStatements(statements: readonly Node[]): () => void {
         const parts = statements.map((statement) => this.#compileStatement(statement));
@@ -992,7 +954,6 @@ class Analysis {
             const variable = this.#slotVariable(declarator.id);
             const slots = variable === undefined ? undefined : this.#slots.get(variable);
             if (slots !== undefined && init.type === "ArrayExpression" && this.#slotInits.get(variable as Variable) === init) {
-                // A slot array: tracked per index, from its initial elements on.
                 const elements = init.elements.map((element, index) => {
                     if (element?.type === "SpreadElement") return refuse("spreads into a slot array", element);
                     const value = element === null ? undefined : this.#compile(element);
@@ -1093,7 +1054,6 @@ class Analysis {
         }
     }
 
-    /** Statements and expressions in a list (missing ones skipped), for their effects. */
     #compileParts(parts: readonly (Node | null | undefined)[]): () => void {
         const compiled = parts.flatMap((part): (() => void)[] => {
             if (part === null || part === undefined) return [];
@@ -1108,22 +1068,12 @@ class Analysis {
 }
 
 /**
- * Whether calling `fn` changes nothing but objects it creates and the slot `allowed` (`undefined`: proven), or the
- * first effect found. `parents` covers the subtree its slot arrays are declared in.
+ * The first effect calling `fn` may have beyond objects it creates and the slot `allowed`; `undefined` when proven local.
  *
- * A flow-insensitive abstract interpretation to a fixpoint: every location (the function's own variables, its slot
- * arrays per index, the fields of each own object by allocation site and key, each own function's `this`, arguments
- * and returns) collects every kind of value any of its code may put there, whether or not that code runs. Values from
- * outside (globals, outer variables, the function's own `this` and arguments) and intrinsics are tracked as such; the
- * function may write only to its own variables, slot arrays and own objects, call only own functions, pure host
- * functions and builtin methods on own objects and primitives with nothing from outside, and construct only own
- * functions and plain host constructors.
- *
- * Assumptions: reads have no effects (host getters included), and operators only read (conversions of host objects
- * included); the host functions and methods it models behave as specified (relies on model 7: builtins intact).
- * Thrown exceptions and loops that don't end aren't effects here: whether the function completes is the caller's
- * question (model 5: the environment passes the checks). `isGlobalRead` names calls known to do nothing but read a
- * global property (the runtime's global-read getters): they count as reads of a value from outside.
+ * Flow-insensitive abstract interpretation to a fixpoint: every location collects every kind of value any of its code
+ * may put there, whether or not that code runs. Assumes reads and operator conversions have no effects and modeled
+ * host functions behave as specified (model 7: builtins intact). Throws and non-termination aren't effects here
+ * (model 5: the environment passes the checks). `isGlobalRead` calls count as reads of a value from outside.
  */
 export const localityOf = (fn: Node, allowed: Slot, scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>, isGlobalRead: (call: Node) => boolean): Effect | undefined =>
     new Analysis(fn, allowed, scopes, parents, isGlobalRead).run();

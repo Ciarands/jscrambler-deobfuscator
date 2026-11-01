@@ -20,13 +20,9 @@ interface Candidate {
 /**
  * Storage comparisons: `G.k.m[1][10] != G.k.m[3][10]` becomes the boolean it always is.
  *
- * jscrambler's opaque predicates compare cells of a matrix a prelude builder made (rows that point at each other, so
- * cells are compared by identity) and hide the result in `x || pred` conditions and loop tests. Both sides are static
- * storage paths; where the analysis finds nothing that may change either after the prelude (model 3: `G` changes only
- * through code that names its paths), each reads the snapshot's value. Reading data properties runs no code, and two
- * objects (identity) or two primitives compare without conversions, so the comparison has no effect and its value is
- * the one the guest computes: the literal replaces it, and simplify folds the conditions. An object against a
- * primitive (a conversion would call into the object) or a path through a getter stays.
+ * Where nothing may change either path after the prelude (model 3), each reads the snapshot's value. Data property
+ * reads run no code, and two objects (identity) or two primitives compare without conversions, so the guest's value
+ * replaces it. An object against a primitive, or a path through a getter, stays.
  */
 export const storageComparisons: Pass = {
     name: "storage-comparisons",
@@ -36,7 +32,6 @@ export const storageComparisons: Pass = {
         if (runtime === undefined) return { changed: 0 };
         const scopes = scope();
         const matcher = storageMatcher(program, runtime, scopes);
-        /** A static path below the storage object: its reference to `G` and the keys. */
         const storagePath = (node: Node): { site: Node; path: PropertyPath } | undefined => {
             const path = memberPath(node);
             return path !== undefined && matcher.isStorage(path.root) ? { site: path.root, path: path.keys } : undefined;

@@ -14,7 +14,6 @@ import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
 /** Constant bindings are only copied into their uses when the copy is small. */
 const MAX_PROPAGATED_STRING = 64;
 
-/** Expression types worth trying to fold (others either can't evaluate or are already literals). */
 const FOLDABLE = new Set([
     "Identifier",
     "BinaryExpression",
@@ -27,7 +26,6 @@ const FOLDABLE = new Set([
     "CallExpression",
 ]);
 
-/** Whether `node` already is the canonical expression for `value` (`3`, `-1`, `undefined`, `NaN`, `Infinity`). */
 const isCanonical = (node: Node, value: Value): boolean => {
     switch (node.type) {
         case "Literal":
@@ -41,7 +39,6 @@ const isCanonical = (node: Node, value: Value): boolean => {
     }
 };
 
-/** Statements of a taken branch, inlined where block scoping allows. */
 const branchStatements = (branch: Statement | null | undefined): Statement[] => {
     if (branch === null || branch === undefined) return [];
     if (branch.type !== "BlockStatement") return [branch];
@@ -49,7 +46,6 @@ const branchStatements = (branch: Statement | null | undefined): Statement[] => 
     return scoped ? [branch] : branch.body;
 };
 
-/** Replace a statement by zero or more statements doing what it did, wherever it sits, and tell `facts`. */
 const replaceStatement = (path: Path, statements: Statement[], facts: Facts): void => {
     const original = path.node;
     if (path.isInStatementList()) {
@@ -71,7 +67,6 @@ const replaceStatement = (path: Path, statements: Statement[], facts: Facts): vo
 const sequence = (expressions: Expression[], origin: Node): SequenceExpression => at<SequenceExpression>({ type: "SequenceExpression", expressions }, origin);
 const prefixAndLast = (s: SequenceExpression): [Expression[], Expression] => [s.expressions.slice(0, -1), s.expressions.at(-1) as Expression];
 
-/** Callee of a call or tag of a tagged template: positions where the callee's reference decides `this`. */
 const isCallee = (path: Path): boolean => (path.parent?.type === "CallExpression" && path.key === "callee") || (path.parent?.type === "TaggedTemplateExpression" && path.key === "tag");
 
 /**
@@ -85,13 +80,8 @@ const keepsSequence = (path: Path, last: Expression): boolean => {
 };
 
 /**
- * Simplify: constant folding, constant propagation, sequence hoisting and dead-code removal. Runs in a fixpoint group
- * with normalize and unflatten: resolved decoder strings and prelude results make opaque predicates constant, dead
- * branches fall away, and the machines whose states became constant can be unflattened in the next round.
- *
- * Every rewrite is exact. Dropped code keeps what it declares beyond itself (`var` and Annex B function names; `let`
- * placeholders for lexical names of a dead statement list), so no binding changes scope. Constant bindings and
- * `arguments` slots come from `constantEnv`.
+ * Simplify: constant folding and propagation, sequence hoisting, dead-code removal. Every rewrite is exact: dropped
+ * code keeps what it declares beyond itself (`var`, Annex B functions, `let` placeholders), so no binding changes scope.
  */
 export const simplify: Pass = {
     name: "simplify",
@@ -134,7 +124,6 @@ export const simplify: Pass = {
             return true;
         };
 
-        /** `(a, v) OP x` and friends -> `(a, v OP x)`, and flattening of sequences. */
         const hoist = (path: Path): boolean => {
             const node = path.node;
             switch (node.type) {
@@ -193,7 +182,6 @@ export const simplify: Pass = {
             }
         };
 
-        /** Branches decided by a constant. */
         const prune = (path: Path): boolean => {
             const node = path.node;
             switch (node.type) {
@@ -244,7 +232,6 @@ export const simplify: Pass = {
             }
         };
 
-        /** Statements after return/throw/break/continue, and pure expression statements. */
         const sweep = (body: Statement[]): void => {
             const terminal = body.findIndex(isJump);
             if (terminal !== -1 && terminal < body.length - 1 && !body.slice(terminal + 1).every(isPlaceholder)) {

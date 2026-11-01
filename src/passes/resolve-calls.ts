@@ -40,7 +40,6 @@ interface Resolution {
     readonly decided: WeakSet<Node>;
     /** Sites of settled decoders whose arguments weren't constant yet, as the last run found them. */
     waiting: Set<Node>;
-    /** Waiting sites already logged as such. */
     readonly logged: WeakSet<Node>;
     readonly proof: DecoderProof;
     /**
@@ -48,11 +47,7 @@ interface Resolution {
      * direct call of it that runs only after that call's root statement can't drive a stage. Found by the first run.
      */
     readonly settlingSites: Map<string, Node>;
-    /**
-     * How many runs walked the whole program. The first comes before wrappers, which puts new direct calls in place of
-     * the wrapper calls it inlines; the waiting sites a later walk finds are the program's own: no later pass makes
-     * decoder calls (they change arguments in place, or remove calls).
-     */
+    /** How many runs walked the whole program; after wrappers, no later pass makes new decoder calls. */
     walks: number;
 }
 
@@ -60,35 +55,26 @@ interface Resolution {
 const requestPart = (value: unknown): string =>
     typeof value === "string" ? JSON.stringify(value) : typeof value === "number" ? (Object.is(value, -0) ? "-0" : String(value)) : `${typeof value}:${String(value)}`;
 
-/** A request's identity: its path, arguments and lookup keys. */
 const requestId = (request: ResolveRequest): string => `${request.path.map(requestPart).join(".")}(${request.args.map(requestPart).join(",")})${(request.lookup ?? []).map(requestPart).join(".")}`;
 
 const RESOLUTION = factKey<Resolution>("resolve-calls");
 
-/** What a call argument passes, when constant: `(e, 32)` passes 32 (once `e` ran). */
 const argumentValue = (arg: Node, env: EvaluateEnv): Evaluation | undefined => {
     const last = arg.type === "SequenceExpression" ? arg.expressions.at(-1) : arg;
     return last === undefined || last.type === "SpreadElement" ? undefined : evaluate(last, env);
 };
 
 /**
- * Resolve calls to the runtime's wrapper functions (`G.w(...)`, whose targets are mostly the string decoder).
+ * Resolve calls to the runtime's wrapper functions (`G.w(...)`, mostly the string decoder).
  *
- * The decoder is stateful until the prelude is done: each stage call (driven by the opaque-predicate machine) shuffles
- * it, and once its stages are done it is a plain lookup (`decoderLookups` proves when, per decoder). So:
- *
- * - Calls the prelude made (recorded by `emulate`) keep running: `G.P1(50)` becomes `(G.P1(50), 1)`, which lets the
- *   opaque predicate fold while the decoder still gets its stages. Cleanup drops the call once the decoder is dead.
- *   A recorded call proven a pure lookup on its settled decoder becomes just its value.
- * - Later calls with constant arguments of a settled decoder's wrappers are pure lookups on a table that no longer
- *   changes: they are made in the sandbox, on the post-prelude state, all in one batch, and replaced when the result
- *   is a string (and, as a sanity check, repeatable: a second call gives the same). Calls of any other target stay,
- *   whatever the sandbox answers: a call can change state and still give the same result twice.
- * - A call returning an object with constant-key lookups on it (`G.t()[41][49][56]`) resolves as a whole when the
- *   lookup gives a primitive.
- * - Sites whose key and arguments equal a prelude call that couldn't be tied to its site are left alone: they may be
- *   that call, made before the decoder froze. Unless every such call was a pure lookup on a settled decoder: then the
- *   site gives the same wherever the call is, and resolves like a later call.
+ * The decoder is stateful until its stages are done (`decoderLookups` proves when). So:
+ * - Calls the prelude made keep running: `G.P1(50)` becomes `(G.P1(50), 1)`, so the decoder still gets its stages;
+ *   one proven a pure lookup on its settled decoder becomes just its value.
+ * - Later constant-argument calls of a settled decoder's wrappers are pure lookups: batched in the sandbox on the
+ *   post-prelude state, replaced when the result is a repeatable string. Other targets stay: a call can change state
+ *   and still give the same result twice.
+ * - Sites matching an unplaced prelude call are left alone (they may be that call, made before the decoder froze),
+ *   unless every such call was a pure lookup on a settled decoder.
  */
 export const resolveCalls: Pass = {
     name: "resolve-calls",
@@ -135,7 +121,6 @@ export const resolveCalls: Pass = {
         const waiting = new Set<Node>();
         const unmappedByKey = new Map<string, LoggedCall[]>();
         for (const logged of runtime.unmappedCalls) unmappedByKey.set(logged.key, [...(unmappedByKey.get(logged.key) ?? []), logged]);
-        // Arguments are often constant bindings (`var n = 1259; ... G.w(n)`).
         // Built on first use: later runs often find no call left to look at.
         let env: EvaluateEnv | undefined;
         const constants = (): EvaluateEnv => (env ??= constantEnv(scopes, log));
@@ -146,9 +131,8 @@ export const resolveCalls: Pass = {
             log.debug(`kept: ${reason}`, node);
         };
         /**
-         * Constant-key member reads on top of a call (`call[41][49]`), up to where the value is used otherwise. A
-         * method called on the result (`call.substring(0, 6)`) leaves its key out: the receiver is what gets resolved
-         * (a primitive string runs its method the same, literal or not; a function result isn't resolved at all).
+         * Constant-key reads on top of a call (`call[41][49]`). A method called on the result leaves its key out:
+         * the receiver is what gets resolved.
          */
         const lookupOn = (path: Path): { outer: Path; keys: string[] } => {
             let outer: Path = path;
@@ -177,7 +161,6 @@ export const resolveCalls: Pass = {
                 const callee = call.callee;
                 if (callee.type !== "MemberExpression") return;
                 let key = isStorage(callee.object) ? propertyKey(callee) : undefined;
-                /** The reference to `G` the call goes through. */
                 let site: Node = callee.object;
                 let direct = false;
                 if (key === undefined || !wrappers.has(key)) {
@@ -213,8 +196,7 @@ export const resolveCalls: Pass = {
                     return keep("its target isn't a settled string decoder: the call may have effects", call);
                 }
 
-                // An argument `(e, 32)` (a calculator's selector call before the index) passes 32 once `e`
-                // ran: `e` stays, in order, ahead of the answer.
+                // `(e, 32)` passes 32 once `e` ran: `e` stays, in order, ahead of the answer.
                 const args: Value[] = [];
                 const prefix: Expression[] = [];
                 for (const arg of call.arguments) {
@@ -334,7 +316,6 @@ export const resolveCalls: Pass = {
         shareStorageAnalysis(scopes, { matcher, effects });
 
         const replacements = new Map<Node, Node>();
-        /** Resolved later calls by wrapper target, for the summary. */
         const byTarget = new Map<string, number>();
         for (const { node, isLookup, key, prefix } of candidates) {
             if (!answers.has(node)) continue;

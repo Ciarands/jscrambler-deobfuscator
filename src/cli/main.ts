@@ -81,7 +81,7 @@ const isInside = (child: string, parent: string): boolean => {
     return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 };
 
-/** Every source file under `root`, skipping node_modules and `exclude` (the output directory). */
+/** Skips node_modules and `exclude` (the output directory). */
 const collectSources = async (root: string, exclude: string): Promise<string[]> => {
     const found: string[] = [];
     const walk = async (dir: string): Promise<void> => {
@@ -184,14 +184,13 @@ interface RunOptions {
     readonly dumpDir: string | undefined;
     readonly selection: PassSelection;
     readonly logger: Logger;
-    /** Batch progress lines (one per file and a summary). Silent with --quiet. */
+    /** Silent with --quiet. */
     readonly progress: (line: string) => void;
     readonly env: CliEnv;
 }
 
 const display = (env: CliEnv, target: string): string => path.relative(env.cwd, target) || ".";
 
-/** Deobfuscate `code` and write it to `outputPath`, or stdout when there is none. */
 const runOne = async (code: string, label: string, name: string, outputPath: string | undefined, run: RunOptions): Promise<FileResult> => {
     const output = outputPath === undefined ? "<stdout>" : display(run.env, outputPath);
     try {

@@ -1,13 +1,10 @@
 import type { Expression, Function as FunctionNode, Node, Program, Statement, TemplateElement } from "./ast.js";
 
 /*
- * ESTree printer. Output reads like hand-written code: numbers as written by people (`0.5`, `1000000`), strings in
- * the quote that needs fewer escapes with invisible characters escaped, short lists (arguments, arrays, objects,
- * parameters) on one line and long ones one item per line. It prints exactly the AST it is given: re-parsing the output
- * gives the same tree (parentheses are added only where the grammar needs them). Comments are not printed.
+ * ESTree printer for readable output. Re-parsing the output gives the same tree: parentheses are added only where the
+ * grammar needs them. Comments are not printed.
  */
 
-/** Lines longer than this break their lists, one item per line. */
 const WIDTH = 100;
 /** A list this short stays on its line however long the line is: breaking it wouldn't shorten the line much. */
 const SHORT_LIST = 40;
@@ -78,7 +75,6 @@ interface Mark {
     readonly abortAt: number;
 }
 
-/** What a list holds, which decides how its items print. */
 type ListKind = "arguments" | "array" | "object" | "objectPattern" | "arrayPattern" | "parameters" | "specifiers" | "attributes";
 
 const SIMPLE_STRING = /^[\x20-\x7e]*$/;
@@ -86,7 +82,6 @@ const INVISIBLE = /[\p{Cc}\p{Cf}\p{Co}\p{Cn}\p{Zl}\p{Zp}\p{Zs}]/u;
 
 const hex = (code: number, digits: number): string => code.toString(16).toUpperCase().padStart(digits, "0");
 
-/** Escape for one character code (or code point) that can't appear as itself; `undefined` when it can. */
 const escapeCode = (code: number, next: number): string | undefined => {
     switch (code) {
         case 0x5c:
@@ -115,11 +110,7 @@ const escapeCode = (code: number, next: number): string | undefined => {
     return code > 0xffff ? `\\u{${hex(code, 0)}}` : `\\u${hex(code, 4)}`;
 };
 
-/**
- * A string's characters with `extra` (the quote, or what a template must escape) escaped. `special` (global) matches
- * every character `extra` or `escapeCode` may escape: printable ASCII other than those can't need it, so runs of it
- * are copied as they are.
- */
+/** `special` (global) must match every character `escapeExtra` or `escapeCode` may escape; other runs are copied as-is. */
 const escapeText = (text: string, special: RegExp, escapeExtra: (code: number, index: number) => string | undefined): string => {
     let out = "";
     let from = 0;
@@ -145,12 +136,10 @@ const escapeText = (text: string, special: RegExp, escapeExtra: (code: number, i
     return out + text.slice(from);
 };
 
-/** What may need escaping in a string literal in double or single quotes, and in a template. */
 const DOUBLE_SPECIAL = /[^\x20-\x7e]|["\\]/g;
 const SINGLE_SPECIAL = /[^\x20-\x7e]|['\\]/g;
 const TEMPLATE_SPECIAL = /[^\x20-\x7e]|[`$\\]/g;
 
-/** A string literal, in the quotes that need fewer escapes (double when even). */
 export const quoteString = (value: string): string => {
     const doubles = value.split('"').length - 1;
     const quote = doubles > 0 && doubles > value.split("'").length - 1 ? "'" : '"';
@@ -159,7 +148,6 @@ export const quoteString = (value: string): string => {
     return quote + escapeText(value, quote === '"' ? DOUBLE_SPECIAL : SINGLE_SPECIAL, (code) => (code === quoteCode ? `\\${quote}` : undefined)) + quote;
 };
 
-/** Raw template text whose cooked value is `cooked`: escapes backslashes, backticks, `${`, and invisible characters. */
 export const templateRaw = (cooked: string): string =>
     escapeText(cooked, TEMPLATE_SPECIAL, (code, index) => {
         if (code === 0x60) return "\\`";
@@ -168,7 +156,7 @@ export const templateRaw = (cooked: string): string =>
         return undefined;
     });
 
-/** A number as people write it: `0.5`, `1000000`, `1e21`, `5e-324`. Non-negative finite numbers only. */
+/** Non-negative finite numbers only. */
 const formatNumber = (value: number): string => {
     if (value === Infinity) return "1e999";
     const text = String(value);
@@ -178,10 +166,7 @@ const formatNumber = (value: number): string => {
 
 const isNegativeNumber = (node: Node): boolean => node.type === "Literal" && typeof node.value === "number" && (node.value < 0 || Object.is(node.value, -0));
 
-/**
- * Whether `node`, printed where an expression of precedence `min` is needed in the context `flags`, needs parentheses.
- * One switch on the node type for both questions: the type read is the costly part (it's megamorphic).
- */
+/** One switch for both precedence and context: the megamorphic type read is the costly part. */
 const needsParentheses = (node: Node, min: number, flags: number): boolean => {
     switch (node.type) {
         case "Identifier":
@@ -230,7 +215,6 @@ const needsParentheses = (node: Node, min: number, flags: number): boolean => {
     }
 };
 
-/** First character of what `node` prints as, for operators that would merge with it (`- -a`, `+ ++a`). */
 const startsWithSign = (node: Node): string | undefined => {
     if (node.type === "UnaryExpression" && (node.operator === "-" || node.operator === "+")) return node.operator;
     if (node.type === "UpdateExpression" && node.prefix) return node.operator[0];
@@ -238,7 +222,6 @@ const startsWithSign = (node: Node): string | undefined => {
     return undefined;
 };
 
-/** Whether `statement` ends with an `if` that has no `else` (an `else` printed after it would attach to that `if`). */
 const endsWithOpenIf = (statement: Statement): boolean => {
     switch (statement.type) {
         case "IfStatement":
@@ -257,7 +240,7 @@ const endsWithOpenIf = (statement: Statement): boolean => {
 
 class Printer {
     readonly #layout: boolean;
-    /** Output so far is `#parts.join("") + #buffer`; the buffer is flushed into `#parts` in chunks (joining many tiny strings is slow). */
+    /** Output is `#parts.join("") + #buffer`; flushed in chunks because joining many tiny strings is slow. */
     #parts: string[] = [];
     #buffer = "";
     #length = 0;
@@ -284,7 +267,6 @@ class Printer {
         if (this.#length > this.#abortAt) throw ABORT;
     }
 
-    /** Text that may contain line breaks (template quasis). */
     writeMultiline(text: string): void {
         const last = text.lastIndexOf("\n");
         if (last === -1) return this.write(text);
@@ -310,10 +292,7 @@ class Printer {
         this.#abortAt = Infinity;
     }
 
-    /**
-     * Where an attempt starts. A long buffer is flushed first, so undoing the attempt only slices a short one: a flush
-     * during the attempt pushed the buffer as it was at the mark (plus more) as the chunk at `mark.parts`.
-     */
+    /** A long buffer is flushed first so undoing an attempt only slices a short one. */
     #mark(): Mark {
         if (this.#buffer.length > 256) {
             this.#parts.push(this.#buffer);
@@ -331,7 +310,6 @@ class Printer {
         };
     }
 
-    /** Undo the output since `mark` (an aborted attempt). */
     #reset(mark: Mark): void {
         const buffer = this.#parts.length > mark.parts ? (this.#parts[mark.parts] as string) : this.#buffer;
         this.#buffer = buffer.slice(0, mark.buffer);
@@ -344,12 +322,9 @@ class Printer {
         this.#abortAt = mark.abortAt;
     }
 
-    // ---- lists
-
     /**
-     * `open item, item close` on one line when it fits, else (arguments only) items hugging the brackets when the
-     * first line fits (`f(function () {` ... `})`), else one item per line. A lone argument always hugs: on a line of
-     * its own it would be as long.
+     * One line when it fits, else (arguments only) hugging the brackets when the first line fits, else one item per
+     * line. A lone argument always hugs: on its own line it would be as long.
      */
     list(open: string, close: string, items: readonly (Node | null)[], kind: ListKind): void {
         if (items.length === 0) {
@@ -374,10 +349,7 @@ class Printer {
         this.write(close);
     }
 
-    /**
-     * Print the list on one line (`flat`) or hugging its brackets; if what it writes passes the line width before its
-     * first line break (or breaks at all when `flat`), undo it and return false.
-     */
+    /** Undo and return false if the output passes the width before its first line break (or breaks at all when `flat`). */
     #attempt(flat: boolean, open: string, close: string, items: readonly (Node | null)[], kind: ListKind): boolean {
         const mark = this.#mark();
         this.#flat = flat;
@@ -429,8 +401,6 @@ class Printer {
         }
     }
 
-    // ---- statements
-
     program(program: Program): void {
         if (program.hashbang !== null) this.write(`#!${program.hashbang.value}`);
         const body = program.body as Statement[];
@@ -439,11 +409,7 @@ class Printer {
         this.write("\n");
     }
 
-    /**
-     * Statements, each on its own line (the program's first on the current one). Where directives may be (`prologue`:
-     * the start of a program or function body), a string statement that isn't a directive gets parentheses, so that it
-     * doesn't become one.
-     */
+    /** Where directives may appear (`prologue`), a non-directive string statement gets parentheses so it doesn't become one. */
     statements(body: readonly Statement[], prologue: boolean): void {
         let inPrologue = prologue;
         for (let i = 0; i < body.length; i++) {
@@ -469,7 +435,6 @@ class Printer {
         }
     }
 
-    /** `{ ... }`; `prologue` for function bodies (see `statements`). */
     block(body: readonly Statement[], prologue = false): void {
         if (body.length === 0) {
             this.write("{}");
@@ -483,7 +448,6 @@ class Printer {
         this.write("}");
     }
 
-    /** The statement of an `if`/loop/label: a block on the same line, or a lone statement after a space. */
     body(statement: Statement): void {
         this.write(" ");
         if (statement.type === "BlockStatement") this.block(statement.body);
@@ -712,7 +676,6 @@ class Printer {
         else this.expression(node, PRIMARY, 0);
     }
 
-    /** `a`, `a as b`, `"a b" as c` in an import or export list. */
     specifier(node: Node): void {
         let from: Node;
         let to: Node;
@@ -730,8 +693,6 @@ class Printer {
         this.write(" with ");
         this.list("{", "}", attributes, "attributes");
     }
-
-    // ---- functions and classes
 
     function(node: FunctionNode): void {
         if (node.async) this.write("async ");
@@ -823,7 +784,6 @@ class Printer {
         }
     }
 
-    /** `get key() {}`, `async *key() {}`, ... */
     method(kind: "get" | "set" | "method", key: Node, computed: boolean, fn: Node): void {
         if (fn.type !== "FunctionExpression") throw new Error(`print: method value ${fn.type}`);
         if (kind !== "method") this.write(`${kind} `);
@@ -844,8 +804,6 @@ class Printer {
         else if (key.type === "PrivateIdentifier") this.write(`#${key.name}`);
         else this.expression(key, PRIMARY, 0);
     }
-
-    // ---- patterns
 
     pattern(node: Node, flags: number): void {
         switch (node.type) {
@@ -886,9 +844,6 @@ class Printer {
         else this.expression(value, ASSIGN, 0);
     }
 
-    // ---- expressions
-
-    /** Print `node` where an expression of precedence `min` is needed, in the context `flags`. */
     expression(node: Node, min: number, flags: number): void {
         if (needsParentheses(node, min, flags)) {
             this.write("(");
@@ -1061,14 +1016,14 @@ class Printer {
     }
 }
 
-/** Print an ESTree program, laid out for reading. Comments are not printed. */
+/** Comments are not printed. */
 export const print = (program: Program): string => {
     const printer = new Printer(true);
     printer.program(program);
     return printer.output;
 };
 
-/** Print one statement as a program of its own (to run it in the sandbox): exact, without layout work. */
+/** Exact, without layout work (for running in the sandbox). */
 export const printStatement = (statement: Statement): string => {
     const printer = new Printer(false);
     printer.statements([statement], true);

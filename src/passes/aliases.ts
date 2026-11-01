@@ -12,7 +12,6 @@ type Rewrite = { readonly ok: true; readonly expression: Expression } | { readon
 
 const refused = (reason: string): Rewrite => ({ ok: false, reason });
 
-/** Whether `parent` deletes its operand. */
 const isDeleted = (parent: Node | null | undefined): boolean => parent?.type === "UnaryExpression" && parent.operator === "delete";
 
 /**
@@ -47,18 +46,11 @@ const rewriteCall = (call: CallExpression, alias: CallAlias, scopes: ScopeInfo, 
 };
 
 /**
- * Aliases: undo the builtin aliases the prelude's setup function created (recorded by `emulate`).
+ * Aliases: undo the builtin aliases the prelude's setup function created (recorded by `emulate`): global aliases
+ * (`S` -> `String`), builtin-owned property aliases naming exactly one builtin property, call aliases on the storage
+ * object (`G.a(s, "%")` -> `s.split("%")`), and host aliases (`D` -> `document`; model 10: the host globals exist).
  *
- * - Global aliases, `S` -> `String` (also values: `I` -> `Infinity`).
- * - Builtin-owned property aliases, `s.p("%")` -> `s.split("%")`, `S.q(...)` -> `String.fromCharCode(...)`;
- *   only for alias names that stand for exactly one builtin property.
- * - Call aliases on the storage object (newer setup variant): `G.a(s, "%")` -> `s.split("%")`,
- *   `G.b(72)` -> `String.fromCharCode(72)`, `G.c()` -> `Array.prototype.unshift`.
- * - Host aliases, global accessors forwarding to a host object: `D` -> `document`, `A(x)` -> `atob(x)`, reads,
- *   writes and calls (model 10: the host globals the script uses exist, so the bare name reads what the getter did).
- *
- * Other writes are never rewritten, and a global name is only introduced where no local of that name is in scope. The
- * setup call and function are left for cleanup, which can check that no alias use remains.
+ * Other writes are never rewritten, and a global name is only introduced where no local of that name is in scope.
  */
 export const aliases: Pass = {
     name: "aliases",
@@ -96,11 +88,7 @@ export const aliases: Pass = {
             counts.refused++;
             log.debug(`kept: ${reason}`, node);
         };
-        /**
-         * Host aliases the program may delete or redefine: a `delete` of the name or of a property by that name, or the
-         * name as a string (`Object.defineProperty(window, "D", ...)`), outside the setup calls that define them.
-         * Their uses stay as they are.
-         */
+        /** Host aliases the program may delete or redefine (by `delete` or by name as a string): their uses stay. */
         const tampered = new Set<string>();
         if (runtime.hostAliases.size > 0) {
             traverse(program, {

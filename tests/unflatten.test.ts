@@ -2,10 +2,7 @@ import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 import { emit, flatten, generate, mulberry32, runTrace } from "./fuzz/programs.js";
 
-/**
- * Differential test for the unflattener: random structured program -> jscrambler-style flattening -> our pipeline
- * -> run original and result on the same inputs; traces must match and no machine may be left behind.
- */
+// Differential: random program -> reference flattening -> pipeline; traces must match and no machine may remain.
 
 const SEEDS = Number(process.env["FUZZ_SEEDS"] ?? 1500);
 const SEED_BASE = Number(process.env["FUZZ_SEED"] ?? 1);

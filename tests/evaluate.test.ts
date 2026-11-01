@@ -15,7 +15,6 @@ const templateOf = (code: string): Node => {
     return found;
 };
 
-/** The expression of the one statement `code` holds. */
 const expression = (code: string): Node => (parse(code).body[0] as unknown as { expression: Node }).expression;
 
 describe("evaluate", () => {

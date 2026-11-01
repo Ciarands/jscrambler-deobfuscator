@@ -1,9 +1,6 @@
 import type { Node } from "../core/ast.js";
 
-/**
- * What one pass learned and later passes need (e.g. the emulated runtime model), for one deobfuscation run.
- * Keys are typed so readers get the type the writer stored.
- */
+/** What one pass learned and later passes need, for one run. */
 export interface FactKey<T> {
     readonly name: string;
     /** Never set; only carries the type. */
@@ -12,7 +9,7 @@ export interface FactKey<T> {
 
 export const factKey = <T>(name: string): FactKey<T> => ({ name });
 
-/** Told that the statements `originals` gave way to `replacements`, which together do exactly what they did. */
+/** `replacements` together do exactly what `originals` did. */
 export type ReplacementListener = (originals: readonly Node[], replacements: readonly Node[]) => void;
 
 export class Facts {
@@ -28,22 +25,18 @@ export class Facts {
         this.#values.set(key.name, value);
     }
 
-    /** Register cleanup for resources a fact holds (e.g. a sandbox). Runs when the deobfuscation run ends. */
     onDispose(cleanup: () => void): void {
         this.#cleanups.push(cleanup);
     }
 
     /**
-     * Facts keyed by statement follow their statements through rewrites. A pass that replaces statements by
-     * equivalent ones (splitting a sequence, keeping the branch an `if` takes, unflattening a machine) reports it here,
-     * and each fact's owner decides what carries over (see `onReplace`). Nothing is told about removed statements:
-     * their facts simply no longer apply to anything in the program.
+     * Report statements replaced by equivalent ones so facts keyed by statement can follow them; each owner decides
+     * what carries over. Removed statements aren't reported: their facts just stop applying.
      */
     replaced(originals: readonly Node[], replacements: readonly Node[]): void {
         for (const listener of this.#replacementListeners) listener(originals, replacements);
     }
 
-    /** Follow statement replacements (see `replaced`), for facts keyed by statement. */
     onReplace(listener: ReplacementListener): void {
         this.#replacementListeners.push(listener);
     }

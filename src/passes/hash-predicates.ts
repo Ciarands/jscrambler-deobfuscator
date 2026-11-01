@@ -14,20 +14,16 @@ import type { RuntimeModel } from "./emulate/model.js";
 import { RUNTIME } from "./emulate/model.js";
 import { PurityProver } from "./hash-purity.js";
 
-/** A loop is simulated for at most this many iterations. */
 const MAX_ITERATIONS = 10_000;
 
-/** Compound assignment operators and the binary operator each applies. */
 const COMPOUND: ReadonlyMap<string, string> = new Map(["+=", "-=", "*=", "/=", "%=", "**=", "<<=", ">>=", ">>>=", "&=", "|=", "^="].map((op) => [op, op.slice(0, -1)]));
 
 type Predicate = IfStatement | ForStatement | WhileStatement;
 
-/** Known values of locals at a point of a statement list. */
 type Env = Map<Variable, Value>;
 
 const samePath = (a: PropertyPath, b: PropertyPath): boolean => a.length === b.length && a.every((key, i) => key === b[i]);
 
-/** The statements an expression statement's assignments are applied by: a sequence's items, or the expression itself. */
 const itemsOf = (expression: Expression): readonly Expression[] => (expression.type === "SequenceExpression" ? expression.expressions : [expression]);
 
 /** Names something in `node` writes (assignment and update targets, initialised or lexical declarations, loop heads). */
@@ -59,7 +55,6 @@ const replaceAll = (env: Env, from: Env): void => {
     for (const [variable, known] of from) env.set(variable, known);
 };
 
-/** Whether code in `node` (outside nested functions) may leave a loop iteration early: `break` or `continue`. */
 const jumpsOut = (node: Node): boolean => {
     if (node.type === "BreakStatement" || node.type === "ContinueStatement") return true;
     if (node.type === "FunctionExpression" || node.type === "FunctionDeclaration" || node.type === "ArrowFunctionExpression") return false;
@@ -89,28 +84,15 @@ const onceUnrolled = (loop: ForStatement | WhileStatement): Statement[] | string
 };
 
 /**
- * Hash opaque predicates: jscrambler's `if`s and loops whose test compares a pure hash of a local's digits with a
- * constant, around straight-line assignments of those locals:
+ * Hash opaque predicates: `if`s and loops whose test compares a pure hash of a local's digits with a constant:
  *
- *     a = 576049076; O = 1928372057; S = 2;
  *     for (var d = 1; G.U.h(d.toString(), d.toString().length, 77300) !== a; d++) { S += 2; }
- *     if (G.U.h(S.toString(), S.toString().length, 42066) !== O) { decoy(); }
  *
- * A test is decided by evaluating it: the hash is a method a prelude builder put on the storage object (reached
- * directly or through a wrapper, read where nothing changes it after the prelude, still the function the builder
- * made), proven pure (`PurityProver`), and run in the guest with the arguments' values, which must repeat. Some
- * builds add clauses comparing the runtime's cyclic-array rows by identity (unflatten's runtime state keys).
- *
- * Locals' values come from a forward pass over the statement list holding the predicate: assignments and declarations
- * of constants set them, any other write (by name, for nodes the scope analysis doesn't know) forgets them. Only
- * locals no closure captures are followed (of their own function, declared by `var`/`let`/`const`), so a call in
- * between can't change them; and none in a program with `with`.
- *
- * Then an `if`'s test becomes its value (simplify drops the dead branch); a loop whose test is false at once gets the
- * test `false` (simplify keeps its init); a loop that runs N times, whose body and update only set followed locals to
- * values that evaluate, is replaced by the final values of what it writes; a loop that runs once with any other body
- * becomes that iteration's code. Anything else stays, with its reason logged. Relies on model 7: builtins intact (the
- * guest's hash runs on the standard builtins, `n.toString()` is the standard conversion).
+ * The hash is a prelude-built storage method, read where nothing changes it after the prelude, proven pure
+ * (`PurityProver`) and run in the guest; its answer must repeat. Locals' values come from a forward pass over the
+ * statement list; only locals no closure captures are followed, so a call in between can't change them, and none
+ * in a program with `with`. Some builds add clauses comparing the runtime's cyclic-array rows by identity. Relies on
+ * model 7 (builtins intact).
  */
 export const hashPredicates: Pass = {
     name: "hash-predicates",
@@ -159,10 +141,8 @@ export const hashPredicates: Pass = {
 };
 
 /**
- * Whether some method a prelude builder made may be a pure hash: a plain function of the builder of a
- * `G.k = (function () {...})()` statement the guest ran, among the methods the guest saw it build, proven pure. Every
- * hash `HashFunctions.targetOf` finds is one; without any, no test can be decided and the program isn't searched.
- * The proofs use a prover of their own, so the ones the search makes don't depend on these.
+ * Whether some prelude-built method may be a pure hash; without one no test can be decided. Uses its own prover,
+ * so the search's proofs don't depend on these.
  */
 const anyPureMethod = (runtime: RuntimeModel, scopes: ScopeInfo): boolean => {
     const prover = new PurityProver(scopes);
@@ -197,7 +177,6 @@ class HashFunctions {
         this.#prover = new PurityProver(scopes);
     }
 
-    /** Whether `node` calls a pure hash function somewhere (not inside nested functions). */
     mentionedIn(node: Node): boolean {
         if (node.type === "CallExpression" && typeof this.targetOf(node.callee) !== "string") return true;
         if (node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression") return false;
@@ -208,7 +187,6 @@ class HashFunctions {
         return found;
     }
 
-    /** The hash a callee reaches (directly or through a wrapper), or why it isn't one. */
     targetOf(callee: Node): PropertyPath | string {
         const path = memberPath(callee);
         if (path === undefined || !this.#analysis.matcher.isStorage(path.root)) return "not a call on the storage object";
@@ -242,10 +220,7 @@ class HashFunctions {
         return impure === undefined ? target : `it isn't pure: ${impure}`;
     }
 
-    /**
-     * The value of a call of a pure hash, with its arguments evaluated by `evaluateIn`; `reason` gets why not. The
-     * call's reads (wrapper, hash) must see the snapshot's values, and the guest's answer must repeat.
-     */
+    /** The call's reads (wrapper, hash) must see the snapshot's values, and the guest's answer must repeat. */
     valueOf(call: Node & { type: "CallExpression" }, evaluateIn: (node: Node) => Evaluation, reason: (why: string) => void): Evaluation {
         const target = this.targetOf(call.callee);
         const path = memberPath(call.callee);
@@ -276,7 +251,6 @@ class HashFunctions {
     }
 }
 
-/** The forward pass over statement lists holding predicates, and the folds. */
 class Folder {
     readonly counts = { ifs: 0, neverRun: 0, unrolled: 0 };
     readonly refusals = new Map<string, number>();
@@ -287,7 +261,6 @@ class Folder {
     readonly #log: PassContext["log"];
     readonly #facts: PassContext["facts"];
     readonly #hasWith: boolean;
-    /** Per variable, whether its values are followed (see `#followed`). */
     readonly #followedCache = new Map<Variable, boolean>();
 
     constructor(runtime: RuntimeModel, analysis: StorageAnalysis, hashes: HashFunctions, scopes: ScopeInfo, log: PassContext["log"], facts: PassContext["facts"], hasWith: boolean) {
@@ -300,7 +273,6 @@ class Folder {
         this.#hasWith = hasWith;
     }
 
-    /** Walk `list` up to its last predicate, following locals' values and deciding each predicate. */
     scan(list: Statement[], predicates: ReadonlySet<Statement>): void {
         const env: Env = new Map();
         let left = predicates.size;
@@ -402,7 +374,6 @@ class Folder {
         return value((left === right) === (operator === "==" || operator === "==="));
     }
 
-    /** Apply a statement to `env`: assignments of values that evaluate set locals, any other write forgets them. */
     #transfer(statement: Statement, env: Env): void {
         if (statement.type === "ExpressionStatement") {
             for (const item of itemsOf(statement.expression)) this.#assign(item, env);
@@ -461,7 +432,6 @@ class Folder {
         return {};
     }
 
-    /** Decide a predicate of `list` with the values in `env`; how the walk goes on (see `Next`). */
     #decide(predicate: Predicate, env: Env, list: Statement[]): Next {
         let why = "its test reads something whose value isn't known";
         const reason = (text: string): void => {
@@ -537,10 +507,8 @@ class Folder {
     }
 
     /**
-     * What a loop that ran (to `local`) leaves: its `var` init declaring the final values, then the final value of each
-     * other local it writes. A lexical init lives only in the loop. A reason instead when a final value isn't known.
-     * The loop's own nodes are reused (its declarators get their final values, its first write of each other local
-     * becomes that local's assignment), so the scope analysis knows every reference in the result: no binding changes.
+     * The loop's own nodes are reused (declarators get final values, the first write of each other local becomes
+     * its assignment), so the scope analysis knows every reference in the result: no binding changes.
      */
     #finals(loop: ForStatement | WhileStatement, local: Env): Statement[] | string {
         const finalOf = (node: Node): Expression | undefined => {
@@ -551,7 +519,6 @@ class Folder {
         const init = loop.type === "ForStatement" ? loop.init : null;
         const declaration = init?.type === "VariableDeclaration" ? init : undefined;
         for (const declarator of declaration?.declarations ?? []) if (declarator.id.type === "Identifier") declared.add(declarator.id.name);
-        // A `var` init keeps its declarators, each with its final value.
         const declaredFinals = declaration?.kind === "var" ? declaration.declarations.map((declarator) => finalOf(declarator.id)) : [];
         if (declaredFinals.some((final) => final === undefined)) return NO_FINAL;
         const written = new Map<string, Node>();

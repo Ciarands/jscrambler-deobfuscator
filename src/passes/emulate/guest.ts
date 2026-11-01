@@ -3,32 +3,26 @@ import type { Held, RunResult } from "../../core/sandbox.js";
 import { Sandbox } from "../../core/sandbox.js";
 
 /**
- * The obfuscator runtime as it lives in the QuickJS sandbox, and the one interface the passes use to ask it things.
+ * The runtime in the QuickJS sandbox. Guest side: a helper object held by the host only (no guest name reaches it);
+ * host side: `Guest`, one method per helper, each a `Sandbox.invoke` with plain data. The only code the sandbox
+ * compiles is the program's own statements (`run`).
  *
- * Guest side: an object of helper functions, installed once and held by the host only (no guest name reaches it).
- * Host side: `Guest`, one typed method per helper. Every question is a `Sandbox.invoke` with plain data (property
- * paths, keys, argument values); no source text is assembled for any of it. The only code the sandbox compiles is
- * the program's own statements (`run`).
- *
- * Paths are property paths: from the global object for builtins (`["String", "prototype"]`, `[]` is the global object
- * itself), from the storage object for the runtime (`["k", "m"]`). Keys are property keys as JS sees them
- * (strings: `G[593908]` has key `"593908"`).
+ * Paths are from the global object for builtins (`[]` is the global object), from the storage object for the runtime.
+ * Keys are property keys as JS sees them (`G[593908]` has key `"593908"`).
  */
 
 export type PropertyPath = readonly string[];
 
 /**
- * How a call alias passes arguments on to its builtin (probed in the runtime):
- * `"static"`: `G.alias(a)` is `Owner.original(a)`; `"method"`: `G.alias(x, a)` is `x.original(a)` (dispatch on x);
- * `"call"`: `G.alias(x, a)` is `Owner.original.call(x, a)`.
+ * `"static"`: `G.alias(a)` is `Owner.original(a)`; `"method"`: `G.alias(x, a)` is `x.original(a)`; `"call"`:
+ * `G.alias(x, a)` is `Owner.original.call(x, a)`.
  */
 export type CallStyle = "static" | "method" | "call";
 
 /**
- * A wrapper call the prelude made: key, arguments and result. Objects and functions are reported by type only. With the
- * wrapper's target given to `record`, also the guest identities (`idOf`) around the call: of the target's owner before it,
- * and of the target before and after it (`null`: a primitive, or reached through an accessor). A change is a write
- * the call made to the target, such as the string decoder replacing its stage function when it freezes.
+ * Objects and functions are reported by type only. With a `record` target, also guest identities (`idOf`) of the
+ * target's owner before the call and of the target before and after (`null`: primitive or behind an accessor); a
+ * change is a write the call made to the target (e.g. a decoder freezing).
  */
 export interface LoggedCall {
     readonly key: string;
@@ -37,17 +31,17 @@ export interface LoggedCall {
     readonly owner: number | null;
     readonly before: number | null;
     readonly after: number | null;
-    /** For a number result: whether `Array.prototype` or `Object.prototype` had an index property right after the call. */
+    /** For a number result: whether `Array.prototype`/`Object.prototype` had an index property right after the call. */
     readonly indexed?: boolean;
 }
 
-/** Guest identities of a storage object part and of the functions it holds in own data properties, by name. */
+/** Methods: functions in own data properties, by name. */
 export interface BuiltIdentities {
     readonly holder: number;
     readonly methods: ReadonlyMap<string, number>;
 }
 
-/** One call for `resolve`: `storage.path(...args)`, then optionally `[lookup[0]][lookup[1]]...` on the result. */
+/** `storage.path(...args)`, then optionally `[lookup[0]][lookup[1]]...` on the result. */
 export interface ResolveRequest {
     readonly path: PropertyPath;
     readonly args: readonly Value[];
@@ -57,21 +51,20 @@ export interface ResolveRequest {
 export type ResolveResult =
     | { readonly ok: true; readonly value: Value; readonly repeatable: boolean }
     | { readonly ok: true; readonly nonPrimitive: "object" | "function" }
-    /** `stale`: not called, because an earlier call in the batch changed the runtime's state. */
+    /** `stale`: an earlier call in the batch changed the runtime's state. */
     | { readonly ok: false; readonly error: string; readonly stale?: true };
 
 /**
- * How the owners (builtins, the global object) and the storage object's accessors changed since the guest's baseline:
- * entries are `[owner index, name, value]`, values as identities (`#3`) or typed primitives. Only what changed is
- * copied out; `namesBefore` lists, for owners that gained a property, the names they had.
+ * Since the baseline; entries are `[owner index, name, value]`, values as identities (`#3`) or typed primitives. Only
+ * changes are copied out; `namesBefore` lists prior names of owners that gained a property.
  */
 export interface OwnersChange {
     readonly same: boolean;
     readonly accessorsBefore: number;
     readonly accessorsAfter: number;
-    /** Entries the baseline had that are gone or hold something else now. */
+    /** Gone or changed. */
     readonly changed: readonly (readonly [number, string, string])[];
-    /** Entries that are new or hold something else now. */
+    /** New or changed. */
     readonly added: readonly (readonly [number, string, string])[];
     readonly namesBefore: Readonly<Record<number, readonly string[]>>;
 }
@@ -496,13 +489,10 @@ const GUEST_RUNTIME = String.raw`(function () {
 })()`;
 
 /**
- * The browser globals a prelude touches while the page loads, modelled as far as a synchronous run can observe them:
- * `window` and `self` are the global object; timers take their callbacks and never run them (no callback fires
- * before the script that scheduled it has finished); `console` is a console nobody watches (model 5: the script
- * isn't debugged; model 10: the host globals it uses exist): its methods do nothing the script can see, read none of
- * their arguments, and look native (bound functions: no `prototype`, `[native code]` text, their own names), as the
- * real ones do to the native-code checks scripts make. Everything else a browser has stays absent: code that needs
- * it fails in the guest, visibly, instead of seeing a made-up value.
+ * Browser globals as far as a synchronous run can observe them: `window`/`self` are the global object; timers never run
+ * their callbacks (none fires before the scheduling script finishes); `console` is unwatched (model 5: not debugged;
+ * model 10: host globals it uses exist): its methods have no visible effect, read no arguments, and look native, as
+ * native-code checks expect. Everything else stays absent, so code needing it fails visibly instead of seeing a made-up value.
  */
 const HOST_MODEL = String.raw`(function () {
     globalThis.window = globalThis;
@@ -528,7 +518,7 @@ const HOST_MODEL = String.raw`(function () {
 
 export const pathName = (path: PropertyPath): string => (path.length === 0 ? "globalThis" : path.join("."));
 
-/** Requests per `resolve` round trip: a timeout costs at most one chunk. */
+/** A timeout costs at most one chunk. */
 const RESOLVE_CHUNK = 2000;
 const RESOLVE_CHUNK_TIMEOUT_MS = 30_000;
 
@@ -536,14 +526,11 @@ const array = <T>(result: RunResult): T[] | undefined => (result.ok && Array.isA
 
 export class Guest {
     readonly sandbox: Sandbox;
-    /** The helper object: held by the host only, so no program name can collide with it or reach it. */
+    /** Held by the host only, so no program name can collide with or reach it. */
     readonly #api: Held;
-    /**
-     * Builtins whose own properties are snapshotted (aliases the setup function adds, effects outside the runtime):
-     * every builtin object a name reached before the program ran (`owners` in the guest). Indexes are owner ids.
-     */
+    /** Every builtin object a name reached before the program ran; indexes are owner ids. */
     readonly owners: readonly PropertyPath[];
-    /** Why the guest's state is no longer known (a batch of calls stopped partway), if it isn't. */
+    /** Set when a batch of calls stopped partway. */
     #tainted: string | undefined;
 
     private constructor(sandbox: Sandbox, api: Held, owners: readonly PropertyPath[]) {
@@ -564,7 +551,6 @@ export class Guest {
         return new Guest(sandbox, installed.held, owners);
     }
 
-    /** Why the guest can't be asked anything more: the sandbox aborted, or its state is no longer known. */
     get broken(): string | undefined {
         return this.sandbox.broken ?? this.#tainted;
     }
@@ -573,17 +559,16 @@ export class Guest {
         return this.sandbox.invoke([helper], payload, timeoutMs, this.#api);
     }
 
-    /** Run one of the program's own statements in the guest's global scope, for its effects (nothing is copied out). */
+    /** In the guest's global scope, for its effects (nothing is copied out). */
     run(source: string, timeoutMs: number): RunResult {
         return this.sandbox.execute(source, timeoutMs);
     }
 
-    /** Names the guest's global object has before any program code runs. */
     globals(): string[] {
         return array<string>(this.#invoke("globals", null)) ?? [];
     }
 
-    /** Point the runtime helpers at the storage object (a global, after the root functions are declared). */
+    /** Call after the root functions are declared. */
     bind(storage: string): boolean {
         const bound = this.#invoke("bind", storage);
         return bound.ok && bound.value === true;
@@ -593,38 +578,29 @@ export class Guest {
         return array<string[]>(this.#invoke("snapshot", this.owners)) ?? [];
     }
 
-    /** Remember the owners as they are now: the baseline `ownersSince` compares with. */
+    /** The baseline `ownersSince` compares with. */
     markOwners(): boolean {
         const result = this.#invoke("markOwners", this.owners);
         return result.ok && result.value === true;
     }
 
-    /** How the owners changed since the baseline, which becomes what they are now. */
+    /** The baseline then becomes the current state. */
     ownersSince(): OwnersChange | undefined {
         const result = this.#invoke("ownersSince", this.owners);
         return result.ok ? (result.value as OwnersChange) : undefined;
     }
 
-    /**
-     * Storage getters handing out a function whose zero-argument call reads one global property the global object
-     * lacks (observed in the guest: the only lookup that reached its prototype chain) and returns it.
-     */
+    /** Observed in the guest: the only lookup that reached the global object's prototype chain. */
     globalReads(): { key: string; name: string }[] {
         return array<{ key: string; name: string }>(this.#invoke("globalReads", null)) ?? [];
     }
 
-    /**
-     * Which of the global accessors `names` forward to one global property the guest lacks: the getter hands out that
-     * property's value whether it is absent or present, the setter writes it (observed in the guest).
-     */
+    /** Accessors whose getter hands out that property absent or present, and whose setter writes it. */
     hostAliases(names: readonly string[]): { alias: string; name: string }[] {
         return array<{ alias: string; name: string }>(this.#invoke("hostAliases", names)) ?? [];
     }
 
-    /**
-     * Replace `storage[key]` with a recorder that logs every call (`takeCalls`), with the identities of `target` (the
-     * wrapper's target, a storage path) and its owner around each call.
-     */
+    /** Replace `storage[key]` with a recorder (`takeCalls`), tracking identities of `target` and its owner per call. */
     record(key: string, target?: PropertyPath): boolean {
         const result = this.#invoke("record", { key, target: target ?? null });
         return result.ok && result.value === true;
@@ -634,7 +610,7 @@ export class Guest {
         return array<LoggedCall>(this.#invoke("takeCalls", null)) ?? [];
     }
 
-    /** Identities of the object at a storage path and of the functions in its own data properties (`undefined`: not an object reached through data properties). */
+    /** `undefined`: not an object reached through data properties. */
     built(path: PropertyPath): BuiltIdentities | undefined {
         const result = this.#invoke("built", path);
         if (!result.ok || result.value === null || typeof result.value !== "object") return undefined;
@@ -642,16 +618,12 @@ export class Guest {
         return { holder, methods: new Map(Object.entries(methods)) };
     }
 
-    /** Which of `candidates` on `owner` holds the same value as `owner[alias]`. */
     aliasOf(owner: PropertyPath, alias: string, candidates: readonly string[]): string | undefined {
         const result = this.#invoke("aliasOf", { owner, alias, candidates });
         return result.ok && typeof result.value === "string" ? result.value : undefined;
     }
 
-    /**
-     * Storage getters handing out a builtin: key, owner, the builtin's name there, and how a call passes its arguments
-     * on (probed, see `CallStyle`; `undefined` when not exactly one style holds).
-     */
+    /** `style` is `undefined` when not exactly one `CallStyle` holds. */
     callAliases(): { key: string; owner: PropertyPath; original: string; style: CallStyle | undefined }[] {
         type Found = { key: string; owner: number; original: string; style: CallStyle | null };
         const found = array<Found>(this.#invoke("callAliases", this.owners)) ?? [];
@@ -661,12 +633,11 @@ export class Guest {
         });
     }
 
-    /** Storage keys holding the global object. */
     globalKeys(): string[] {
         return array<string>(this.#invoke("globalKeys", null)) ?? [];
     }
 
-    /** Make each call (twice, to see whether its result repeats), in chunks. */
+    /** Each call is made twice, to see whether its result repeats. */
     resolve(requests: readonly ResolveRequest[]): ResolveResult[] {
         const results: ResolveResult[] = [];
         for (let start = 0; start < requests.length; start += RESOLVE_CHUNK) {
@@ -681,8 +652,7 @@ export class Guest {
                 results.push(...values);
                 continue;
             }
-            // The batch stopped somewhere inside: the calls it made may have moved the runtime's state, and nothing
-            // says which. Nothing asks this guest anything more.
+            // The calls made may have moved the runtime's state, and nothing says which.
             const failure = answered.ok ? "malformed answer" : answered.error;
             this.#tainted = `a batch of calls failed partway (${failure}), leaving the guest's state unknown`;
             results.push(...chunk.map((): ResolveResult => ({ ok: false, error: failure })));
@@ -690,31 +660,30 @@ export class Guest {
         return results;
     }
 
-    /** `left op right` (an equality) of the values at two storage paths, as the snapshot holds them. */
     compare(requests: readonly { left: PropertyPath; right: PropertyPath; op: string }[]): ({ ok: true; value: boolean } | { ok: false; reason: string })[] {
         const answered = this.#invoke("compare", requests);
         return array<{ ok: true; value: boolean } | { ok: false; reason: string }>(answered) ?? requests.map(() => ({ ok: false as const, reason: answered.ok ? "malformed answer" : answered.error }));
     }
 
-    /** A state key for the value at `path` on the storage object: objects by identity, primitives by value. */
+    /** Objects by identity, primitives by value. */
     stateKey(path: PropertyPath): string | undefined {
         const result = this.#invoke("stateKey", path);
         return result.ok && typeof result.value === "string" ? result.value : undefined;
     }
 
-    /** `typeof storage.path`, and whether every step to it is a data property (reading it runs no code). */
+    /** `data`: every step is a data property (reading runs no code). */
     inspect(path: PropertyPath): { type: string; data: boolean } | undefined {
         const result = this.#invoke("inspect", path);
         return result.ok ? (result.value as { type: string; data: boolean }) : undefined;
     }
 
-    /** Keys of the storage object's own properties a call could reach: function values and getters. */
+    /** Function values and getters. */
     ownCallables(): string[] | undefined {
         const result = this.#invoke("ownCallables", null);
         return result.ok && Array.isArray(result.value) ? (result.value as string[]) : undefined;
     }
 
-    /** Make a call and report whether it changed anything outside its own state (builtins, globals, storage keys). */
+    /** Makes the call; false if it changed anything outside its own state (builtins, globals, storage keys). */
     effectFree(call: ResolveRequest): boolean {
         const result = this.#invoke("effectFree", { owners: this.owners, call });
         return result.ok && result.value === true;

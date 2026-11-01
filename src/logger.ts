@@ -5,7 +5,7 @@ export interface Logger {
     warn(message: string): void;
     info(message: string): void;
     debug(message: string): void;
-    /** Whether messages at `level` are written; lets callers skip building them. Assumed true when missing. */
+    /** Lets callers skip building messages. Assumed true when missing. */
     enabled?(level: Exclude<LogLevel, "silent">): boolean;
 }
 
@@ -17,7 +17,7 @@ const LEVELS: Record<LogLevel, number> = {
     debug: 4,
 };
 
-/** Logger that drops everything. The library default: it never writes to the console on its own. */
+/** The library default: it never writes to the console on its own. */
 export const silentLogger: Logger = {
     error: () => {},
     warn: () => {},
@@ -26,7 +26,6 @@ export const silentLogger: Logger = {
     enabled: () => false,
 };
 
-/** Logger that writes every message at or above `level` to `write` (one line per call). */
 export const createLogger = (level: LogLevel, write: (line: string) => void): Logger => {
     const threshold = LEVELS[level];
     const enabled = (messageLevel: Exclude<LogLevel, "silent">): boolean => threshold >= LEVELS[messageLevel];

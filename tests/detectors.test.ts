@@ -2,10 +2,7 @@ import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 
-/**
- * What a script leaves in `result` in a healthy page that isn't being debugged: no `require` or `process`, a native
- * `Date.now`, a `navigator`. `setTimeout` callbacks (code after the prelude) run once it has finished.
- */
+/** Runs in a healthy, undebugged page: no `require`/`process`, native `Date.now`, a `navigator`. */
 const observed = (source: string): string => {
     const timers: (() => void)[] = [];
     const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback), navigator: { userAgent: "test" } };
@@ -16,14 +13,13 @@ const observed = (source: string): string => {
 
 const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "detectors", "simplify", "cleanup"] })).code;
 
-/** The program and its deobfuscation leave the same result; returns the deobfuscation. */
 const sameBehaviour = async (program: string): Promise<string> => {
     const output = await run(program);
     expect(observed(output)).toBe(observed(program));
     return output;
 };
 
-// jscrambler's j-016 detectors, each a builder whose method answers from a report its slow path sets on detection.
+// j-016 detectors: each a builder whose method answers from a report its slow path sets on detection.
 const DETECTORS = `
 function G() {}
 var log = [];
@@ -104,7 +100,6 @@ G.L = function () {
 setTimeout(function () { result = [G.L.d() ? "set" : "unset"]; });
 `;
 
-/** Like `observed`, on a page that has `FEATURE`. */
 const withFeature = (code: string): string => {
     const timers: (() => void)[] = [];
     const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback), FEATURE: true };
@@ -115,7 +110,6 @@ const withFeature = (code: string): string => {
 
 describe("detectors", () => {
     it("answers every detector call, the prelude's included, and drops the detectors", async () => {
-        // G.T's builder reads navigator, which the guest lacks: its answer comes from its code alone.
         const program = `${DETECTORS}if (G.w()) { log.push("start"); }
 setTimeout(function () {
   if (!G.N.d()) { log.push("n"); }
@@ -167,7 +161,6 @@ G.V = function () {
     });
 
     it("leaves lazy initializers and checks that set their report on the healthy path", async () => {
-        // A builder reading navigator, which the guest lacks: only its code speaks for it.
         const unfinished = "\n  S[1] = navigator.userAgent;";
         const shapes = [
             lazy('S[4] = "ready";', unfinished), // set unconditionally: an initialization
@@ -183,7 +176,6 @@ G.V = function () {
     });
 
     it("leaves a lazy feature probe: nothing in it checks for a debugger", async () => {
-        // The guest lacks FEATURE, so it would answer undefined; a page with it gets 1.
         const program = lazy("if (globalThis.FEATURE) { S[4] = 1; }");
         const output = await sameBehaviour(program);
         expect(output).toContain("G.L.d()");
@@ -191,7 +183,6 @@ G.V = function () {
     });
 
     it("keeps a detector's builder that calls something outside it while it runs", async () => {
-        // Directly, through a local holding it, and through a slot of the builder's array holding it.
         for (const start of ["\n  bump();", "\n  var b = bump;\n  b();", "\n  S[7] = bump;\n  (1, S[7])();"]) {
             const program = lazy('if (typeof require === "function" && require("inspector").url()) { S[4] = "j-016-00015"; }', start)
                 .replace("function G() {}", "function G() {}\nvar count = 0;\nfunction bump() { count++; }")

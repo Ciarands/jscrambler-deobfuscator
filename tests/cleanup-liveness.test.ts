@@ -2,7 +2,6 @@ import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 
-/** What a script leaves in `result`; `setTimeout` callbacks (code after the prelude) run once it has finished. */
 const observed = (source: string): string => {
     const timers: (() => void)[] = [];
     const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };
@@ -11,11 +10,8 @@ const observed = (source: string): string => {
     return JSON.stringify(context.result);
 };
 
-/**
- * jscrambler's decoder shape: it finds its string function by trying permutations of a few characters (`codes`, each
- * one below its character) until `G[name]` exists. `before` runs before the decoder, `after` after it; the decoder is
- * used after the prelude with a key no pass can resolve, so it stays, and its probe with it.
- */
+// The decoder finds its string function by trying permutations of a few characters until `G[name]` exists; it is
+// used later with a key no pass can resolve, so it and its probe stay.
 const runtime = ({ before = "", codes = "[79, 112]", after = "", later = "" } = {}) => `
 function G() {}
 G.Pq = function () { return "a,b,c"; };
@@ -51,7 +47,6 @@ describe("cleanup: computed reads in prelude-only code", () => {
         const output = await run(program);
         expect(observed(output)).toBe(observed(program));
         expect(output).not.toContain("G.late");
-        // What the probe finds stays.
         expect(output).toContain("G.Pq = ");
     });
 

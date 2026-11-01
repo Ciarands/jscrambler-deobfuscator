@@ -1,11 +1,8 @@
 import { runInNewContext } from "node:vm";
 
 /**
- * Random structured programs and a reference flattener that turns them into jscrambler-style switch machines.
- *
- * Programs only call `T(id)` (record a trace step), `Tg` (the same, as a template tag) and `C()` (read the next input
- * bit), so running a program on the same inputs before and after a transformation and comparing traces checks that
- * control flow is unchanged. Half of them run in strict mode, where a lost `var` throws instead of making a global.
+ * Random structured programs and a reference flattener into switch machines. Programs only call `T(id)`/`Tg` (trace)
+ * and `C()` (next input bit), so comparing traces checks control flow. Half run in strict mode, where a lost `var` throws.
  */
 
 export type Stmt =
@@ -60,7 +57,6 @@ interface GenState {
 interface Loops {
     /** Labels of enclosing loops, innermost last. `null` entries are unlabeled loops. */
     readonly labels: readonly (string | null)[];
-    /** Inside a loop, so `break`/`continue` have a target. */
     readonly inLoop: boolean;
 }
 
@@ -78,7 +74,6 @@ const addDeadCode = (g: GenState, out: Stmt[]): void => {
     if (g.rng() < 0.3) {
         const name = `h${g.nextName++}`;
         out.push({ k: "deadFn", name, id: g.nextId++ });
-        // Before the jump (the jump is at `length - 2` now, or earlier if a var was added).
         const jump = out.findIndex(isJump);
         out.splice(Math.floor(g.rng() * (jump + 1)), 0, { k: "callFn", name });
     }
@@ -144,7 +139,6 @@ export const generate = (seed: number, depth = 4): Program => {
 
 const closures = (id: number): string => `{ const cl = []; for (let i = 0; i < 2; i++) cl.push(() => T("${id}." + i)); for (const c of cl) c(); }`;
 
-/** Code for statements that are the same structured and flattened. */
 const leaf = (s: Stmt): string | undefined => {
     switch (s.k) {
         case "T":
@@ -168,7 +162,6 @@ const leaf = (s: Stmt): string | undefined => {
     }
 };
 
-/** Plain JS for statements. Each loop test calls C(). */
 export const emitStatements = (seq: readonly Stmt[], indent = "  "): string => {
     const inner = (body: readonly Stmt[]): string => emitStatements(body, `${indent}  `);
     return seq
@@ -199,7 +192,6 @@ export const emitStatements = (seq: readonly Stmt[], indent = "  "): string => {
         .join("\n");
 };
 
-/** Plain JS for a program: the body of `function f`. */
 export const emit = (program: Program): string => `${program.strict ? '"use strict";\n' : ""}${emitStatements(program.body)}`;
 
 /** Next state: a state id, or `[a, b]` for `C() ? a : b` (nested for `if / else if`). */
@@ -220,7 +212,6 @@ interface LoopTargets {
     readonly continueTo: number;
 }
 
-/** The loop a `break`/`continue` with this label (or none: innermost) targets. */
 const loopFor = (loops: readonly LoopTargets[], label: string | null): LoopTargets => {
     const found = label === null ? loops.at(-1) : loops.toReversed().find((l) => l.label === label);
     if (found === undefined) throw new Error(`no loop for ${label}`);
@@ -246,7 +237,6 @@ const hasEscapedTry = (body: readonly Stmt[]): boolean =>
         return false;
     });
 
-/** Fisher-Yates. */
 const shuffle = <T>(items: readonly T[], rng: Rng): T[] => {
     const out = [...items];
     for (let i = out.length - 1; i > 0; i--) {
@@ -256,19 +246,15 @@ const shuffle = <T>(items: readonly T[], rng: Rng): T[] => {
     return out;
 };
 
-/** How a machine sets its initial state and what its loop's init clause holds. */
 type InitStyle = "sibling" | "loop" | "loopExtra" | "separate" | "lexical";
 
 /**
- * Flatten statements the way jscrambler does: one `for (; S !== 0;) switch (S)` machine, with blocks in shuffled case
- * order. Exiting the machine is state 0. A `try` stays whole inside one case, its parts flattened into nested machines
- * with their own state variables; a loop holding a try that a `break`/`continue` leaves stays structured in one case.
- * Code after a jump lands in unreachable cases, or after the `return`/`throw` in the same case.
+ * One `for (; S !== 0;) switch (S)` machine with shuffled cases; state 0 exits. A `try` stays whole in one case, its
+ * parts nested machines; a loop holding a try a jump leaves stays structured.
  */
 const flattenStatements = (seq: readonly Stmt[], rng: Rng, names: { next: number }): string => {
     const machine = names.next++;
     const stateVar = machine === 0 ? "s" : `s${machine}`;
-    // Machine style, picked per machine like jscrambler's output varies between samples.
     const inSlot = rng() < 0.25; // state kept in an `arguments`-style slot: a[4]
     const init: InitStyle = inSlot ? "sibling" : pick(rng, ["sibling", "sibling", "loop", "loopExtra", "separate", "lexical"] as const);
     // `sx` is 0 and case bodies read it: losing its declaration or its value makes them throw or trace differently.
@@ -290,7 +276,6 @@ const flattenStatements = (seq: readonly Stmt[], rng: Rng, names: { next: number
         // Through a nested function whose parameter reuses the state's name, like minified code does: that `s` is a
         // different variable, so the machine must still be unflattened.
         if (roll < 0.12) return { step: `T((function (${stateVar}) { return ${stateVar}; })(${value}))` };
-        // A closure reading the loop's (possibly lexical) init variable.
         if (extra !== undefined && roll < 0.24) return { step: `T((() => ${value})())` };
         if (roll < 0.32) return { step: `Tg\`a\${${value}}b\`` };
         return { step: `T(${value})` };
@@ -304,11 +289,9 @@ const flattenStatements = (seq: readonly Stmt[], rng: Rng, names: { next: number
         let current = next;
         let from = live.length - 1;
         if (dead.length > 0 && (last?.k === "return" || last?.k === "throw") && rng() < 0.5) {
-            // Dead declarations right after the return/throw, in the same case.
             current = add({ body: [], exit: { end: leaf(last) as string, after: dead.map((s) => leaf(s) as string) } });
             from--;
         } else if (dead.length > 0) {
-            // Dead declarations in a case nothing jumps to.
             add({ body: dead.map((s) => ({ code: leaf(s) as string })), exit: { next } });
         }
         for (let i = from; i >= 0; i--) current = cStmt(live[i] as Stmt, current, loops);
@@ -343,9 +326,7 @@ const flattenStatements = (seq: readonly Stmt[], rng: Rng, names: { next: number
                 // `head` is where `continue` goes: the test for while/do-while, the top of the body for forever.
                 const head = reserve();
                 const body = cSeq(s.body, head, [...loops, { label: s.label, breakTo: next, continueTo: head }]);
-                // A forever loop's head is an empty block that just jumps into the body.
                 blocks.set(head, { body: [], exit: { next: s.k === "forever" ? body : [body, next] } });
-                // A do-while enters its body first.
                 return s.k === "doWhile" ? body : head;
             }
             case "break":
@@ -410,7 +391,6 @@ const flattenStatements = (seq: readonly Stmt[], rng: Rng, names: { next: number
     }
 };
 
-/** Flatten a program: the body of `function f`. */
 export const flatten = (program: Program, rng: Rng): string => `${program.strict ? '"use strict";\n' : ""}${flattenStatements(program.body, rng, { next: 0 })}`;
 
 /** Run `function f() { <body> }` with `bits` as the C() inputs and return the trace. Bounded so loops terminate. */

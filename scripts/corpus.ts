@@ -3,12 +3,8 @@
  *
  *   npm run corpus -- [samplesDir] [--only a,b] [--dump] [--passes x,y] [--skip x,y] [--out dir]
  *
- * samplesDir defaults to $SAMPLES_DIR, then ../jscrambler-samples. For each sample this writes to <out>/<name>/
- * (out defaults to .corpus):
- *   out.js       final output
- *   log.txt      every log line (debug level), with source locations
- *   passes/      with --dump: the code after each pass (00-input.js, 01-<pass>.js, ...)
- * and prints a metrics table, with the change since the previous run (.corpus/summary.json).
+ * samplesDir defaults to $SAMPLES_DIR, then ../jscrambler-samples. Writes out.js, log.txt and (with --dump) passes/
+ * to <out>/<name>/ (out defaults to .corpus), and prints metrics against the previous run (.corpus/summary.json).
  */
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";

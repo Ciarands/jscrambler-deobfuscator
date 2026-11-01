@@ -6,17 +6,8 @@ import type { PassLog } from "../../core/log.js";
 import { forEachChild } from "../../core/traverse.js";
 
 /**
- * Readability clean-ups for code produced by `structure`. Each rewrite keeps behaviour identical:
- *
- * - a `break L` / `continue L` in tail position of L's own body goes where execution would go anyway, so it is dropped;
- * - labels nobody jumps to are removed (a labeled block without users is spliced into its parent);
- * - statements after an unconditional jump are unreachable and dropped, leaving what they declare (see `Dropped`);
- * - `if (c) { ...jump } else { B }` becomes `if (c) { ...jump } B`;
- * - `if (c) {} else { B }` becomes `if (!c) { B }`;
- * - `L: while (true)` loops of known shapes become `while (c)` / `do ... while (c)` (`recognizeLoop`).
- *
- * Statements only leave their block when none of them is a lexical declaration (`let`, `const`, `class`, a block
- * function): those would change scope.
+ * Exact readability clean-ups for code produced by `structure`. Statements only leave their block when none of them is
+ * a lexical declaration (`let`, `const`, `class`, a block function): those would change scope.
  */
 
 type JumpKind = "BreakStatement" | "ContinueStatement";
@@ -26,7 +17,6 @@ interface JumpCount {
     continues: number;
 }
 
-/** What tidy dropped as unreachable that still binds names for the whole function. */
 export interface Dropped {
     /** `var` names: they bind wherever they are, so a placeholder anywhere in the function keeps them. */
     readonly vars: Set<string>;
@@ -36,7 +26,6 @@ export interface Dropped {
 
 interface Context {
     readonly log: PassLog;
-    /** Rewrites in the current round. */
     changed: number;
     /**
      * Jumps to each label name, from one walk over the whole output, kept current as jumps are removed. By name, so
@@ -89,14 +78,13 @@ const jumpsIn = (statements: readonly Statement[], label: string, kind: JumpKind
     return found;
 };
 
-/** A declaration scoped to the statement list it sits in. */
 const isLexical = (s: Statement): boolean => (s.type === "VariableDeclaration" && s.kind !== "var") || s.type === "ClassDeclaration" || s.type === "FunctionDeclaration";
 
 const declaresLexically = (statements: readonly Statement[]): boolean => statements.some(isLexical);
 
 const asBlock = (s: Statement | null): BlockStatement | undefined => (s?.type === "BlockStatement" ? s : undefined);
 
-/** Remove jumps to `label` in tail position of `statements`: the last statement, through ifs and nested blocks. */
+/** Tail position: the last statement, through ifs and nested blocks. */
 const dropTailJumps = (cx: Context, statements: Statement[], label: string, kind: JumpKind): void => {
     const last = statements.at(-1);
     if (last === undefined) return;
@@ -124,7 +112,7 @@ const negate = (test: Expression): Expression =>
 
 const isLiteralTrue = (node: Expression): boolean => node.type === "Literal" && node.value === true;
 
-/** Whether an unlabeled `break` in `node` would leave `node` itself: one walk, stopping at loops, switches, functions. */
+/** Stops at loops, switches and functions. */
 const hasOwnBreak = (statements: readonly Statement[]): boolean => {
     let found = false;
     const walk = (node: Node): void => {
@@ -136,10 +124,7 @@ const hasOwnBreak = (statements: readonly Statement[]): boolean => {
     return found;
 };
 
-/**
- * Whether running `statements` can finish by reaching their end (rather than always jumping, returning or throwing).
- * Conservative: when unsure, says yes.
- */
+/** Conservative: when unsure, says yes. */
 const canCompleteNormally = (cx: Context, statements: readonly Statement[]): boolean => statements.every((s) => statementCanComplete(cx, s));
 
 const statementCanComplete = (cx: Context, s: Statement): boolean => {
@@ -165,7 +150,6 @@ const statementCanComplete = (cx: Context, s: Statement): boolean => {
 
 const blockAt = (statements: Statement[], position: Statement): BlockStatement => at<BlockStatement>({ type: "BlockStatement", body: statements }, position);
 
-/** A branch of an if: an `else if` stays a bare IfStatement, anything else becomes a block. */
 const branchOf = (body: Statement[], like: Statement): Statement => (body.length === 1 && body[0]?.type === "IfStatement" && like.type === "IfStatement" ? body[0] : blockAt(body, like));
 
 /**
@@ -175,7 +159,7 @@ const branchOf = (body: Statement[], like: Statement): Statement => (body.length
  *     if (c) { X } R                  ->  while (!c) { R } X     X: never finishes, no jumps to L. R: no break L.
  *     B; if (c) { continue L } X      ->  do { B } while (c); X  B: no jumps to L. X: never finishes, no jumps to L.
  *
- * The caller has checked that the body declares nothing lexically. Returns the replacement statements, or undefined.
+ * The caller has checked that the body declares nothing lexically.
  */
 const recognizeLoop = (cx: Context, labelNode: LabelIdentifier, body: readonly Statement[]): Statement[] | undefined => {
     const label = labelNode.name;
@@ -271,7 +255,6 @@ const deadRemainder = (cx: Context, dead: readonly Statement[]): Statement[] => 
 
 const tidyList = (cx: Context, statements: readonly Statement[]): Statement[] => {
     const out: Statement[] = [];
-    // Everything after an unconditional jump.
     let dead: Statement[] | undefined;
     const push = (s: Statement): void => {
         if (dead !== undefined) dead.push(s);
@@ -355,10 +338,6 @@ const tidyList = (cx: Context, statements: readonly Statement[]): Statement[] =>
 
 const MAX_ROUNDS = 8;
 
-/**
- * Tidy the statements `structure` produced for one machine, until nothing changes. Also returns what unreachable
- * code it dropped still declares, for the machine's preamble.
- */
 export const tidy = (statements: Statement[], log: PassLog): { statements: Statement[]; dropped: Dropped } => {
     const cx: Context = { log, changed: 0, jumps: new Map(), dropped: { vars: new Set(), functions: [] } };
     for (const statement of statements) countJumps(cx, statement, 1);

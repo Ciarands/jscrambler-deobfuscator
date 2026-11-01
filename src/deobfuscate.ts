@@ -9,13 +9,11 @@ import { runPipeline, selectPasses } from "./pipeline/run.js";
 import type { PassReport, PassSelection } from "./pipeline/run.js";
 
 export interface DeobfuscateOptions extends PassSelection {
-    /** Used in parse error messages. */
     readonly filename?: string;
-    /** Defaults to a logger that prints nothing. */
     readonly logger?: Logger;
-    /** Called once with the parsed input printed back, before any pass runs. For diffing against `afterPass` dumps. */
+    /** Called once with the parsed input printed back, before any pass runs. */
     readonly beforePasses?: (code: string) => void;
-    /** Called after every pass run with the code at that point. Printing costs time, so only set this when needed. */
+    /** Printing costs time, so only set this when needed. */
     readonly afterPass?: (report: PassReport, code: string) => void;
 }
 
@@ -29,12 +27,7 @@ export interface DeobfuscateResult {
     readonly report: DeobfuscateReport;
 }
 
-/**
- * Deobfuscate one script or module.
- *
- * Throws `ParseError` when the input doesn't parse and `UnknownPassError` for bad pass names.
- * Async so the same API can run on the WASM parser in a browser later.
- */
+/** Throws `ParseError` on unparsable input and `UnknownPassError` for bad pass names. */
 export const deobfuscate = async (code: string, options: DeobfuscateOptions = {}): Promise<DeobfuscateResult> => {
     const start = performance.now();
     const logger = options.logger ?? silentLogger;

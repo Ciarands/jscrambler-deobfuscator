@@ -5,13 +5,10 @@ import { sameReference } from "../../core/equal.js";
 import { evaluate } from "../../core/evaluate.js";
 import { forEachChild } from "../../core/traverse.js";
 
-/** Canonical key of a state value: `n:5`, `s:abc`, `o:3`... Two states are the same iff their keys are equal. */
+/** Two states are the same iff their keys are equal. */
 export type StateKey = string;
 
-/**
- * Key of the block a computed initial state starts with (`var S = c() ? 2 : 5`): no case, just the choice. Never a
- * state value's key (those carry a `x:` prefix).
- */
+/** Key of the block choosing a computed initial state; never a state value's key (those carry a `x:` prefix). */
 const ENTRY: StateKey = "entry";
 
 export type Terminator =
@@ -19,7 +16,6 @@ export type Terminator =
     | { readonly kind: "branch"; readonly test: Expression; readonly consequent: Terminator; readonly alternate: Terminator }
     /** `S = c ? 2 : 2`: `c` still runs for its effects, then `next`. */
     | { readonly kind: "evaluate"; readonly expression: Expression; readonly next: Terminator }
-    /** The block ends in `return` or `throw`; it has no successor. */
     | { readonly kind: "end" };
 
 export interface Block {
@@ -32,16 +28,14 @@ export interface Block {
     /** What follows a case-level `return`/`throw`: never runs, but its declarations still count. */
     readonly dead: readonly Statement[];
     readonly terminator: Terminator;
-    /** The `case` this block came from; `null` for the block that picks a computed initial state. */
     readonly origin: SwitchCase | null;
 }
 
 export interface Machine {
-    /** The variable (or `arguments` slot like `a[4]`) holding the state. */
     readonly state: Expression;
     readonly entry: StateKey | "exit";
     readonly blocks: ReadonlyMap<StateKey, Block>;
-    /** The `switch (S)` itself: its cases share one block scope. */
+    /** Its cases share one block scope. */
     readonly dispatch: SwitchStatement;
     /** Cases whose label repeats an earlier one: never dispatched to, but their declarations still count. */
     readonly duplicates: readonly SwitchCase[];
@@ -51,23 +45,17 @@ export interface Machine {
     readonly preamble: Statement[];
 }
 
-/** Where a candidate loop sits: the matcher only needs these, not the walker's path. */
 export interface MachineSite {
     readonly loop: ForStatement;
-    /** The statement list holding the loop, or `null` when it's a lone statement (`if (x) for (...)`). */
     readonly siblings: readonly Statement[] | null;
-    /** The loop's index in `siblings`. */
     readonly index: number | null;
-    /** The loop is the body of a labeled statement. */
     readonly labeled: boolean;
 }
 
-/** The variable an identifier resolves to, or `undefined` when unknown (unresolved, or not in the analysed program). */
+/** `undefined` when unknown (unresolved, or not in the analysed program). */
 export type Resolve = (identifier: Node) => object | undefined;
 
 /**
- * Why a loop was left alone, as a stable code (for counting and control flow) plus a human-readable reason (for logs).
- *
  * - `not-a-machine`: an ordinary loop, nothing to report;
  * - `shape`: looks like a machine, but some part doesn't fit exactly;
  * - `non-constant-state`: a state value the evaluator (and the runtime model) can't turn into a key;
@@ -96,14 +84,12 @@ const constantKey = (node: Node): StateKey | undefined => {
     return typeof result.value === "number" ? `n:${result.value}` : typeof result.value === "string" ? `s:${result.value}` : undefined;
 };
 
-/** `S` itself for an identifier state, `a` for `a[4]`. */
 const rootIdentifier = (node: Node): Node | undefined => {
     let current = node;
     while (current.type === "MemberExpression") current = current.object;
     return current.type === "Identifier" ? current : undefined;
 };
 
-/** Recognises references to the state, telling apart same-named variables when the resolver knows both bindings. */
 type IsState = (node: Node) => boolean;
 
 const stateMatcher = (state: Expression, resolve: Resolve | undefined): IsState => {
@@ -119,7 +105,6 @@ const stateMatcher = (state: Expression, resolve: Resolve | undefined): IsState 
     };
 };
 
-/** The value in `S = value;` or `var S = value;` (single declarator). */
 const stateAssignment = (statement: Node | undefined | null, isState: IsState): Expression | undefined => {
     if (statement?.type === "ExpressionStatement") {
         const e = statement.expression;
@@ -132,10 +117,7 @@ const stateAssignment = (statement: Node | undefined | null, isState: IsState): 
     return undefined;
 };
 
-/**
- * The loop init's state value plus everything else the init does, kept as statements in their original order.
- * `last`: the state is the init's final effect, so the rest can run first without reordering anything.
- */
+/** `last`: the state is the init's final effect, so the rest can run first without reordering anything. */
 const initAssignment = (init: NonNullable<ForStatement["init"]>, isState: IsState): { value: Expression; preamble: Statement[]; last: boolean } | undefined => {
     if (init.type === "VariableDeclaration") {
         if (init.kind !== "var") return undefined;
@@ -151,10 +133,7 @@ const initAssignment = (init: NonNullable<ForStatement["init"]>, isState: IsStat
     return { value: last.right, preamble: expressions.slice(0, -1).map((expression) => at<Statement>({ type: "ExpressionStatement", expression }, expression)), last: true };
 };
 
-/**
- * Whether `node` contains the state reference anywhere: reads, writes, closures. Names that aren't references (`o.S`,
- * `{ S: 1 }`, `S: for`, `break S`) don't count, even when they spell the state's name.
- */
+/** Names that aren't references (`o.S`, `{ S: 1 }`, `S: for`, `break S`) don't count. */
 const mentionsState = (node: Node, isState: IsState): boolean => {
     if (isState(node)) return true;
     switch (node.type) {
@@ -237,7 +216,6 @@ const distribute = (node: Expression): (Expression & { type: "ConditionalExpress
     return { ...inner, consequent: { ...node, object: inner.consequent }, alternate: { ...node, object: inner.alternate } };
 };
 
-/** `S = c ? a : b` (possibly nested) as a terminator over state keys, or the reason it can't be one. */
 const terminatorOf = (value: Expression, isState: IsState, terminal: StateKey, known: (key: StateKey) => boolean, keyOf: KeyOf): TerminatorResult => {
     const distributed = distribute(value);
     if (distributed !== undefined) return terminatorOf(distributed, isState, terminal, known, keyOf);
@@ -275,11 +253,8 @@ const terminatorOf = (value: Expression, isState: IsState, terminal: StateKey, k
  *       case 5: ...; return x;
  *     }
  *
- * Anything that doesn't fit exactly is refused, with the reason. `resolve` (optional) tells same-named variables apart;
- * `stateKey` (optional) gives keys to states the static evaluator can't (cyclic-array rows, by identity).
- *
- * Declarations are not judged here: what moving case code out of the switch does to them takes scope analysis
- * (`declarations.ts`).
+ * `resolve` tells same-named variables apart; `stateKey` keys states the static evaluator can't (cyclic-array rows,
+ * by identity). Declarations are judged in `declarations.ts`.
  */
 export const matchMachine = ({ loop, siblings, index, labeled }: MachineSite, resolve?: Resolve, stateKey?: KeyOf): MatchResult => {
     const keyOf: KeyOf = (node) => constantKey(node) ?? stateKey?.(node);
@@ -375,7 +350,6 @@ export const matchMachine = ({ loop, siblings, index, labeled }: MachineSite, re
         const jump = escapingJump(statements);
         if (jump) return refuse("escaping-jump", "case body jumps out of the switch early", jump);
 
-        // Either a fixed terminator, or the value the case assigns to the state (`transition`).
         let terminator: Terminator | undefined;
         let transition: Expression | undefined;
         const tail = statements.at(-1);
@@ -411,10 +385,8 @@ export const matchMachine = ({ loop, siblings, index, labeled }: MachineSite, re
                 transition = seqValue;
             }
         } else if (endsWithBreak) {
-            // `break` without a state change dispatches the same state again.
             terminator = { kind: "goto", target: key };
         } else {
-            // No break: falls through into the next case's body.
             const next = body.cases[caseIndex + 1];
             if (next === undefined) return refuse("shape", "last case falls off the switch without setting the state", switchCase);
             const nextKey = keyOf(next.test as Expression) as StateKey;

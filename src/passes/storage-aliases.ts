@@ -11,19 +11,14 @@ type FunctionLike = FunctionNode | ArrowFunctionExpression;
 
 const asFunction = (node: Node): FunctionLike | undefined => (node.type === "FunctionExpression" || node.type === "FunctionDeclaration" || node.type === "ArrowFunctionExpression" ? node : undefined);
 
-/** The statements of a function's block body (none for an expression-bodied arrow). */
 const statementsOf = (fn: FunctionLike): Statement[] => (fn.body?.type === "BlockStatement" ? fn.body.body : []);
 
 /**
  * Another name for `G` and what makes it hold `G` wherever it is read:
- * - `declared`: `var A = G;` as top-level statement `index` of `fn`'s body. Code in that body's later statements runs
- *   after it, and so do the functions those statements create (and the functions those create, whatever their kind).
- *   A function declaration directly in `fn` is `fn`'s local, created once `fn`'s parameters are bound (their
- *   initialisers can't reach it), so only the code of `fn`'s body can call it first: its reads come after the alias is
- *   set when that code runs nothing before (`quietStart`: only directives and function declarations before the
- *   statement, no initialiser before the alias's declarator).
- * - `parameter`: a parameter of the immediately invoked `fn`, bound before any of its code runs; `valid` once the call
- *   is seen to pass `G` itself.
+ * - `declared`: `var A = G;` as top-level statement `index` of `fn`'s body. Later statements, and functions they
+ *   create, run after it; a function declaration directly in `fn` can be called first only by `fn`'s body, so it is
+ *   safe when nothing runs before the statement (`quietStart`).
+ * - `parameter`: a parameter of the immediately invoked `fn`; `valid` once the call is seen to pass `G` itself.
  */
 type Alias =
     | {
@@ -36,16 +31,12 @@ type Alias =
       }
     | { readonly kind: "parameter"; readonly fn: Node; valid: boolean };
 
-/** A function whose code is running, and which top-level statement of its body the walk is in (-1: none yet). */
 interface Frame {
     readonly fn: FunctionLike;
     top: number;
 }
 
-/**
- * The storage binding, when it holds `G` at every moment code runs: a function declaration among the root's
- * statements (initialised before any of the root's code runs) that nothing reassigns.
- */
+/** The storage binding, when it holds `G` whenever code runs: a never-reassigned function declaration of the root. */
 const storageBinding = (runtime: RuntimeModel, scopes: ScopeInfo): Variable | string => {
     const declarations = rootStatements(runtime.root).filter((statement) => statement.type === "FunctionDeclaration" && statement.id?.name === runtime.storage);
     const [only] = declarations;
@@ -56,7 +47,6 @@ const storageBinding = (runtime: RuntimeModel, scopes: ScopeInfo): Variable | st
     return variable;
 };
 
-/** What makes `variable`, another name for `G`, hold `G` where it is read; a reason when that can't be shown. */
 const aliasOf = (variable: Variable, storage: Variable, scopes: ScopeInfo): Alias | string => {
     const [def] = variable.defs;
     if (def === undefined) return "it has no declaration";
@@ -98,21 +88,15 @@ const tooEarly = (alias: Alias, frames: readonly Frame[]): string | undefined =>
 };
 
 /**
- * Replace reads of locals and parameters that only hold the storage object `G` (`var A = G;`, `(function (A) {...})(G)`)
- * with `G`'s own name, so the output names the runtime one way; a declaration left without reads goes.
+ * Replace reads of locals and parameters that only hold `G` (`var A = G;`, `(function (A) {...})(G)`) with `G`.
  *
- * Exact where `A` holds `G` whenever it is read and `G`'s name means `G`'s binding there:
- * - `G` is a function declaration of the runtime's root, never reassigned: it holds the storage object from before
- *   any code runs (see `storageBinding`);
- * - `A` is written only by its initialiser, `G` itself, in a top-level statement of its function's body, and each read
- *   runs after that statement (see `Alias`); a parameter is never written, and its function doesn't use `arguments`
- *   (the matcher's conditions), and the call passes `G` itself at its position;
- * - no declaration of `G`'s name and no `with` sit between the read and `G`'s binding. Names resolve statically: code
- *   a direct `eval` runs doesn't use this script's names (model 2), so the declaration also goes in such functions.
- * Aliases initialised from another alias are left for the next round, which sees them initialised from `G`.
+ * Exact where `A` holds `G` whenever it is read and `G`'s name means `G`'s binding there: `G` is never reassigned
+ * (`storageBinding`); `A` is written only by its initialiser and each read runs after it (`Alias`), or is a parameter
+ * never written in a function without `arguments` whose call passes `G`; and no declaration of `G`'s name or `with`
+ * sits between. Direct `eval` code doesn't use this script's names (model 2). Aliases of aliases wait for the next
+ * round.
  *
- * Runs once the storage analyses are done with the program: the new references are unknown to `scopes`, so the
- * caller reports changed bindings.
+ * The new references are unknown to `scopes`, so the caller reports changed bindings.
  */
 export const inlineStorageAliases = (runtime: RuntimeModel, matcher: StorageMatcher, scopes: ScopeInfo, log: PassLog): number => {
     if (matcher.aliases.size === 0) return 0;

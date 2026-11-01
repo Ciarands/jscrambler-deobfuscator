@@ -1,7 +1,4 @@
-/**
- * Output metrics shared by the dev scripts (corpus runner, comparison with `main`). Diagnostics only: readability is
- * judged by reading the output, these just show where obfuscation is left and whether code went missing.
- */
+/** Output metrics for the dev scripts. Diagnostics only: they show leftover obfuscation and missing code. */
 import type { Node } from "../src/core/ast.js";
 import { memberPath } from "../src/core/ast.js";
 import { parse } from "../src/core/parse.js";
@@ -11,23 +8,20 @@ export const COUNTED = ["bytes", "machines", "switches", "functions", "deepCalls
 export type Counted = (typeof COUNTED)[number];
 export type Metrics = Record<Counted, number> & { ms: number; error?: string };
 
-/** The single statement of a loop body, looking through a one-statement block. */
 const loneStatement = (body: Node): Node | undefined => (body.type === "BlockStatement" ? (body.body.length === 1 ? body.body[0] : undefined) : body);
 
-/** A loop whose body is one `switch` on a variable: a flattened state machine, whatever loop form it took. */
 const isMachine = (loop: Node): boolean => {
     if (loop.type !== "ForStatement" && loop.type !== "WhileStatement" && loop.type !== "DoWhileStatement") return false;
     const body = loneStatement(loop.body);
     return body?.type === "SwitchStatement" && (body.discriminant.type === "Identifier" || body.discriminant.type === "MemberExpression");
 };
 
-/** A static member chain `a.b.c` as one key (`undefined` for anything else). */
 const chainKey = (node: Node): string | undefined => {
     const path = memberPath(node);
     return path !== undefined && path.root.type === "Identifier" ? [path.root.name, ...path.keys].join("\u0000") : undefined;
 };
 
-/** jscrambler's wrapper: `function () { return typeof T === "function" ? T.apply(O, arguments) : T; }`. */
+/** `function () { return typeof T === "function" ? T.apply(O, arguments) : T; }` */
 const isWrapper = (fn: Node): boolean => {
     if (fn.type !== "FunctionExpression" || fn.body?.body.length !== 1) return false;
     const ret = fn.body.body[0];
@@ -41,15 +35,13 @@ const isWrapper = (fn: Node): boolean => {
 };
 
 /**
- * - machines:  loops whose body is one `switch` on a variable: flattened machines left.
- * - deepCalls: calls like `a.b.c(...)`, and calls of a wrapper (`G.w(...)` with `G.w` assigned a wrapper function):
- *   runtime / decoder calls left, a wrapper call being one behind another name (also ordinary method chains).
- * - calls:     all calls. Restructuring passes must never lower this; a drop means code went missing.
+ * - machines:  loops whose body is one `switch` on a variable (flattened machines left).
+ * - deepCalls: `a.b.c(...)` and calls of a wrapper-assigned member: runtime/decoder calls left (also ordinary chains).
+ * - calls:     restructuring passes must never lower this; a drop means code went missing.
  */
 export const measure = (code: string, ms: number): Metrics => {
     const metrics: Metrics = { bytes: code.length, ms: Math.round(ms), machines: 0, switches: 0, functions: 0, deepCalls: 0, calls: 0 };
     const wrappers = new Set<string>();
-    /** Callees of the `a.b(...)` calls, counted as deep once every wrapper is known. */
     const shallow: string[] = [];
     traverse(parse(code), {
         enter(path) {

@@ -6,7 +6,6 @@ import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
 
 const statementOf = (expression: Expression): Statement => at<Statement>({ type: "ExpressionStatement", expression }, expression);
 
-/** Split a statement whose leading expressions are a comma sequence into the sequence's statements plus the rest. */
 const split = (statement: Statement): Statement[] | undefined => {
     switch (statement.type) {
         case "ExpressionStatement":
@@ -58,7 +57,6 @@ const SINGLE_STATEMENT_SLOTS: Record<string, readonly string[]> = {
     WithStatement: ["body"],
 };
 
-/** Split `statement` until nothing in the result splits further (`return (a, b), c`). */
 const splitFully = (statement: Statement): Statement[] | undefined => {
     let current = split(statement);
     if (current === undefined) return undefined;
@@ -75,9 +73,8 @@ const splitFully = (statement: Statement): Statement[] | undefined => {
 };
 
 /**
- * `var x = <literal>` followed by a declarator or assignment of `x` with another literal: the first literal is never
- * seen. Only a literal: any other value may run code (a call, a getter) that reads `x` and would see the first one.
- * A declarator without an initializer (`var x = 1, x;`) leaves the value as it is.
+ * `var x = <literal>` followed by another literal write of `x`: the first is never seen. Only a literal: any other
+ * value may run code that reads `x`.
  */
 const overwritten = (declarator: VariableDeclarator | undefined, name: string | undefined, value: Node | null): boolean =>
     value?.type === "Literal" && declarator?.id.type === "Identifier" && declarator.id.name === name && (declarator.init === null || declarator.init.type === "Literal");
@@ -86,11 +83,9 @@ const declarationOf = (node: VariableDeclaration, declarations: VariableDeclarat
     at<VariableDeclaration>({ type: "VariableDeclaration", kind: node.kind, declarations }, node);
 
 /**
- * Declarations whose literal value is replaced right away (`var a = "", a = "keyCode";`, `var b = "";
- * b = "href";`): `var x = <literal>` followed by another declarator of `x`, in the same `var` or the next one, or
- * by the statement `x = e`. The literal is never seen, so only the second value matters, as long as it doesn't read
- * `x` (it would see the literal). Both are in one statement list, so they name one binding, and dropping a repeated
- * declarator leaves the variable declared. What `first` (and `second`, when `consumed` is 2) become, or `undefined`.
+ * Declarations whose literal value is replaced right away (`var a = "", a = "keyCode";`), when the second value
+ * doesn't read `x`. Both are in one statement list, so they name one binding. What `first` (and `second`, when
+ * `consumed` is 2) become, or `undefined`.
  */
 const mergeDeclaration = (first: Statement, second: Statement | undefined): { replacement: Statement[]; consumed: 1 | 2 } | undefined => {
     if (first.type !== "VariableDeclaration" || first.kind !== "var") return undefined;
@@ -114,16 +109,8 @@ const mergeDeclaration = (first: Statement, second: Statement | undefined): { re
 };
 
 /**
- * Normalize syntax so later passes only have to recognise one shape. Every rewrite is exactly equivalent:
- *
- * - `a, b, c;` -> `a; b; c;` (statement position; as the lone body of an if/loop/label it becomes `{ a; b; c; }`)
- * - `return a, b;` -> `a; return b;` and `throw a, b;` -> `a; throw b;`
- * - `if ((a, b)) ...` -> `a; if (b) ...`
- * - `x["name"]` -> `x.name` when the key is a valid identifier name
- * - `!0` -> `true`, `!1` -> `false`
- *
- * Runs first: minified outputs keep the runtime prelude in comma sequences, which hides its
- * statements from the unflattener and the emulator.
+ * Normalize syntax so later passes only recognise one shape (comma statements split, `x["name"]` -> `x.name`,
+ * `!0` -> `true`). Every rewrite is exact. Runs first: minified outputs hide the prelude in comma sequences.
  */
 export const normalize: Pass = {
     name: "normalize",

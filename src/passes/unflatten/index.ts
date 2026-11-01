@@ -42,7 +42,6 @@ const runtimeStateKey = (program: Node, runtime: RuntimeModel | undefined, scope
     };
 };
 
-/** Every identifier in the machine (loop and initializer), and those called directly (`g(...)`): one walk. */
 const machineIdentifiers = (roots: readonly Node[]): { identifiers: Set<Node>; callees: Set<Node> } => {
     const identifiers = new Set<Node>();
     const callees = new Set<Node>();
@@ -80,7 +79,6 @@ const outsideUse = (scopes: ScopeInfo, machine: Machine, inside: ReadonlySet<Nod
     return undefined;
 };
 
-/** `object` → its member expression, for every `x.k` / `x[k]` whose object is an identifier. One walk, on demand. */
 const membersByObject = (program: Node): Map<Node, MemberExpression> => {
     const members = new Map<Node, MemberExpression>();
     const walk = (node: Node): void => {
@@ -91,17 +89,12 @@ const membersByObject = (program: Node): Map<Node, MemberExpression> => {
     return members;
 };
 
-/** The statement list of a node `Path.isInStatementList()` accepted. */
 const statementsOf = (parent: Node): readonly Statement[] => (parent.type === "SwitchCase" ? (parent as SwitchCase).consequent : (parent as Program | BlockStatement | StaticBlock).body);
 
 /**
- * Control-flow unflattening.
- *
- * Runs right after `normalize`: jscrambler flattens nearly every function, including its own runtime helpers, into
- * `for (; S !== end;) switch (S)` machines. Machines whose states are plain constants need nothing else to be undone,
- * and every later pass (global proxy, aliases, decoders, slot inlining) is far simpler to write and to check on
- * structured code. Machines whose states are computed (cyclic-array ids) are left for a later run, after those ids
- * have been resolved to constants or keyed by the emulated runtime (`runtimeStateKey`).
+ * Runs right after `normalize`: jscrambler flattens nearly every function into `for (; S !== end;) switch (S)`
+ * machines, and every later pass is far simpler on structured code. Machines with computed states (cyclic-array ids)
+ * wait for a later run, once those ids are constants or keyed by the emulated runtime (`runtimeStateKey`).
  */
 export const unflatten: Pass = {
     name: "unflatten",

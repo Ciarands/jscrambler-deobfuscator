@@ -6,14 +6,12 @@ import { deobfuscate } from "../src/index.js";
 
 const normalize = async (code: string) => (await deobfuscate(code, { passes: ["normalize"] })).code;
 
-/** Run a script that records calls through `t(x)`, and return the trace. */
 const trace = (code: string): unknown[] => {
     const calls: unknown[] = [];
     runInNewContext(code, { t: (x: unknown) => (calls.push(x), x) });
     return calls;
 };
 
-/** Comma sequences left where normalize should have split them. */
 const leftoverSequences = (code: string): number => {
     let count = 0;
     traverse(parse(code), {

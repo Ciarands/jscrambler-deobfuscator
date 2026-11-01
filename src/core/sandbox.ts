@@ -3,20 +3,13 @@ import { newQuickJSWASMModuleFromVariant, newVariant } from "quickjs-emscripten-
 import type { CustomizeVariantOptions, QuickJSContext, QuickJSHandle, QuickJSRuntime, QuickJSSyncVariant, QuickJSWASMModule } from "quickjs-emscripten-core";
 
 /**
- * A QuickJS (WASM) sandbox for running small pieces of the obfuscator's own runtime: the prelude helpers and calls
- * to them with constant arguments.
- *
- * Isolation: the guest gets QuickJS's standard builtins only. Nothing from the host is exposed (no fs, network,
- * process, require, console), and only plain values are copied out. Every run has a wall-clock deadline and the
- * runtime has a memory and stack limit, so hostile code can at worst fail its own run.
- *
- * Determinism: `Math.random` is replaced with a seeded generator, so runs are repeatable.
+ * QuickJS (WASM) sandbox for the obfuscator's own runtime helpers. Guest gets standard builtins only, nothing from the
+ * host; plain values are copied out. Deadline plus memory/stack limits bound hostile code; `Math.random` is seeded.
  */
 
 export interface SandboxLimits {
     readonly memoryBytes: number;
     readonly stackBytes: number;
-    /** Default deadline for one `run`. */
     readonly timeoutMs: number;
 }
 
@@ -31,18 +24,12 @@ export interface Held {
 }
 
 let modulePromise: Promise<QuickJSWASMModule> | undefined;
-/** The variant package's typings describe its CommonJS shape (default nested once more); at runtime this is the variant. */
 const baseVariant = variantModule.default as unknown as QuickJSSyncVariant;
-/**
- * Emscripten prints aborts (`Aborted(Assertion failed ...)`) to the host's stderr before throwing; the library never
- * writes to the console, and the abort still reaches `run`/`dispose` as an exception. `print`/`printErr` are standard
- * Emscripten module options the loader passes through, missing from its typings.
- */
+/** Emscripten prints aborts to stderr before throwing; silence it (the abort still surfaces as an exception). */
 const silent = { print: () => {}, printErr: () => {} } as unknown as NonNullable<CustomizeVariantOptions["emscriptenModule"]>;
 const syncVariant = newVariant(baseVariant, { emscriptenModule: silent });
 const quickjs = (): Promise<QuickJSWASMModule> => (modulePromise ??= newQuickJSWASMModuleFromVariant(syncVariant));
 
-/** Seeded mulberry32, installed as Math.random inside the guest. */
 const DETERMINISM = `(() => {
     let a = 0x9e3779b9 | 0;
     Math.random = function random() {
@@ -53,10 +40,7 @@ const DETERMINISM = `(() => {
     };
 })();`;
 
-/**
- * Values cross between host and guest as JSON, with the values JSON can't carry tagged: `undefined`, `NaN`,
- * `Infinity`, `-Infinity` and `-0`. The guest side of this lives in `TRANSPORT` and must stay in step.
- */
+/** JSON with `undefined`/`NaN`/`±Infinity`/`-0` tagged. Must stay in step with the guest side in `TRANSPORT`. */
 const TAG = "$jsd";
 const SPECIAL: Record<string, unknown> = { undefined: undefined, NaN: Number.NaN, Infinity: Number.POSITIVE_INFINITY, "-Infinity": Number.NEGATIVE_INFINITY, "-0": -0 };
 const tagOf = (value: unknown): string | undefined => {
@@ -76,7 +60,6 @@ const encode = (value: unknown): string =>
 const decode = (text: string): unknown =>
     JSON.parse(text, (_key, raw: unknown) => (typeof raw === "object" && raw !== null && TAG in raw ? SPECIAL[String((raw as Record<string, unknown>)[TAG])] : raw));
 
-/** Guest half of the transport: `[decode, encode]`. */
 const TRANSPORT = `(function () {
     var TAG = ${JSON.stringify(TAG)};
     var SPECIAL = { "undefined": undefined, "NaN": NaN, "Infinity": Infinity, "-Infinity": -Infinity, "-0": -0 };
@@ -109,19 +92,13 @@ export class Sandbox {
     readonly #runtime: QuickJSRuntime;
     readonly #context: QuickJSContext;
     readonly #limits: SandboxLimits;
-    /** Guest `JSON.stringify`, for copying strings out (see `#copy`). */
     readonly #quote: QuickJSHandle;
-    /** Guest transport functions: tagged JSON text to value, value to tagged JSON text. */
     readonly #decode: QuickJSHandle;
     readonly #encode: QuickJSHandle;
-    /** Guest functions `invoke` has looked up, by base and path. */
     readonly #functions = new Map<string, { fn: QuickJSHandle; owner: QuickJSHandle }>();
-    /** Objects `hold` keeps, by id. */
     readonly #held = new Map<number, QuickJSHandle>();
     #deadline = 0;
-    /** The interrupt handler stopped the current run (its deadline passed). */
     #interrupted = false;
-    /** Set once the WASM instance aborted; every later call fails fast. */
     #broken: string | undefined;
 
     private constructor(module: QuickJSWASMModule, limits: SandboxLimits) {
@@ -143,10 +120,7 @@ export class Sandbox {
         transport.dispose();
     }
 
-    /**
-     * Copy a guest value to the host. Strings go through the guest's `JSON.stringify`: copied directly they cross as C
-     * strings and lose everything from the first NUL on (a decoded `"a\0b"` would arrive as `"a"`).
-     */
+    /** Strings go through guest `JSON.stringify`: copied directly they cross as C strings and truncate at NUL. */
     #copy(handle: QuickJSHandle): unknown {
         if (this.#context.typeof(handle) !== "string") return this.#context.dump(handle);
         const quoted = this.#context.unwrapResult(this.#context.callFunction(this.#quote, this.#context.undefined, handle));
@@ -164,7 +138,6 @@ export class Sandbox {
         return sandbox;
     }
 
-    /** Why the sandbox stopped working, if it did. */
     get broken(): string | undefined {
         return this.#broken;
     }
@@ -176,21 +149,16 @@ export class Sandbox {
         return { ok: false, error: `sandbox aborted: ${this.#broken}`, timedOut: false };
     }
 
-    /** Start a run's clock: the interrupt handler stops it `timeoutMs` from now. */
     #arm(timeoutMs: number): void {
         this.#deadline = Date.now() + timeoutMs;
         this.#interrupted = false;
     }
 
-    /**
-     * Evaluate `code` as a script in the guest's global scope and copy its completion value out. Only a WASM abort
-     * breaks the sandbox; a host-side failure copying the value (e.g. a cyclic structure) is an ordinary error.
-     */
+    /** Only a WASM abort breaks the sandbox; a host-side copy failure (e.g. cyclic value) is an ordinary error. */
     run(code: string, timeoutMs = this.#limits.timeoutMs): RunResult {
         return this.#evaluate(code, timeoutMs, true);
     }
 
-    /** Evaluate `code` as a script in the guest's global scope for its effects: nothing but a thrown error is copied out. */
     execute(code: string, timeoutMs = this.#limits.timeoutMs): RunResult {
         return this.#evaluate(code, timeoutMs, false);
     }
@@ -212,10 +180,7 @@ export class Sandbox {
         }
     }
 
-    /**
-     * Evaluate `code`, an expression, and keep its value on the host side only: guest code finds it under no name, so
-     * helper objects installed this way can't collide with the program's names or show up among the globals.
-     */
+    /** Keep an expression's value host-side only, so helpers can't collide with or show up among program globals. */
     hold(code: string, timeoutMs = this.#limits.timeoutMs): { readonly ok: true; readonly held: Held } | (RunResult & { readonly ok: false }) {
         if (this.#broken !== undefined) return { ok: false, error: `sandbox aborted earlier: ${this.#broken}`, timedOut: false };
         try {
@@ -230,11 +195,7 @@ export class Sandbox {
         }
     }
 
-    /**
-     * Call a guest function, found by property path from `base` (a held object) or else the global object, with
-     * `payload` as its one argument. Nothing is compiled: the payload and the result cross as data (tagged JSON, so
-     * `undefined`, `NaN`, `-0` and NULs in strings survive). Guest functions are looked up once and kept.
-     */
+    /** Call a guest function by property path from `base` (or the global object); payload and result cross as tagged JSON. */
     invoke(path: readonly string[], payload: unknown, timeoutMs = this.#limits.timeoutMs, base?: Held): RunResult {
         if (this.#broken !== undefined) return { ok: false, error: `sandbox aborted earlier: ${this.#broken}`, timedOut: false };
         const context = this.#context;
@@ -267,7 +228,6 @@ export class Sandbox {
         const context = this.#context;
         const start = base === undefined ? context.global : this.#held.get(base.id);
         if (start === undefined) return undefined;
-        /** Handles this lookup made (the start isn't one: the global object or a held object stays). */
         const own = (handle: QuickJSHandle): boolean => handle !== start;
         let owner: QuickJSHandle = start;
         for (const segment of path.slice(0, -1)) {
@@ -286,12 +246,10 @@ export class Sandbox {
         return entry;
     }
 
-    /** A guest exception as a failed result (disposing the handle when asked), with where it was thrown when known. */
     #failure(handle: QuickJSHandle, dispose = false): RunResult {
         try {
             const thrown: unknown = this.#copy(handle);
             const message = typeof thrown === "object" && thrown !== null && "message" in thrown ? String(thrown.message) : String(thrown);
-            // The innermost frame of the evaluated code (`sandbox.js:line:column`), from the error's stack text.
             const stack = typeof thrown === "object" && thrown !== null && "stack" in thrown ? String(thrown.stack) : "";
             const frame = /sandbox\.js:(\d+):(\d+)/.exec(stack);
             const at = frame === null ? undefined : { line: Number(frame[1]), column: Number(frame[2]) };

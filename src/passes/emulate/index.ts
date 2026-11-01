@@ -12,7 +12,7 @@ import { Guest, pathName } from "./guest.js";
 import type { Alias, CallAlias, Wrapper } from "./model.js";
 import { RUNTIME } from "./model.js";
 
-/** Per-statement deadlines. The runtime's own statements can be heavy (a decoder may XOR a >1 MB string). */
+/** Runtime statements can be heavy (a decoder may XOR a >1 MB string). */
 const RUNTIME_STATEMENT_TIMEOUT_MS = 15_000;
 const OTHER_STATEMENT_TIMEOUT_MS = 500;
 const TOTAL_BUDGET_MS = 60_000;
@@ -20,9 +20,8 @@ const TOTAL_BUDGET_MS = 60_000;
 const isPrimitive = (value: unknown): value is Value => value === null || value === undefined || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
 
 /**
- * The statements that run at the top, and the node whose scope declares them: a lone top-level IIFE (after any
- * directives), or the program. The IIFE may be a function expression or a block-bodied arrow, called directly or
- * with `.call(this)`, under unary operators (`!function () {...}()`).
+ * A lone top-level IIFE (after directives; function or block-bodied arrow, direct or `.call(this)`, under unary
+ * operators), or the program.
  */
 const rootBody = (program: Program): { body: Statement[]; owner: Node } => {
     const statements = program.body.filter(
@@ -33,16 +32,12 @@ const rootBody = (program: Program): { body: Statement[]; owner: Node } => {
     while (call?.type === "UnaryExpression") call = call.argument;
     if (call?.type !== "CallExpression") return { body: program.body, owner: program };
     let fn: Node = call.callee;
-    // `(function () {...}).call(this)`: the same run, `this` being the script's own.
     if (fn.type === "MemberExpression" && propertyKey(fn) === "call" && call.arguments.length <= 1 && call.arguments.every((arg) => arg.type === "ThisExpression")) fn = fn.object;
     const block = (fn.type === "FunctionExpression" || fn.type === "ArrowFunctionExpression") && !fn.async && !fn.generator && fn.body?.type === "BlockStatement" ? fn.body : undefined;
     return block === undefined ? { body: program.body, owner: program } : { body: block.body, owner: fn };
 };
 
-/**
- * `G[k] = ...` / `G.k = ...` as a statement: the storage identifier, the key and the value. Also `(X = G).k = ...`,
- * which stores `G` somewhere first (jscrambler keeps the runtime as a global this way): the member is still `G`'s.
- */
+/** Also `(X = G).k = ...`, which stores `G` somewhere first (keeping the runtime as a global): the member is still `G`'s. */
 const storageAssignment = (statement: Statement): { object: string; key: string; right: Expression } | undefined => {
     if (statement.type !== "ExpressionStatement") return undefined;
     const e = statement.expression;
@@ -53,12 +48,9 @@ const storageAssignment = (statement: Statement): { object: string; key: string;
 };
 
 /**
- * How a call changed the owners (builtins, the global object), judged against what jscrambler's setup function does:
- * every property they had is unchanged, and every new one is an alias (on its owner it reads the same as a property
- * the owner already had, getters included) or a global. New globals (alias holders, accessors forwarding to host
- * properties the guest lacks) go with the setup call, so cleanup removes it only while the program doesn't name them
- * (`RuntimeModel.setupGlobals`). Any other effect makes the call something cleanup must keep: `unexpected` names the
- * first.
+ * Judged against what the setup function does: every existing property unchanged, every new one an alias (reads the
+ * same as an existing property, getters included) or a global. New globals go with the setup call, so cleanup removes
+ * it only while the program doesn't name them (`RuntimeModel.setupGlobals`). `unexpected` names the first other effect.
  */
 const setupEffects = (guest: Guest, change: OwnersChange): { unexpected: string | undefined; globals: string[] } => {
     const [changed] = change.changed;
@@ -75,13 +67,12 @@ const setupEffects = (guest: Guest, change: OwnersChange): { unexpected: string 
     return { unexpected: added === undefined ? undefined : `${pathName(guest.owners[added[0]] ?? [])}.${added[1]} added`, globals };
 };
 
-/** A static member chain rooted at the storage identifier, as its path on the storage object. */
 const storagePath = (node: Node, storage: string): PropertyPath | undefined => {
     const path = memberPath(node);
     return path !== undefined && path.root.type === "Identifier" && path.root.name === storage ? path.keys : undefined;
 };
 
-/** `function () { return typeof T === "function" ? T.apply(O, arguments) : T; }` with T on the storage object. */
+/** `function () { return typeof T === "function" ? T.apply(O, arguments) : T; }` */
 const wrapperOf = (fn: Expression, storage: string): Omit<Wrapper, "key" | "definition"> | undefined => {
     if (fn.type !== "FunctionExpression" || fn.body === null || fn.body.body.length !== 1) return undefined;
     const ret = fn.body.body[0];
@@ -100,10 +91,8 @@ const wrapperOf = (fn: Expression, storage: string): Omit<Wrapper, "key" | "defi
 };
 
 /**
- * The runtime's storage object: jscrambler declares it as an empty root function (`function G() {}`) and fills it
- * through root assignments (`G.k = ...`, `G[123] = ...`), wrappers among them. Of the names root statements assign
- * properties of, the one with most evidence: that declaration first, then the most wrapper definitions, then the
- * most assignments. Never the first by source order alone: when the best two tie, there is none.
+ * The root-assigned name with most evidence: an empty root function declaration (`function G() {}`), then most wrapper
+ * definitions, then most assignments. Never by source order alone: when the best two tie, there is none.
  */
 const storageOf = (body: readonly Statement[]): string | { ambiguous: string[] } | undefined => {
     const evidence = new Map<string, { declared: number; wrappers: number; assignments: number }>();
@@ -127,7 +116,6 @@ const storageOf = (body: readonly Statement[]): string | { ambiguous: string[] }
     return second !== undefined && same(best, second) ? { ambiguous: [best[0], second[0]] } : best[0];
 };
 
-/** Free names a statement needs from outside itself, split by whether the sandbox can provide them. */
 const freeNames = (statement: Statement, scopes: ScopeInfo, rootScopeNodes: ReadonlySet<Node>): string[] => {
     const names = new Set<string>();
     traverse(statement, {
@@ -143,8 +131,8 @@ const freeNames = (statement: Statement, scopes: ScopeInfo, rootScopeNodes: Read
 };
 
 /**
- * Root bindings a statement reads while it runs: references outside nested function bodies (those only run when
- * called), not counting the names it declares. Through any of them a real run of the statement can reach the runtime.
+ * Root bindings read outside nested function bodies, excluding its own declarations: through any of them a real run
+ * can reach the runtime.
  */
 const evaluatedRootNames = (statement: Statement, scopes: ScopeInfo, rootScopeNodes: ReadonlySet<Node>): string[] => {
     const names = new Set<string>();
@@ -162,11 +150,7 @@ const evaluatedRootNames = (statement: Statement, scopes: ScopeInfo, rootScopeNo
     return [...names];
 };
 
-/**
- * Statements that are the obfuscator runtime setting itself up: assignments to the storage object
- * (`G.k = ...`, `G[1] = ...`, also chained like `G[1].x = G`), and calls of root functions given storage values
- * (`setup(G.R_)`).
- */
+/** Storage assignments (also chained, `G[1].x = G`) and calls of root functions given storage values (`setup(G.R_)`). */
 const isRuntimeStatement = (statement: Statement, storage: string, declared: ReadonlySet<string>): boolean => {
     if (statement.type !== "ExpressionStatement") return false;
     const e = statement.expression;
@@ -181,7 +165,6 @@ const isRuntimeStatement = (statement: Statement, storage: string, declared: Rea
     return false;
 };
 
-/** The RUNTIME facts keyed by root statement, as emulate builds them. */
 interface StatementFacts {
     readonly executed: Set<Node>;
     readonly pure: Set<Node>;
@@ -190,11 +173,8 @@ interface StatementFacts {
 }
 
 /**
- * Carry statement facts over to the statements that replaced their statements (see `Facts.replaced`), dropping them
- * from the originals that left. Running to completion carries over to every replacement when every original ran:
- * together the replacements did what the originals did, so each of them ran to completion. The others describe one
- * statement's whole effect (none outside the storage object, defining the aliases, what it stored): split over
- * several statements they say nothing about each part, so they carry over only from one statement to one.
+ * See `Facts.replaced`. Running to completion carries to every replacement when every original ran: together they did
+ * what the originals did. The other facts describe one statement's whole effect, so they carry only one-to-one.
  */
 const carryStatementFacts = (statementFacts: StatementFacts, originals: readonly Node[], replacements: readonly Node[]): void => {
     const { executed, pure, setup, built } = statementFacts;
@@ -214,13 +194,8 @@ const carryStatementFacts = (statementFacts: StatementFacts, originals: readonly
 };
 
 /**
- * Run the obfuscator's runtime prelude inside the QuickJS sandbox and record what it does.
- *
- * Runs right after `unflatten` and before anything that rewrites the runtime, so the sandbox sees the runtime
- * exactly as the obfuscator wrote it (only restructured). Produces the RUNTIME fact: the storage object, which of
- * its keys hold the global object, builtin aliases, wrapper functions, and the results of every wrapper call the
- * prelude made (those drive the string decoder's shuffle and decide the opaque predicates around them).
- * Changes no code itself.
+ * Runs right after `unflatten` and before anything rewrites the runtime, so the sandbox sees it as the obfuscator wrote
+ * it. Produces the RUNTIME fact; changes no code.
  */
 export const emulate: Pass = {
     name: "emulate",
@@ -243,12 +218,10 @@ export const emulate: Pass = {
 
         const guest = await Guest.create();
         facts.onDispose(() => guest.dispose());
-        // Globals the guest has: builtins and the host model, plus whatever earlier statements define (the setup
-        // function's global aliases), so read again (when next needed) after each statement that ran.
+        // Grows with what earlier statements define (setup aliases): re-read after each statement that ran.
         let available: Set<string> | undefined;
         const before = guest.snapshot();
 
-        // Hoisting: every root function exists before the first statement runs.
         const declared = new Set<string>();
         const functions = new Set<string>();
         for (const statement of body) {
@@ -274,15 +247,13 @@ export const emulate: Pass = {
         const executed = new Set<Node>();
         const setupKeys = new Set<string>();
         const setupGlobals = new Set<string>();
-        /** For log lines: the setup call that installed each storage key, and after which each builtin property first appeared. */
         const installedBy = new Map<string, Statement>();
         const appearedAfter = new Map<string, Statement>();
         let lastSnapshot = before;
         const counts = { executed: 0, skipped: 0, failed: 0, mapped: 0 };
         const started = Date.now();
-        /** The first statement after which the guest may no longer match a real run: results stop being recorded. */
+        /** From here on the guest may no longer match a real run: results stop being recorded. */
         let diverged: Statement | undefined;
-        /** The guest's owner baseline is the state before the next statement (only running statements change owners). */
         let marked = false;
 
         for (const statement of body) {
@@ -291,9 +262,8 @@ export const emulate: Pass = {
                 log.warn(`emulation budget of ${TOTAL_BUDGET_MS}ms used up, stopping`, statement);
                 break;
             }
-            // The runtime's own statements always run: what they need (prototype getters, aliases from the setup
-            // function) only exists once earlier ones have run, so free-name analysis can't judge them. Anything
-            // else only runs when every free name is a builtin or a root declaration.
+            // Runtime statements always run: what they need only exists once earlier ones ran, so free-name analysis
+            // can't judge them. Others run only when every free name is a builtin or a root declaration.
             const isRuntime = isRuntimeStatement(statement, storage, declared);
             if (!isRuntime) {
                 const free = freeNames(statement, scopes, rootScopes);
@@ -312,18 +282,15 @@ export const emulate: Pass = {
             const isCall = statement.type === "ExpressionStatement" && statement.expression.type === "CallExpression";
             if (bound && !marked) marked = guest.markOwners();
             const tracked: boolean = bound && marked;
-            // What a setup call installs on the storage object: its getters (call aliases, probed or not).
             const callablesBefore = bound && isCall ? new Set(guest.ownCallables()) : undefined;
             const source = printStatement(statement);
             const result = guest.run(source, isRuntime ? RUNTIME_STATEMENT_TIMEOUT_MS : OTHER_STATEMENT_TIMEOUT_MS);
             marked = false;
             if (!result.ok) {
                 counts.failed++;
-                // Where in the statement (as printed for the guest) it threw, when the guest says.
                 const where = result.at === undefined ? "" : ` at \`${(source.split("\n")[result.at.line - 1] ?? "").slice(Math.max(0, result.at.column - 21), result.at.column + 40).trim()}\``;
                 log.debug(`failed: ${result.error}${where}`, statement);
-                // Calls it made before failing moved the runtime's state in a way no real run does; so may what it
-                // wrote before failing (or before its deadline), if it can reach the runtime at all.
+                // Calls (and, if it can reach the runtime, writes) made before failing moved state as no real run does.
                 const madeCalls = guest.takeCalls();
                 if (madeCalls.length > 0) {
                     log.debug(`it made ${madeCalls.length} runtime call(s) first: ${madeCalls.map((c) => `${c.key}(${c.args.map((a) => JSON.stringify(a)).join(", ")})`).join(" ")}`, statement);
@@ -337,7 +304,6 @@ export const emulate: Pass = {
             available = undefined;
             if (!bound) bound = guest.bind(storage);
 
-            // Effects outside the storage object decide what cleanup may remove later.
             const change: OwnersChange | undefined = tracked ? guest.ownersSince() : undefined;
             marked = change !== undefined;
             if (change !== undefined) {
@@ -372,7 +338,6 @@ export const emulate: Pass = {
                     wrappers.set(assignment.key, { key: assignment.key, ...found, definition: statement });
                     log.debug(`wrapper ${assignment.key} -> ${storage}.${found.target.join(".")}`, statement);
                 }
-                // A builder's result (`G.k = (function () {...})()`): what it stored, and its methods, as they are now.
                 const { right } = assignment;
                 if (right.type === "CallExpression" && right.arguments.length === 0 && (right.callee.type === "FunctionExpression" || right.callee.type === "ArrowFunctionExpression")) {
                     const identities = guest.built([assignment.key]);
@@ -380,8 +345,7 @@ export const emulate: Pass = {
                 }
             }
 
-            // Map the wrapper calls this statement made back to their call sites, in completion order (post-order).
-            // Sites inside nested functions don't count: those run again later, in another runtime state.
+            // Sites match calls in completion order (post-order); sites in nested functions run later, in another state.
             const logged = guest.takeCalls();
             if (logged.length === 0) continue;
             if (diverged !== undefined) {
@@ -430,7 +394,6 @@ export const emulate: Pass = {
         }
         if (diverged !== undefined) log.info("the emulated runtime may differ from a real run from here on; later call results weren't recorded", diverged);
 
-        // Aliases: properties added to builtins whose value equals an existing property of the same owner.
         const after = guest.snapshot();
         const aliases: Alias[] = [];
         for (const [index, owner] of guest.owners.entries()) {
@@ -445,7 +408,6 @@ export const emulate: Pass = {
             }
         }
 
-        // Call aliases: getters on the storage object returning a function whose zero-argument call gives a builtin.
         const callAliases = new Map<string, CallAlias>();
         if (bound) {
             for (const found of guest.callAliases()) {
@@ -461,8 +423,7 @@ export const emulate: Pass = {
                 log.debug(`call alias ${storage}.${found.key}(...) = ${shape}`, installedBy.get(found.key));
             }
         }
-        // Global reads: setup getters whose zero-argument call gives a global property the global object lacks (the
-        // random names the code locks probe with `typeof`).
+        // Globals the global object lacks (the random names code locks probe with `typeof`).
         const globalReads = new Map<string, string>();
         if (bound) {
             for (const { key, name } of guest.globalReads()) {
@@ -471,7 +432,6 @@ export const emulate: Pass = {
                 log.debug(`global read ${storage}.${key}() = globalThis.${name}`, installedBy.get(key));
             }
         }
-        // Host aliases: setup globals forwarding to a global property the guest lacks (`document`, `console`).
         const hostAliases = new Map<string, string>();
         if (setupGlobals.size > 0) {
             for (const { alias, name } of guest.hostAliases([...setupGlobals])) {

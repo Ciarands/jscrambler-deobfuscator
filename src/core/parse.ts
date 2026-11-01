@@ -3,7 +3,7 @@ import type { OxcError, Program } from "oxc-parser";
 import { SourceMap } from "./log.js";
 
 export class ParseError extends Error {
-    /** Formatted code frames, one per parser error. These repeat the whole source line, which can be huge in minified input. */
+    /** Codeframes repeat the whole source line, which can be huge in minified input. */
     readonly codeframes: readonly string[];
 
     constructor(message: string, codeframes: readonly string[]) {
@@ -18,12 +18,7 @@ const describe = (source: SourceMap, error: OxcError): string => {
     return start === undefined ? error.message : `${error.message} (${source.location(start)})`;
 };
 
-/**
- * Parse source into an ESTree program.
- *
- * `range` is always on: scope analysis needs it, and every node a pass creates must copy it.
- * Parenthesized expressions are not kept as separate nodes.
- */
+/** `range` is always on (scope analysis needs it). Parenthesized expressions are not kept as nodes. */
 export const parse = (code: string, filename = "input.js"): Program => {
     const result = parseSync(filename, code, {
         lang: "js",

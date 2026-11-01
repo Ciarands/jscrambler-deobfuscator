@@ -16,7 +16,6 @@ const isLiteral = (node: Node): boolean =>
     (node.type === "Literal" && !("regex" in node && node.regex !== undefined && node.regex !== null)) ||
     (node.type === "UnaryExpression" && (node.operator === "-" || node.operator === "!") && node.argument.type === "Literal");
 
-/** A lock call in a gate: the call and the lock's path. */
 interface GateCall {
     readonly call: CallExpression;
     readonly path: PropertyPath;
@@ -32,20 +31,14 @@ interface Gate {
 const GLOBAL_OBJECT_NAMES: ReadonlySet<string> = new Set(["globalThis", "window", "self"]);
 
 /**
- * Domain locks: tests like `G.k.m(0, false, 105006) === 349182763 || G.k.m(0, false, 314987) === 1310130950 || ...`
- * gating the program on a hash of the host (`location.hostname`) jscrambler computes at run time. Semantic model 5
- * says the environment passes the runtime's checks (user decision: domain locks included), so such a test holds
- * (`||` of `===`/`==`) or fails (`&&` of `!==`/`!=`; `!` flips either), and simplify keeps the branch the licensed
- * host takes.
+ * Domain locks: tests like `G.k.m(0, false, 105006) === 349182763 || ...` gating the program on a hash of the host.
+ * Model 5 says the environment passes the runtime's checks (domain locks included), so such a test holds (`||` of
+ * `===`/`==`) or fails (`&&` of `!==`/`!=`; `!` flips either).
  *
- * A lock method `G.k.m` qualifies when its builder reads the host (it names the global object; hashes of anything
- * else are hash-predicates' business, which evaluates them) and nothing can reach it but the gates' calls, which
- * code-locks' full mode asks too: every static reference to its holder key (on any object) is one of those calls, in
- * the builder's own statement, in an unused wrapper's definition, or done before the builder runs; and `G` is used as
- * a value or read with a computed key only before the builder runs, or to keep it as a global the program never names
- * again (model 2). A test qualifies when every one of its comparisons is a call of a qualifying lock, with literal
- * arguments, against a literal. Then the lock never runs again, so dropping its calls drops only its own work on its
- * builder's state, which nothing else reads, and cleanup removes the builder.
+ * A lock qualifies when its builder reads the host (other hashes are hash-predicates' business) and nothing reaches
+ * it but the gates' calls, as in code-locks' full mode (model 2). A test qualifies when every comparison is a
+ * literal-argument call of a qualifying lock against a literal. Dropping the calls drops no effect: a domain lock's
+ * code changes only objects its builder made (model 5, not proven).
  */
 export const domainLocks: Pass = {
     name: "domain-locks",
@@ -92,7 +85,6 @@ export const domainLocks: Pass = {
         });
         if (gates.length === 0) return { changed: 0 };
 
-        /** The gates' calls of each lock, by path. */
         const callsOf = new Map<string, GateCall[]>();
         for (const gate of gates) for (const call of gate.calls) callsOf.set(JSON.stringify(call.path), [...(callsOf.get(JSON.stringify(call.path)) ?? []), call]);
         const { dynamic } = survey(program, matcher, scopes);

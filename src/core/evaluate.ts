@@ -7,20 +7,11 @@ export const FAIL: Evaluation = { ok: false };
 export const value = (v: Value): Evaluation => ({ ok: true, value: v });
 
 export interface EvaluateEnv {
-    /**
-     * Whether an identifier named `undefined`, `NaN`, `Infinity` or `atob` really is the global (not shadowed).
-     * Without this, those names are not evaluated.
-     */
+    /** Confirms `undefined`/`NaN`/`Infinity`/`atob` aren't shadowed; without it those names don't evaluate. */
     readonly isGlobal?: (identifier: Node) => boolean;
-    /**
-     * Value of an expression the evaluator can't see through by itself (variables, `arguments` array slots,
-     * string decoder calls...). Return `FAIL` when unknown. Consulted before the built-in rules.
-     */
+    /** Consulted before the built-in rules; return `FAIL` when unknown. */
     readonly lookup?: (node: Expression) => Evaluation;
-    /**
-     * Results per node, for callers that evaluate many overlapping subtrees in one walk (a fold at every node of a
-     * chain). Only valid while the nodes aren't changed in place.
-     */
+    /** Only valid while the nodes aren't changed in place. */
     readonly cache?: WeakMap<Node, Evaluation>;
 }
 
@@ -30,7 +21,6 @@ const GLOBAL_CONSTANTS = new Map<string, Value>([
     ["Infinity", Number.POSITIVE_INFINITY],
 ]);
 
-/** A literal that makes a fresh object without running anything: `[]` / `[1, "a"]`, `{}`, a function. */
 const isInertObject = (node: Node): boolean =>
     (node.type === "ArrayExpression" && node.elements.every((element) => element === null || element.type === "Literal")) ||
     (node.type === "ObjectExpression" && node.properties.length === 0) ||
@@ -39,7 +29,6 @@ const isInertObject = (node: Node): boolean =>
 
 /** JS binary operators on primitives. Values are always primitives here, so these can't run user code. */
 export const binary = (operator: string, left: Value, right: Value): Evaluation => {
-    // Primitives only: the casts below never reach valueOf/toString on an object.
     const l = left as number;
     const r = right as number;
     switch (operator) {
@@ -90,10 +79,7 @@ export const binary = (operator: string, left: Value, right: Value): Evaluation 
 
 const typeOf = (v: Value): string => (v === null ? "object" : typeof v);
 
-/**
- * Evaluate an expression to a primitive without running anything. Only side-effect-free expressions over known
- * values evaluate; anything else gives `{ ok: false }`.
- */
+/** Primitive value of a side-effect-free expression over known values, without running anything. */
 export const evaluate = (node: Node, env: EvaluateEnv = {}): Evaluation => {
     const { cache } = env;
     const visit = (n: Node): Evaluation => {

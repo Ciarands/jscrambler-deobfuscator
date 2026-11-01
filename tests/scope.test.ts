@@ -27,7 +27,6 @@ describe("scope analysis", () => {
     });
 });
 
-/** `program`'s statements as expression statements, with their expressions. */
 const statements = (program: Program) => program.body.map((statement) => statement as ExpressionStatement);
 
 describe("scope analysis: parents", () => {
@@ -37,7 +36,6 @@ describe("scope analysis: parents", () => {
         const [first, second] = statements(program);
         expect(scopes.parentOf(first!.expression)).toBe(first);
         expect(scopes.parentOf(first!)).toBe(program);
-        // Move the second statement's expression into the first, take the second out.
         const moved = second!.expression;
         first!.expression = moved;
         program.body.pop();

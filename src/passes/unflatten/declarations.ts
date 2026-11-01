@@ -8,8 +8,6 @@ import { refuse } from "./match.js";
 import type { NodeId } from "./structure.js";
 
 /**
- * What unflattening does to declarations, and how to keep every binding exactly as it was.
- *
  * The case bodies of a machine share one block scope (the switch's), entered afresh on every dispatch. Unflattening
  * spreads them over plain blocks and drops the cases that can never run, so:
  *
@@ -21,7 +19,7 @@ import type { NodeId } from "./structure.js";
  *   to a block wrapped around the rebuilt code (`hoistable` says when that is exact).
  */
 
-/** A declaration scoped to the statement list it sits in, other than a function (those are handled separately). */
+/** Functions are handled separately. */
 const isLexicalDeclaration = (s: Statement): boolean => (s.type === "VariableDeclaration" && s.kind !== "var") || s.type === "ClassDeclaration";
 
 /**
@@ -113,10 +111,7 @@ export interface CaseDeclarations {
     readonly vars: Set<string>;
 }
 
-/**
- * The declarations of `machine`'s cases once unflattened (see the top of this file). `reachable` are the states the
- * entry reaches; `callees` the identifiers in the machine called directly (`g(...)`).
- */
+/** `reachable`: the states the entry reaches; `callees`: identifiers in the machine called directly (`g(...)`). */
 export const caseDeclarations = (
     scopes: ScopeInfo,
     machine: Machine,

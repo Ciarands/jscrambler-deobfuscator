@@ -10,7 +10,6 @@ import { silentLogger } from "../src/logger.js";
 import { unflatten } from "../src/passes/unflatten/index.js";
 import { runPipeline } from "../src/pipeline/run.js";
 
-/** What `f()` returns (or throws), as JSON. */
 const run = (code: string): string => {
     const context: Record<string, unknown> = {};
     try {
@@ -21,7 +20,6 @@ const run = (code: string): string => {
     }
 };
 
-/** Unflatten `source`; returns the output, whether a machine is left, and both behaviours. */
 const unflattened = async (source: string) => {
     const { code } = await deobfuscate(source, { passes: ["unflatten"] });
     return { code, flat: code.includes("switch"), expected: run(source), got: run(code) };
@@ -228,7 +226,6 @@ function f() {
     });
 });
 
-/** Nodes reachable from `root` more than once (the same object in two places). */
 const sharedNodes = (root: Node): Node[] => {
     const seen = new Set<Node>();
     const shared: Node[] = [];
@@ -271,7 +268,6 @@ function f() {
     });
 });
 
-/** A machine whose one case builds a class with members decorated by `decorator`. */
 const decoratedMachine = (decorator: string): string => `
 function f() {
   var x;

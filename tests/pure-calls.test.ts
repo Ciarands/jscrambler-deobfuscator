@@ -2,7 +2,6 @@ import { createContext, runInContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 
-/** What a script leaves in `result`, run in a fresh global with a host function `host` that records its calls. */
 const observed = (source: string): string => {
     const context = createContext({});
     runInContext("var hostCalls = []; function host(x) { hostCalls.push(x); return x; }", context);

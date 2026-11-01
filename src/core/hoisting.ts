@@ -3,7 +3,6 @@ import { isFunctionNode } from "./ast.js";
 import { at } from "./build.js";
 import { forEachChild } from "./traverse.js";
 
-/** The names a binding pattern declares: `a`, `{ a, b: [c] }`, `[d = 1, ...e]`. */
 export const bindingNames = (pattern: Node, names: Set<string> = new Set()): Set<string> => {
     switch (pattern.type) {
         case "Identifier":
@@ -28,9 +27,8 @@ export const bindingNames = (pattern: Node, names: Set<string> = new Set()): Set
 };
 
 /**
- * Visit what a subtree declares for its whole function, wherever in it they sit, in source order: `var` names, and
- * block functions (sloppy-mode Annex B gives them a function-scoped binding too). Nested functions are their own scope
- * and not searched; a function declaration is reported, not entered.
+ * `var` names and block functions (Annex B binds them function-wide too), in source order. Nested functions aren't
+ * searched; a function declaration is reported, not entered.
  */
 const visitHoisted = (node: Node, onVar: (name: string) => void, onFunction: (declaration: FunctionDeclaration) => void): void => {
     if (node.type === "VariableDeclaration" && node.kind === "var") {
@@ -44,7 +42,6 @@ const visitHoisted = (node: Node, onVar: (name: string) => void, onFunction: (de
     forEachChild(node, (child) => visitHoisted(child, onVar, onFunction));
 };
 
-/** Names a subtree declares for its whole function: `var`s and block functions (see `visitHoisted`). */
 export const hoistedNames = (node: Node, names: Set<string> = new Set()): Set<string> => {
     visitHoisted(
         node,
@@ -56,10 +53,7 @@ export const hoistedNames = (node: Node, names: Set<string> = new Set()): Set<st
     return names;
 };
 
-/**
- * `hoistedNames`, split by kind. A block function only binds its name for the whole function when Annex B applies
- * (sloppy mode, no clashing lexical declaration on the way up), which takes scope analysis to decide; `var`s always do.
- */
+/** Block functions are reported separately: whether Annex B applies needs scope analysis. */
 export const hoistedDeclarations = (node: Node, into: { readonly vars: Set<string>; readonly functions: FunctionDeclaration[] }): void =>
     visitHoisted(
         node,
@@ -67,7 +61,6 @@ export const hoistedDeclarations = (node: Node, into: { readonly vars: Set<strin
         (declaration) => into.functions.push(declaration)
     );
 
-/** `var a, b;` / `let a, b;` with no initializers, or nothing when there are no names. */
 export const placeholderDeclaration = (kind: "var" | "let", names: ReadonlySet<string>, origin: Node): VariableDeclaration[] =>
     names.size === 0
         ? []
@@ -83,17 +76,13 @@ export const placeholderDeclaration = (kind: "var" | "let", names: ReadonlySet<s
               ),
           ];
 
-/** What a removed statement list leaves behind: `var x;`/`let x;` placeholders and function declarations (kept whole). */
 export const isPlaceholder = (s: Statement): boolean =>
     s.type === "FunctionDeclaration" || (s.type === "VariableDeclaration" && (s.kind === "var" || s.kind === "let") && s.declarations.every((d) => d.init === null));
 
 /**
- * The statements that must stay when `dead` (statements of one list that can never run) is removed, so that no binding
- * changes scope:
- * - `var` names and Annex B function names from anywhere inside: `var a, b;` (their binding is the function's);
- * - `let`/`const`/`class` names declared directly in the list: `let c;` (still in their temporal dead zone, as the
- *   originals would be forever: every access keeps throwing, nothing rebinds to an outer `c`);
- * - function declarations of the list itself, whole: they're hoisted with their body and may be called.
+ * What must stay when unreachable `dead` statements are removed, so no binding changes scope: `var`/Annex B names as
+ * `var x;`; the list's own `let`/`const`/`class` names as `let c;` (forever in TDZ, as the originals were, so nothing
+ * rebinds to an outer `c`); the list's function declarations whole (hoisted, may be called).
  */
 export const deadRemainder = (dead: readonly Statement[], origin: Node): Statement[] => {
     const varNames = new Set<string>();

@@ -9,14 +9,8 @@ import { storageAnalysis } from "./emulate/effects.js";
 /**
  * Global proxy: `G[k]` (where the emulated prelude left the global object) becomes `globalThis`.
  *
- * jscrambler's prelude stores the global object, found through an `Object.prototype` getter, on its storage object and
- * reaches globals through it (`G[611277].String`). Only reads of those slots are rewritten; `G` stays its own object
- * (main rewrote all of `G` to the global object, so `G[0] = ...` landed on `window[0]`). The definition
- * (`G[k] = (function () { ... })()`) is left for cleanup.
- *
- * A read is rewritten only where it sees the snapshot's value (nothing writes `G[k]` later, and it doesn't run while
- * the prelude is still setting it up) and where `globalThis` isn't a local name. The storage binding is told apart
- * from same-named locals by scope; locals that only ever hold `G` (`var g = G;`) count as `G`.
+ * Only reads of those slots are rewritten; `G` stays its own object (so `G[0] = ...` doesn't land on `window[0]`).
+ * A read is rewritten only where it sees the snapshot's value and `globalThis` isn't a local name.
  */
 export const globalProxy: Pass = {
     name: "global-proxy",

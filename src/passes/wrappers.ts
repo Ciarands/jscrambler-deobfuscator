@@ -33,10 +33,9 @@ const isInert = (node: Node): boolean => {
 };
 
 /**
- * Why the arguments of `call`, run before the inlined call reads its target (the wrapper reads it after them), could
- * see another target, if they could. Not when they run no code. Not either when nothing can change the target
- * meanwhile: its object is reached only through `G`'s paths (so model 3 covers every change to it), and no code that
- * names those paths changes the target or its object after the prelude. `site` is the call's reference to `G`.
+ * Why the arguments of `call`, run before the inlined call reads its target, could see another target, if they could.
+ * Safe when they run no code, or when the target's object is reached only through `G`'s paths (model 3) and nothing
+ * naming those paths changes it after the prelude.
  */
 const reorderingRisk = (call: CallExpression, target: PropertyPath, site: Node, effects: StorageEffects): string | undefined => {
     if (call.arguments.every((arg) => arg.type !== "SpreadElement" && isInert(arg))) return undefined;
@@ -47,20 +46,14 @@ const reorderingRisk = (call: CallExpression, target: PropertyPath, site: Node, 
 };
 
 /**
- * Wrapper inlining by target kind (#5): `G.w = function () { return typeof T === "function" ? T.apply(O, arguments) : T; }`
- * with `T = O.m`.
+ * Wrapper inlining (#5): `G.w = function () { return typeof T === "function" ? T.apply(O, arguments) : T; }`.
  *
- * - Function targets: `G.w(a, b)` -> `O.m(a, b)`, when O is T's own object. The wrapper reads T after evaluating the
- *   arguments, the inlined call before: the same only when reading T runs no code (data properties all the way,
- *   checked in the runtime) and the arguments can't change T (see `reorderingRisk`: the decoder swaps its accessor on
- *   its holder, which a closure of the runtime keeps, on its first call). Other calls keep their wrapper.
- * - Value targets: only `G.w()` -> `T` (arguments would be evaluated by the original, and ignored).
+ * - Function targets: `G.w(a, b)` -> `O.m(a, b)`. The wrapper reads T after the arguments, the inlined call before:
+ *   the same only when reading T runs no code and the arguments can't change T (`reorderingRisk`).
+ * - Value targets: only `G.w()` -> `T`.
  *
- * The kind is the snapshot's, so a call is only inlined where nothing writes T or a prefix of it after the prelude (the
- * convention resolve-calls follows for a wrapper's target: objects handed to calls as `this` are left out). The call
- * site's own storage reference (possibly a local alias of `G`) becomes the root of the inlined path, so no name is
- * introduced that could be shadowed there. A call is only inlined where `G.w` still is the wrapper when it runs
- * (nothing writes it after the prelude).
+ * The kind is the snapshot's, so only where nothing writes `G.w`, T or a prefix after the prelude. The site's own
+ * storage reference roots the inlined path, so no shadowable name is introduced.
  */
 export const wrappers: Pass = {
     name: "wrappers",
@@ -83,8 +76,6 @@ export const wrappers: Pass = {
                 log.debug(`wrapper ${key}: can't read ${name}, left`, wrapper.definition);
                 continue;
             }
-            // The wrapper reads T after its arguments are evaluated; the inlined call reads it before. Only the same
-            // when reading T runs no code (data properties all the way).
             if (!info.data) {
                 log.debug(`wrapper ${key}: ${name} is reached through an accessor, left`, wrapper.definition);
                 continue;

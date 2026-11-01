@@ -2,7 +2,6 @@ import { createContext, runInContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 
-/** What a script leaves in `result`, run in a fresh global where `window` is the global object (as in a browser). */
 const observed = (source: string): string => {
     const context = createContext({});
     context.window = runInContext("this", context);
@@ -12,7 +11,7 @@ const observed = (source: string): string => {
 
 const simplified = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["simplify"] })).code;
 
-/** A string table at the top of the script, as jscrambler builds it: decoder calls still run, in sequences. */
+/** A top-level string table whose decoder calls still run, in sequences. */
 const TABLE = `var log = [];
 var T;
 T = [(log.push("built"), "get"), "set", , 3];
@@ -70,7 +69,6 @@ result = G();
         const output = await simplified(program);
         expect(observed(output)).toBe(observed(program));
         expect(output).toContain("return 42;");
-        // `early` also runs before `u` is set.
         expect(output).toContain("return typeof u;");
         // A definition inside the declaration itself: its earlier reads run first in each call.
         const inside = `var F = function () {\n  var k;\n  function g() {\n    var r = typeof k;\n    k = 5;\n    return r;\n  }\n  return [g(), g()];\n};\nresult = F();\n`;
@@ -322,7 +320,6 @@ a();
         const output = await simplified(program);
         expect(observed(output)).toBe(observed(program));
         expect(output).toContain(`result = ["set", "get", 4, undefined, 3, log];`);
-        // Building the table still runs its calls.
         expect(output).toContain(`T = [(log.push("built"), "get"), "set", , 3];`);
     });
 

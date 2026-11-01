@@ -2,7 +2,7 @@ import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 
-// jscrambler's matrix: a prelude builder makes rows that point at each other; opaque predicates compare cells.
+// Matrix: a prelude builder makes rows that point at each other; opaque predicates compare cells.
 const MATRIX = `
 var seen = 0;
 function G() {}
@@ -16,7 +16,6 @@ G.k = (function (n) {
 
 const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "storage-comparisons"] })).code;
 
-/** What a script leaves in `result`; `setTimeout` callbacks (code after the prelude) run once it has finished. */
 const observed = (source: string): string => {
     const timers: (() => void)[] = [];
     const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };

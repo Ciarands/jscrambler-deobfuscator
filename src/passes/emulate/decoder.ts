@@ -31,20 +31,18 @@ import { rootStatements } from "./storage.js";
  *         return Q;
  *     })();
  *
- * What the proof needs from the template, by variable: `Q` is the builder's holder, referenced only by its declaration,
- * `return Q` and the freeze writes `Q.m = L`; `S` only by its declaration and `return S`; `L` only by its declaration and
- * in S's lookup exits; `R` only by its declaration (a number), S's guards and S's increments (by positive constants, on
- * stage paths only); the parameter `x` only read by S's guards and lookup exits; `T` only by L's read, by S's stage
- * bodies (shuffles) and by F's own top-level code before and in its last write, which splits a string.
+ * The proof needs: `Q` referenced only by its declaration, `return Q` and freeze writes `Q.m = L`; `S` only by its
+ * declaration and `return S`; `L` only by its declaration and S's lookup exits; `R` only by its declaration (a number),
+ * S's guards and S's increments (positive constants, stage paths only); `x` only read by S's guards and lookup exits;
+ * `T` only by L's read, S's stage bodies (shuffles) and F's top-level code up to its last write, which splits a string.
  */
 interface Template {
     readonly stages: readonly { readonly state: number; readonly argument: number | undefined }[];
-    /** What a stage body adds to `R`, and how S's last statement returns it: `R`, `R++` (`post`), `++R` (`pre`). */
+    /** `bodyStep`: what a stage body adds to `R`; `tail`: S returns `R`, `R++` (`post`) or `++R` (`pre`). */
     readonly bodyStep: number;
     readonly tail: "after" | "post" | "pre";
 }
 
-/** The names S's template binds, as they're found. */
 interface Bindings {
     readonly holder: Variable;
     readonly argument: Variable;
@@ -53,14 +51,13 @@ interface Bindings {
     table: Variable | undefined;
 }
 
-/** The declarator of a variable declared once, by a `var`/`let`/`const` statement in `body`. */
 const declaratorIn = (variable: Variable, body: readonly Statement[]): VariableDeclarator | undefined => {
     const [def] = variable.defs;
     if (variable.defs.length !== 1 || def?.type !== "Variable" || !body.includes(def.parent as unknown as Statement)) return undefined;
     return def.node as unknown as VariableDeclarator;
 };
 
-/** Statements of a function with a block body (an arrow's included). */
+/** Arrows included. */
 const blockOf = (fn: Node): readonly Statement[] | undefined =>
     (fn.type === "FunctionExpression" || fn.type === "ArrowFunctionExpression") && fn.body?.type === "BlockStatement" ? fn.body.body : undefined;
 
@@ -71,47 +68,38 @@ const numberOf = (node: Node): number | undefined => {
     return undefined;
 };
 
-/** The conjuncts of `a && b && c`. */
 const conjuncts = (test: Expression): Expression[] => (test.type === "LogicalExpression" && test.operator === "&&" ? [...conjuncts(test.left), ...conjuncts(test.right)] : [test]);
 
-/** A plain (not async or generator) function expression or arrow. */
 const plainFunction = (node: Node): FunctionNode | undefined =>
     (node.type === "FunctionExpression" || node.type === "ArrowFunctionExpression") && !node.async && !node.generator ? (node as FunctionNode) : undefined;
 
-/** The one function a local is bound to by its declaration in `body` (`var L = function (y) {...}`). */
 const localFunction = (variable: Variable, body: readonly Statement[]): FunctionNode | undefined => {
     const init = declaratorIn(variable, body)?.init;
     return init === null || init === undefined ? undefined : plainFunction(init);
 };
 
-/** Two number arguments (a splice's start and count). */
 const twoNumbers = (args: readonly Node[]): boolean => args.length === 2 && args.every((arg) => numberOf(arg) !== undefined);
 
 const isStringLiteral = (node: Node | undefined): boolean => node?.type === "Literal" && typeof node.value === "string";
 
-/** What the decoder proof found: recorded calls that were pure lookups, and the wrapper keys of settled decoders. */
 export interface DecoderProof {
     readonly lookups: ReadonlySet<LoggedCall>;
     /**
-     * Wrappers whose target is a decoder settled during the prelude and still in place after it (`G.k` is `Q`, `G.k.m`
-     * is S or L): a later call of them is a pure lookup unless something writes `G.k` or `G.k.m` after the prelude.
+     * Wrappers whose decoder settled during the prelude and stayed in place: a later call is a pure lookup unless
+     * something writes `G.k` or `G.k.m` after the prelude.
      */
     readonly settled: ReadonlySet<string>;
-    /**
-     * Targets (`JSON.stringify` of `[k, m]`) that follow the template, settled or not: a call of one writes nothing but
-     * the decoder's own state (`T`, `R`, `Q.m`), all reachable only through `G.k`.
-     */
+    /** Targets (`JSON.stringify` of `[k, m]`) following the template: a call writes only state reachable through `G.k`. */
     readonly templated: ReadonlySet<string>;
-    /** The recorded call that settled each decoder in `settled`: calls made after it can't drive a stage. */
+    /** Calls made after the settling call can't drive a stage. */
     readonly settlingCalls: ReadonlySet<LoggedCall>;
 }
 
-/** The decoder proof resolve-calls made, for cleanup: stage calls of templated decoders only touch their own state. */
+/** For cleanup: stage calls of templated decoders only touch their own state. */
 export const DECODER_PROOF = factKey<DecoderProof>("decoder proof");
 
 /**
- * Which recorded calls of jscrambler's string decoders were pure table lookups (see `Template`), and which decoders
- * are settled once the prelude is done.
+ * Which recorded decoder calls were pure table lookups (see `Template`), and which decoders are settled after the prelude.
  *
  * Proof, per decoder `G.k.m`. The template makes `S` write only `T`, `R` (stage paths) and `Q.m` (lookup exits, only
  * ever to `L`), and return `L(x)`, which only reads `T[x]`, on every path but the stage paths; a stage path requires
@@ -139,18 +127,16 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
     const settlingCalls = new Set<LoggedCall>();
     const { storage, wrappers, aliases, callAliases } = runtime;
     const originals = new Map(aliases.map((alias) => [`${pathName(alias.owner)}.${alias.alias}`, alias.original]));
-    /** The builtin `owner.name` stands for: an alias's original, or the name itself (relies on model 7: builtins intact). */
+    /** An alias's original, or the name itself (relies on model 7: builtins intact). */
     const builtin = (owner: string, name: string | undefined): string | undefined => (name === undefined ? undefined : (originals.get(`${owner}.${name}`) ?? name));
-    /** The call alias `G.key(...)` is, as `owner.original`. */
+    /** As `owner.original`. */
     const callAliasOf = (callee: Node): string | undefined => {
         if (callee.type !== "MemberExpression" || !matcher.isStorage(callee.object)) return undefined;
         const alias = callAliases.get(propertyKey(callee) ?? "");
         return alias === undefined ? undefined : `${pathName(alias.owner)}.${alias.original}`;
     };
 
-    // Wrapper targets `G.k.m`, and the root statements assigning `G.k`.
     const targets = new Map<string, PropertyPath>();
-    /** The target id (`JSON.stringify` of its path) each wrapper key calls. */
     const targetOf = new Map<string, string>();
     for (const wrapper of wrappers.values()) {
         if (wrapper.target.length !== 2) continue;
@@ -218,8 +204,7 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
             `decoder ${name}: settled by its recorded call ${stage} = ${String(settled.result)}, which leaves its counter past all ${template.stages.length} stage guards; ${count} later recorded call(s) are pure lookups`,
             statement
         );
-        // Later calls are lookups too while G.k is still Q and G.k.m still S or L: so the prelude must leave them there
-        // (what may change them afterwards is the storage analysis' question, per call site).
+        // Later calls are lookups only if the prelude leaves G.k at Q and G.k.m at S or L.
         const current = runtime.guest.stateKey(target);
         if (runtime.guest.stateKey([key]) !== `o:${holderId}` || (current !== `o:${stageId}` && (lookupId === undefined || current !== `o:${lookupId}`))) {
             log.debug(
@@ -234,7 +219,6 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
     if (settledKeys.size > 0) log.info(`${settledKeys.size} wrapper(s) of string decoders proven settled during the prelude; ${lookups.size} recorded call(s) on them were pure lookups`);
     return { lookups, settled: settledKeys, templated, settlingCalls };
 
-    /** The template's facts, or why the builder statement doesn't follow it. */
     function templateOf(statement: Statement, method: string): Template | string {
         if (statement.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression" || statement.expression.operator !== "=")
             return "its holder isn't assigned by a plain assignment";
@@ -273,7 +257,6 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
         const { state, lookup, table } = bindings;
         if (state === undefined || lookup === undefined || table === undefined) return "the stage function's names weren't all found";
 
-        // Every reference to the template's names is one it allows.
         const only = (variable: Variable, allowed: (identifier: Node) => boolean): boolean =>
             scopes.staticReferences(variable).every((reference) => {
                 const identifier = reference.identifier as unknown as Node;
@@ -290,14 +273,12 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
         return tableProblem ?? stage;
     }
 
-    /** S's statements: lookup exits, the stage chain, the tail return. Binds R, L and T on the way. */
     function matchStage(fn: FunctionNode, method: string, setupBody: readonly Statement[], bindings: Bindings, accepted: Set<Node>): Template | string {
         const body = blockOf(fn);
         const tail = body?.at(-1);
         const chain = body?.at(-2);
         if (body === undefined || tail?.type !== "ReturnStatement" || tail.argument === null || chain?.type !== "IfStatement")
             return "the stage function doesn't end in its stage chain and a return of its counter";
-        // The tail return: `return R`, `return R++`, `return ++R`.
         const returned = tail.argument;
         const counter = returned.type === "UpdateExpression" && returned.operator === "++" ? returned.argument : returned;
         if (counter.type !== "Identifier") return "the stage function doesn't return its counter";
@@ -306,7 +287,6 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
         accepted.add(counter);
         const tailKind = returned.type === "UpdateExpression" ? (returned.prefix ? "pre" : "post") : "after";
 
-        // The chain: stage branches, then the freeze (which names L, and through it T).
         const branches: { test: Expression; body: Node }[] = [];
         let link: Node = chain;
         while (link.type === "IfStatement") {
@@ -343,7 +323,7 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
         return { stages, bodyStep, tail: tailKind };
     }
 
-    /** `{ [Q.m = L;] [if (true) { Q.m = L; }] return L(x); }`: writes L to Q.m, then looks x up. */
+    /** `{ [Q.m = L;] [if (true) { Q.m = L; }] return L(x); }` */
     function lookupExit(node: Node, method: string, bindings: Bindings, accepted: Set<Node>): string | undefined {
         const statements = node.type === "BlockStatement" ? node.body : [node as Statement];
         const last = statements.at(-1);
@@ -376,7 +356,6 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
         return undefined;
     }
 
-    /** L's body `return T[y]` (or `y => T[y]`): binds T. */
     function bindTable(fn: Node, bindings: Bindings, accepted: Set<Node>): string | undefined {
         const lookupFn = plainFunction(fn);
         const [param] = lookupFn?.params ?? [];
@@ -402,7 +381,7 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
         return undefined;
     }
 
-    /** `R === c && x === d` (either order, either side): the counter's guard and the argument it wants. */
+    /** `R === c && x === d`, either order and side. */
     function guardOf(test: Expression, bindings: Bindings, accepted: Set<Node>): { state: number | undefined; argument: number | undefined } | string {
         let state: number | undefined;
         let argument: number | undefined;
@@ -420,7 +399,6 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
         return { state, argument };
     }
 
-    /** A stage body: counter increments and table shuffles. What it adds to the counter, or why it isn't one. */
     function stageBody(node: Node, bindings: Bindings, accepted: Set<Node>): number | string {
         let step = 0;
         for (const statement of node.type === "BlockStatement" ? node.body : [node as Statement]) {
@@ -444,14 +422,13 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
         return step;
     }
 
-    /** `T` itself. */
     function isTable(node: Node, bindings: Bindings, accepted: Set<Node>): boolean {
         if (node.type !== "Identifier" || scopes.variableOf(node) !== bindings.table) return false;
         accepted.add(node);
         return true;
     }
 
-    /** `X.splice(a, b)` / `G.splice(X, a, b)` with `X` as `inner` says (relies on model 7: builtins intact). */
+    /** `X.splice(a, b)` / `G.splice(X, a, b)` (relies on model 7: builtins intact). */
     function splice(node: Node, inner: (node: Node) => boolean): boolean {
         if (node.type !== "CallExpression") return false;
         const { callee } = node;
@@ -461,9 +438,8 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
     }
 
     /**
-     * `T.unshift.apply(T, T.splice(a, b).splice(c, d))`, or with call aliases `G.apply(G.unshift(), T, G.splice(G.splice(T,
-     * a, b), c, d))`: moves some of T's own elements to its front, and hands T to builtins only as their receiver
-     * (relies on model 7: builtins intact).
+     * `T.unshift.apply(T, T.splice(a, b).splice(c, d))` or its call-alias form: hands T to builtins only as their
+     * receiver (relies on model 7: builtins intact).
      */
     function shuffle(node: Node, bindings: Bindings, accepted: Set<Node>): boolean {
         if (node.type !== "CallExpression") return false;
@@ -498,14 +474,11 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
         );
     }
 
-    /**
-     * T's references: L's read, the stage bodies' (accepted), and the setup's own top-level code up to its last write,
-     * a top-level statement that splits T, until which T is a string (only string literals and `+=` write it).
-     */
+    /** T is a string (only literals and `+=` write it) until the setup's top-level statement that splits it. */
     function checkTable(table: Variable, setup: FunctionNode, setupBody: readonly Statement[], accepted: ReadonlySet<Node>): string | undefined {
         if (table.scope.block !== (setup as never)) return "the table isn't a local of the setup";
         const parents = parentsWithin(setup);
-        /** The index of the setup's top-level statement a node is in (positions don't tell: passes before moved code). */
+        /** By containing statement: positions don't tell, as earlier passes moved code. */
         const statementIndex = (node: Node): number => {
             let current: Node | undefined = node;
             while (current !== undefined && !setupBody.includes(current as Statement)) current = parents.get(current);
@@ -542,7 +515,7 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
         return undefined;
     }
 
-    /** `T.split(s)` / `G.split(T, s)` with `s` a string literal: a fresh array of strings (relies on model 7: builtins intact). */
+    /** With `s` a string literal: a fresh array of strings (relies on model 7: builtins intact). */
     function splits(value: Node, table: Variable): boolean {
         if (value.type !== "CallExpression") return false;
         const isTableName = (node: Node | undefined): boolean => node?.type === "Identifier" && scopes.variableOf(node) === table;
@@ -553,18 +526,13 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
     }
 };
 
-/** The name a non-computed object-literal key gives its property. */
 const propertyName = (key: Node): string | undefined => {
     if (key.type === "Identifier") return key.name;
     if (key.type === "Literal" && (typeof key.value === "string" || typeof key.value === "number")) return String(key.value);
     return undefined;
 };
 
-/**
- * The first recorded call, made while the guest followed a real run, that settled the decoder: a call on S (on the
- * holder the builder made) that left S in place, took a stage path (a number result: see `decoderLookups`) and left
- * the counter past every stage guard, consistently with the stage table.
- */
+/** The first call, made while the guest followed a real run, leaving S in place and the counter past every guard. */
 const settlingCall = (calls: readonly LoggedCall[], order: ReadonlyMap<LoggedCall, number>, template: Template, holderId: number, stageId: number): LoggedCall | undefined => {
     const highest = Math.max(...template.stages.map((stage) => stage.state));
     return calls.find((call) => {

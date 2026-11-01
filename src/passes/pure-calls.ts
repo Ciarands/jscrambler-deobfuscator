@@ -14,11 +14,7 @@ import { replaceNodes, traverse } from "../core/traverse.js";
 import { factKey } from "../pipeline/facts.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
 
-/**
- * Global names a pure function may use: values, and builtins whose functions compute from their arguments (model 7:
- * the builtins are the standard ones). The few of their functions that don't (`Math.random`, the locale-dependent
- * ones...) throw in the pure realm (see `HARDEN`).
- */
+/** Builtins compute from their arguments (model 7); the few that don't throw in the pure realm (`HARDEN`). */
 const PURE_GLOBALS: ReadonlySet<string> = new Set([
     "undefined",
     "NaN",
@@ -42,15 +38,13 @@ const PURE_GLOBALS: ReadonlySet<string> = new Set([
     "unescape",
 ]);
 
-/** Names a pass may have created since the scope analysis (`valueToNode`): the globals when nothing declares them. */
+/** A pass may have created these since the scope analysis (`valueToNode`). */
 const VALUE_NAMES: ReadonlySet<string> = new Set(["undefined", "NaN", "Infinity"]);
 
 /**
- * The node types a pure function may contain. Left out: what reaches state outside the call (`this`, `super`,
- * `import.meta`, `new.target`, `import()`), what runs later or elsewhere (`yield`, `await`, classes), what makes
- * strict-mode evaluation differ from sloppy (`try`, which could catch the strict-mode error of a write the program's
- * sloppy code would let fail silently; `with`), tagged templates (their strings object is cached per site, shared
- * between calls), and `debugger`.
+ * Left out: what reaches state outside the call (`this`, `super`, `import.meta`, `new.target`, `import()`), what
+ * runs later (`yield`, `await`, classes), `try` (could catch a strict-mode error the sloppy program ignores), `with`,
+ * tagged templates (strings object cached per site), `debugger`.
  */
 const ALLOWED: ReadonlySet<string> = new Set([
     "BlockStatement",
@@ -101,20 +95,13 @@ const ALLOWED: ReadonlySet<string> = new Set([
 ]);
 
 /**
- * Turns the pure realm's builtins into ones a pure function can't tell apart from the program's (model 7) or that
- * throw, then freezes every builtin object. Run once, before any function is installed.
+ * Makes the realm's builtins indistinguishable from the program's (model 7) or throwing, then freezes them all so a
+ * write throws (strict mode). Run once, before any function is installed.
  *
- * - Throw: what depends on more than the arguments or differs between engines: `Math.random`, the
- *   implementation-approximated `Math` functions, the locale-dependent methods, `normalize` (Unicode data), regular
- *   expressions (`exec` updates engine-specific static state; `match`/`search`/`matchAll` build one from a string),
- *   `Function.prototype.toString` (the guest has printed source, not the program's), sorting with a comparator or
- *   over objects (the order is implementation-defined when the comparison isn't consistent), `toString(radix)` of a
- *   non-integer (implementation-defined digits), the `Function` constructor (reached as any function's `constructor`:
- *   code it compiles would run in the guest's global scope), and the reflection functions that would show the
- *   freezing below (`isFrozen`, `getOwnPropertyDescriptor`...). Replacements keep the `name` and `length` of what
- *   they replace and, like builtin methods, have no `prototype`.
- * - Freeze: every builtin object (and the global object), so a write to one, which in the program would change it
- *   for everyone, throws (the functions run in strict mode).
+ * Throws: what depends on more than the arguments or differs between engines (`Math.random`, approximated `Math`
+ * functions, locale methods, `normalize`, regexes' engine-specific static state, `Function.prototype.toString`,
+ * inconsistent sorts, non-integer `toString(radix)`), the `Function` constructor (would run in the guest's global
+ * scope), and reflection that would reveal the freezing. Replacements keep `name` and `length`, with no `prototype`.
  */
 const HARDEN = `(() => {
     "use strict";
@@ -187,12 +174,10 @@ const HARDEN = `(() => {
     freeze(globalThis);
 })();`;
 
-/** Deadline for setting the pure realm up, and for one call of a pure function in it. */
 const SETUP_TIMEOUT_MS = 5000;
 const CALL_TIMEOUT_MS = 250;
 const LIMITS = { memoryBytes: 64 * 1024 * 1024, stackBytes: 1024 * 1024, timeoutMs: SETUP_TIMEOUT_MS };
 
-/** What a pure function uses beyond its own names: constants, other pure functions, and builtins by global name. */
 interface Captures {
     readonly constants: Map<Variable, Value>;
     readonly functions: Map<Variable, FunctionLike>;
@@ -207,31 +192,20 @@ const isWithin = (scope: Scope | null, fn: Node): boolean => {
 };
 
 /**
- * Proves functions pure: called with primitive arguments, their result depends only on those, they change nothing
- * that outlives the call, and evaluating them in the pure realm (`HARDEN`, strict mode) gives what the program gets.
+ * Proves functions pure: with primitive arguments, the result depends only on them, nothing outliving the call
+ * changes, and the pure realm (`HARDEN`, strict mode) gives what the program gets.
  *
- * Rules, checked on the function's code (nested functions included):
- * - only the node types in `ALLOWED`; no `async` or generator function (their code runs after the call returns: in
- *   jobs the realm never runs, or when the program resumes them; a rejected promise is reported to the host), no `**`
- *   (implementation-approximated), function declarations only directly in a function body (block-level ones bind
- *   differently in strict mode);
- * - its names are its own (parameters and locals of it and its nested functions, written freely), constants per
- *   `constantEnv` where they are read (never written: their values are put in the realm), functions that are pure
- *   themselves and hold for good where they are named (`functionAt`), and the globals in `PURE_GLOBALS` (read only);
- *   not `arguments` (sloppy-mode `arguments` aliases parameters).
+ * Rules: only `ALLOWED` node types; no async/generator (code runs after the call returns); no `**` (approximated);
+ * function declarations only directly in a function body (block ones bind differently in strict mode). Names are its
+ * own, `constantEnv` constants (read only), functions pure themselves and fixed where named (`functionAt`), or
+ * `PURE_GLOBALS` (read only); not `arguments` (sloppy `arguments` aliases parameters).
  *
- * What strict mode refuses to compile (`delete name`, octal literals, duplicate parameters...) leaves the call as it
- * is: the function's code doesn't compile in the realm.
+ * Soundness: every object reached is one it made, a pure function, or a builtin; distinguishing builtins throw and
+ * the rest are frozen, so strict and sloppy code differ only where strict throws (no `this`, `arguments` or `try`).
+ * A call that returns in the realm returned the same in the program. Relies on model 7.
  *
- * Every object the function reaches is then one it made, a pure function, or a builtin. In the realm the builtins
- * that could tell the realm from the program throw, and every builtin and pure function is frozen, so a write to one
- * throws (strict mode), as does the `Function` constructor; strict and sloppy code then differ only where the strict
- * code throws (no `this`, no `arguments`, no `try` to catch it). A call that returns there returned the same in the
- * program and only wrote to objects it made. Relies on model 7 (builtins intact: the program's are the standard ones,
- * like the realm's).
- *
- * Mutually recursive functions are proven coinductively: a function whose proof is running is assumed pure; results
- * reached under an assumption are kept once the function assumed is proven, and dropped if it isn't.
+ * Mutual recursion is proven coinductively: a function whose proof is running is assumed pure; results under an
+ * assumption are kept once it is proven, dropped otherwise.
  */
 class PurityProver {
     readonly #scopes: ScopeInfo;
@@ -239,7 +213,7 @@ class PurityProver {
     readonly #log: PassLog;
     readonly #proofs = new Map<FunctionLike, Proof>();
     readonly #stack: FunctionLike[] = [];
-    /** Successes resting on an assumption still open, in proof order. */
+    /** Successes resting on a still-open assumption, in proof order. */
     readonly #pending: { readonly fn: FunctionLike; readonly proof: Proof }[] = [];
     /** The lowest stack index of an assumption the current proof made. */
     #assumed = Number.POSITIVE_INFINITY;
@@ -316,7 +290,6 @@ class PurityProver {
         }
     }
 
-    /** A name: see the class. Property names and labels aren't references. */
     #nameImpurity(node: Node, name: string, parent: Node | null, key: string | null, root: FunctionLike, captures: Captures): string | undefined {
         if (parent?.type === "MemberExpression" && key === "property" && !parent.computed) return undefined;
         if (parent?.type === "Property" && key === "key" && !parent.computed) return undefined;
@@ -325,7 +298,7 @@ class PurityProver {
         const reference = scopes.referenceOf(node);
         if (reference === undefined) {
             if (scopes.variableOf(node) !== undefined) return undefined;
-            // An identifier a pass made since the analysis (`undefined` for `void 0`): the global, unless declared.
+            // An identifier a pass made since the analysis (`undefined` for `void 0`).
             if (VALUE_NAMES.has(name) && !scopes.declaresName(name)) {
                 captures.globals.add(name);
                 return undefined;
@@ -341,7 +314,7 @@ class PurityProver {
         }
         if (name === "arguments" && variable.defs.length === 0) return "it uses arguments";
         if (isWithin(variable.scope, root)) return undefined;
-        // A binding the function writes is neither a constant nor a function for good (its write is another one).
+        // A binding the function writes is neither a constant nor a function for good.
         const constant = this.#env.lookup?.(node as Expression);
         if (constant?.ok === true) {
             captures.constants.set(variable, constant.value);
@@ -355,7 +328,7 @@ class PurityProver {
         return undefined;
     }
 
-    /** What a proven function and the pure functions it uses capture, together: by name, or why they can't share one scope. */
+    /** All captures of a proven function and the pure functions it uses, or why they can't share one scope. */
     closure(variable: Variable, fn: FunctionLike): Captures | string {
         const all: Captures = { constants: new Map(), functions: new Map([[variable, fn]]), globals: new Set() };
         const queue: FunctionLike[] = [fn];
@@ -382,7 +355,7 @@ class PurityProver {
     }
 }
 
-/** A primitive as source text that means it whatever the names around are. */
+/** Means the primitive whatever names are in scope. */
 const literalText = (value: Value): string => {
     if (value === undefined) return "void 0";
     if (typeof value === "string") return JSON.stringify(value);
@@ -393,7 +366,6 @@ const literalText = (value: Value): string => {
     return Object.is(value, -0) ? "-0" : String(value);
 };
 
-/** `const name = fn;` (an expression), or the declaration itself. */
 const declarationOf = (name: string, fn: FunctionLike): Statement =>
     fn.type === "FunctionDeclaration"
         ? fn
@@ -407,10 +379,7 @@ const declarationOf = (name: string, fn: FunctionLike): Statement =>
               fn
           );
 
-/**
- * The guest code giving `{ call(args) }` for the function `name` in `captures`: the captured constants and functions
- * declared by their names in a scope of their own (the harness's names can't meet theirs), the functions frozen.
- */
+/** Captures are declared in a scope of their own so the harness's names can't meet theirs. */
 const harnessOf = (name: string, captures: Captures): string => {
     const constants = [...captures.constants].map(([variable, value]) => `const ${variable.name} = ${literalText(value)};`);
     const functions = [...captures.functions].map(([variable, fn]) => printStatement(declarationOf(variable.name, fn)));
@@ -435,7 +404,6 @@ ${[...constants, ...functions].join("\n")}
 })()`;
 };
 
-/** A call to evaluate: its function (by binding) and constant arguments. */
 interface Candidate {
     readonly call: CallExpression;
     readonly variable: Variable;
@@ -443,21 +411,16 @@ interface Candidate {
     readonly args: readonly Value[];
 }
 
-/** Calls already answered for good (resolved, or kept because the evaluation failed): not asked again in later rounds. */
+/** Calls answered for good: not asked again in later rounds. */
 const DECIDED = factKey<{ readonly decided: WeakSet<Node>; readonly logged: WeakSet<Node> }>("pure-calls");
 
 const argsKey = (args: readonly Value[]): string =>
     args.map((value) => (typeof value === "string" ? JSON.stringify(value) : typeof value === "number" && Object.is(value, -0) ? "-0" : `${typeof value}:${String(value)}`)).join(",");
 
 /**
- * Replace calls of provably pure local functions whose arguments are constants by their results (geocomply's
- * substitution cipher `f9("qjGLKLKLq")`), evaluated in a QuickJS realm of their own (never the runtime's guest).
- * See `PurityProver` for what makes a function pure and why the realm's answer is the program's. The function must be
- * what the callee holds for good where the call is (`functionAt`), and each argument a constant there; arguments
- * that are constants evaluate without effects, so the call's only effect is its result. Only primitive results are
- * put in (strings of any length); a call that throws, times out or returns an object stays.
- *
- * Runs in the simplify group: arguments and captured bindings become constants as it folds.
+ * Replaces calls of provably pure local functions with constant arguments by their primitive results, evaluated in
+ * a QuickJS realm of their own (never the runtime's guest). Constant arguments evaluate without effects, so the
+ * call's only effect is its result. Runs in the simplify group: arguments and captures become constants as it folds.
  */
 export const pureCalls: Pass = {
     name: "pure-calls",
@@ -519,9 +482,7 @@ export const pureCalls: Pass = {
                 log.warn(`couldn't set the pure realm up: ${setup.error}`);
                 return { changed: 0 };
             }
-            /** Per function: its harness, or why it has none. */
             const harnesses = new Map<FunctionLike, Held | string>();
-            /** Per function and arguments: the result, or why there is none. */
             const results = new Map<FunctionLike, Map<string, { value: Value } | string>>();
             for (const { call, variable, fn, args } of candidates) {
                 let harness = harnesses.get(fn);
@@ -547,7 +508,7 @@ export const pureCalls: Pass = {
                     const answer = sandbox.invoke(["call"], args, CALL_TIMEOUT_MS, harness);
                     if (!answer.ok) {
                         result = answer.timedOut ? `it ran past ${CALL_TIMEOUT_MS} ms` : `it threw: ${answer.error}`;
-                        // A function that runs this long isn't asked again: its other calls would cost as much.
+                        // Its other calls would cost as much.
                         if (answer.timedOut) harnesses.set(fn, `a call of it ran past ${CALL_TIMEOUT_MS} ms`);
                     } else {
                         const returned = answer.value as { value?: Value; type?: string };

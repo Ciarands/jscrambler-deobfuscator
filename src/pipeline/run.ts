@@ -8,17 +8,13 @@ import type { Pass, PipelineStep } from "./pass.js";
 import { Facts } from "./facts.js";
 
 export interface PassSelection {
-    /** Only run these passes. Omit to run every pass. */
     readonly passes?: readonly string[] | undefined;
-    /** Skip these passes. */
     readonly skip?: readonly string[] | undefined;
 }
 
 export interface PassReport {
     readonly name: string;
-    /** Fixpoint group the pass ran in, if any. */
     readonly group?: string;
-    /** 1-based round within the group. */
     readonly round?: number;
     readonly changed: number;
     readonly durationMs: number;
@@ -36,10 +32,9 @@ export class UnknownPassError extends Error {
     }
 }
 
-/** Every pass in a pipeline, groups flattened, in order. */
 export const passesOf = (steps: readonly PipelineStep[]): readonly Pass[] => steps.flatMap((step) => (isGroup(step) ? step.passes : [step]));
 
-/** Keep the selected passes (dropping groups that end up empty). Throws on names that don't exist. */
+/** Throws on unknown names; drops groups that end up empty. */
 export const selectPasses = (steps: readonly PipelineStep[], selection: PassSelection): readonly PipelineStep[] => {
     const names = new Set(passesOf(steps).map((pass) => pass.name));
     const requested = [...(selection.passes ?? []), ...(selection.skip ?? [])];
@@ -59,7 +54,6 @@ export const selectPasses = (steps: readonly PipelineStep[], selection: PassSele
 export interface RunOptions {
     readonly logger: Logger;
     readonly source: SourceMap;
-    /** Called after every pass run, e.g. to dump the program for inspection. */
     readonly afterPass?: ((report: PassReport, program: Program) => void) | undefined;
 }
 
@@ -67,7 +61,6 @@ export const runPipeline = async (program: Program, steps: readonly PipelineStep
     const reports: PassReport[] = [];
     const facts = new Facts();
     let scope: ScopeInfo | undefined;
-    /** The cached analysis predates expression-only changes: refreshed (removed references dropped) on next use. */
     let stale = false;
     const currentScope = (): ScopeInfo => {
         if (scope === undefined) scope = new ScopeInfo(program);

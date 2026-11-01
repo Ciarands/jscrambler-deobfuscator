@@ -3,11 +3,8 @@
  *
  *   npm run build && npx tsx scripts/compare.ts [samplesDir] [--main ../jsd-main] [--only a,b]
  *
- * `--main` is a worktree of the `main` branch with its dependencies installed (never modified). Both tools run each
- * sample end to end (read, deobfuscate, write) with logging off, one after the other in this process. The rewrite runs
- * from `dist/` (the build users run; it must be newer than every source file). Outputs go to
- * .compare/<sample>/{main.js,rewrite.js}; the table shows wall clock and the shared metrics for both, and whether the
- * rewrite is faster and no worse on machines, switches and deep calls.
+ * `--main` is a worktree of `main` with dependencies installed (never modified). The rewrite runs from `dist/`, which
+ * must be newer than every source file. Outputs go to .compare/<sample>/{main.js,rewrite.js}.
  */
 import { mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -17,7 +14,6 @@ import type { deobfuscate as Deobfuscate } from "../src/index.js";
 import type { Metrics } from "./metrics.js";
 import { errorMetrics, measure } from "./metrics.js";
 
-/** Newest modification time of the files under `dir`. */
 const newest = (dir: string): number =>
     Math.max(...readdirSync(dir, { withFileTypes: true }).map((entry) => (entry.isDirectory() ? newest(path.join(dir, entry.name)) : statSync(path.join(dir, entry.name)).mtimeMs)));
 const built = path.resolve("dist/index.js");
@@ -33,13 +29,12 @@ const only = values.only?.split(",").map((s) => s.trim());
 const outRoot = path.resolve(".compare");
 
 type ProcessSample = (input: string, output: string) => Promise<boolean>;
-// The `main` worktree's location is chosen at run time (`--main`), so this import can't be static.
 const { processSample } = (await import(pathToFileURL(path.join(mainDir, "src/deobfuscator.js")).href)) as { processSample: ProcessSample };
 
 const ignore = () => {};
 const ok = (better: boolean) => (better ? "ok" : "WORSE");
 
-/** `main` narrates every step on the console; keep that out of the table, but keep what it reports as errors. */
+/** `main` narrates every step on the console; keep that out of the table, but keep its errors. */
 const quietly = async <T>(run: () => Promise<T>): Promise<{ result: T; errors: string[] }> => {
     const errors: string[] = [];
     const saved = { log: console.log, warn: console.warn, error: console.error };

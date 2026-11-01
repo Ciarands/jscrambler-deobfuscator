@@ -4,10 +4,7 @@ import { deobfuscate } from "../src/index.js";
 
 const run = async (code: string) => (await deobfuscate(code, { passes: ["emulate", "global-proxy"] })).code;
 
-/**
- * What a script leaves in `result`. Code that runs after the prelude is scheduled with `setTimeout`: the emulator's
- * timers never fire, here they run (synchronously, in order) once the script has finished.
- */
+/** Timers (code after the prelude) never fire in the emulator; here they run in order once the script finishes. */
 const observed = (source: string): string => {
     const timers: (() => void)[] = [];
     const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };
@@ -16,13 +13,12 @@ const observed = (source: string): string => {
     return JSON.stringify(context.result);
 };
 
-/** What a script and its deobfuscation leave in `result`, and the deobfuscation. */
 const observe = async (code: string): Promise<[string, string, string]> => {
     const output = await run(code);
     return [observed(code), observed(output), output];
 };
 
-// The shape jscrambler's prelude uses: the global object, found through a getter, parked on the storage function.
+// The prelude's shape: the global object, found through a getter, parked on the storage function.
 const PRELUDE = `
 G[7] = (function () {
   if (typeof globalThis === "object") return globalThis;
@@ -95,7 +91,6 @@ function g() { var s = G; s = other; return s[7]; }
     });
 
     it("judges code by when it runs: never, only while the prelude runs, or later", async () => {
-        // Nothing calls it: its write never happens.
         const [neverBefore, neverAfter, neverOutput] = await observe(
             `${PRELUDE}\nfunction unused() { G[7] = { marker: 1 }; }\nfunction read() { return typeof G[7].Math; }\nsetTimeout(function () { result = read(); });\n`
         );

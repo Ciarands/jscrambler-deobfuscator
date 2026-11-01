@@ -2,7 +2,6 @@ import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 
-/** What a script leaves in `result`; `setTimeout` callbacks (code after the prelude) run once it has finished. */
 const observed = (source: string): string => {
     const timers: (() => void)[] = [];
     const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };
@@ -13,14 +12,12 @@ const observed = (source: string): string => {
 
 const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "hash-predicates", "simplify"] })).code;
 
-/** The test programs' hash, as the runtime's builder defines it. */
 const hash = (s: string, n: number, seed: number): number => {
     let q = seed;
     for (let i = 0; i < n; i++) q = Math.imul(q ^ s.charCodeAt(i), 16777619) | 0;
     return q;
 };
 
-/** The hash's loop, then what a variant does with `q`. */
 const hashCode = (returned = "q", before = "") => `function (s, n, seed) { ${before} var q = seed; for (var i = 0; i < n; i++) { q = mix(q ^ s.charCodeAt(i), 16777619); } return ${returned}; }`;
 
 /** A runtime with the hash on `G.U.h` (as `G.w` too, through a wrapper), and `app` (from `body`) run after the prelude. */
@@ -41,7 +38,7 @@ function app() {
 setTimeout(function () { ${later} app(); result = log; });
 `;
 
-/** jscrambler's predicate pair: a counting loop until the hash of `d` is `a`, then an `if` on the hash of the count. */
+/** Predicate pair: a counting loop until the hash of `d` is `a`, then an `if` on the hash of the count. */
 const predicates = ({ untilDigit = 1, ifTrue = false, loopBody = "S += 2;", between = "", call = "G.U.h" } = {}) => {
     const a = hash(String(untilDigit), 1, 77300);
     const count = 2 + 2 * (untilDigit - 1);
@@ -57,7 +54,6 @@ const predicates = ({ untilDigit = 1, ifTrue = false, loopBody = "S += 2;", betw
 const lonePredicate = `if (G.U.h("1", 1, 77300) !== ${hash("1", 1, 77300)}) { log.push("decoy"); }
   log.push("real");`;
 
-/** A counting loop on `d` until its hash is `until`, around `body`. */
 const loop = (head: string, until: number, body: string) => `for (${head} = 1; G.U.h(d.toString(), d.toString().length, 77300) !== ${until}; d++) { ${body} }`;
 
 describe("hash-predicates", () => {

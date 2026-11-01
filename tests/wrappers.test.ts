@@ -22,7 +22,6 @@ const run = (code: string): string => {
     return JSON.stringify(context.result);
 };
 
-/** What a script leaves in `result` (or the error it throws); `setTimeout` callbacks (code after the prelude) run once it has finished. */
 const observed = (source: string): string => {
     const timers: (() => void)[] = [];
     const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback), host: { k: () => 7 } };
@@ -37,7 +36,6 @@ const observed = (source: string): string => {
 
 const inline = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "wrappers"] })).code;
 
-/** `G.f`, a wrapper over `G.H.add`. */
 const WRAPPER = `G.f = function () { return typeof G.H.add === "function" ? G.H.add.apply(G.H, arguments) : G.H.add; };`;
 
 describe("wrappers", () => {
@@ -50,7 +48,7 @@ describe("wrappers", () => {
     });
 
     it("inlines calls whose arguments run code when nothing but G's paths reaches the target", async () => {
-        // jscrambler's hash: a builder returns a fresh literal naming its local function (`{ add }`).
+        // A builder returns a fresh literal naming its local function (`{ add }`).
         const program = `
 function G() {}
 G.H = (function () {
@@ -67,8 +65,7 @@ setTimeout(function () { var n = host.k(); result = G.f(n.toString(), host.k());
 
     it("keeps calls whose arguments may change the target first", async () => {
         const cases = {
-            // The runtime keeps the target's object in a binding of its own (as the decoder its holder): calling the
-            // target swaps it, without naming G's paths.
+            // The target's object is held in a binding of its own: calling the target swaps it without naming G's paths.
             held: `
 function G() {}
 var holder = {};

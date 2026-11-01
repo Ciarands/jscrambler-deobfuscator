@@ -62,13 +62,12 @@ export const reachableOrder = (machine: Machine): NodeId[] => {
 };
 
 interface Labels {
-    /** Fresh label name not used anywhere in the program. */
+    /** Must not clash with any label in the program. */
     next(prefix: string): string;
 }
 
 type Context = { readonly kind: "loop" | "block"; readonly node: NodeId; readonly label: string };
 
-/** Structured statements for `machine`, whose reachable states are `order` (from `reachableOrder`). */
 export const structure = (machine: Machine, order: readonly NodeId[], position: At, labels: Labels): StructureResult => {
     const blocks = machine.blocks;
     const successors = new Map<NodeId, NodeId[]>(order.map((id) => [id, edgesOf(machine, id)]));

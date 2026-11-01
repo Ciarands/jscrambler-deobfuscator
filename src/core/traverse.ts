@@ -3,15 +3,12 @@ import type { Node } from "./ast.js";
 
 type Container = Record<string, unknown>;
 
-/** AST nodes are plain objects; the walker reads and writes their child fields by name (from `visitorKeys`). */
 const fields = (node: Node): Container => node as unknown as Container;
 
-/** Position of the node currently being visited inside an array, shared with the loop that walks the array. */
 interface Cursor {
     index: number;
 }
 
-/** Re-points a path at another node (module-private: only the walker reuses paths). */
 const RESET = Symbol("reset");
 
 export class Path<N extends Node = Node> {
@@ -29,7 +26,6 @@ export class Path<N extends Node = Node> {
         this.#cursor = cursor;
     }
 
-    /** The walker keeps one path per depth and points it at each node in turn: paths aren't kept past their visit. */
     [RESET](node: N, parentPath: Path | null, key: string | null, cursor: Cursor | null): this {
         this.node = node;
         this.#parentPath = parentPath;
@@ -48,12 +44,10 @@ export class Path<N extends Node = Node> {
         return this.#parentPath;
     }
 
-    /** Property of the parent holding this node, e.g. `"body"` or `"test"`. */
     get key(): string | null {
         return this.#key;
     }
 
-    /** Index inside the parent's array, or `null` when the node is a plain property. */
     get index(): number | null {
         return this.#cursor?.index ?? null;
     }
@@ -66,7 +60,6 @@ export class Path<N extends Node = Node> {
         return this.#skipped;
     }
 
-    /** Don't walk this node's children. */
     skip(): void {
         this.#skipped = true;
     }
@@ -76,7 +69,7 @@ export class Path<N extends Node = Node> {
         return fields(this.parent)[this.key] as Node[];
     }
 
-    /** Replace this node. The walker continues into the new node's children; its enter visitor is not called again. */
+    /** The walker continues into the new node's children; its enter visitor is not called again. */
     replace(node: Node): void {
         if (this.parent === null || this.key === null) throw new Error("Can't replace the root node");
         const list = this.#list();
@@ -85,7 +78,6 @@ export class Path<N extends Node = Node> {
         this.node = node as N;
     }
 
-    /** Remove this node from an array (statement lists, arguments, sequence items...). */
     remove(): void {
         const list = this.#list();
         if (list === null || this.#cursor === null) throw new Error(`Can't remove ${this.node.type} from ${this.parent?.type}.${this.key}: not in a list`);
@@ -95,7 +87,7 @@ export class Path<N extends Node = Node> {
         this.#skipped = true;
     }
 
-    /** Insert nodes before this one in the parent's array. They are not visited. */
+    /** Inserted nodes are not visited. */
     insertBefore(nodes: readonly Node[]): void {
         const list = this.#list();
         if (list === null || this.#cursor === null) throw new Error(`Can't insert next to ${this.node.type}: not in a list`);
@@ -103,7 +95,7 @@ export class Path<N extends Node = Node> {
         this.#cursor.index += nodes.length;
     }
 
-    /** Insert nodes after this one in the parent's array. They are not visited. */
+    /** Inserted nodes are not visited. */
     insertAfter(nodes: readonly Node[]): void {
         const list = this.#list();
         if (list === null || this.#cursor === null) throw new Error(`Can't insert next to ${this.node.type}: not in a list`);
@@ -111,7 +103,7 @@ export class Path<N extends Node = Node> {
         this.#cursor.index += nodes.length;
     }
 
-    /** Remove another node from the same array as this one, keeping the walk consistent. Returns false if it isn't there. */
+    /** Keeps the walk's cursor consistent; false if `node` isn't a sibling. */
     removeSibling(node: Node): boolean {
         const list = this.#list();
         if (list === null || this.#cursor === null) return false;
@@ -135,7 +127,6 @@ export class Path<N extends Node = Node> {
         return parent.type === "ArrayPattern" || parent.type === "RestElement";
     }
 
-    /** This node is an element of a statement list (program, block, static block or `case` body). */
     isInStatementList(): boolean {
         const parent = this.parent;
         if (parent === null || this.index === null) return false;
@@ -147,20 +138,16 @@ export type VisitFn<N extends Node = Node> = (path: Path<N>) => void;
 export type VisitEntry<N extends Node = Node> = VisitFn<N> | { enter?: VisitFn<N>; exit?: VisitFn<N> };
 type NodeOfType<T extends string> = Extract<Node, { type: T }>;
 
-/** Visitors keyed by node type, plus `enter`/`exit` for every node. */
 export type Visitors = { [T in Node["type"]]?: VisitEntry<NodeOfType<T>> } & {
     enter?: VisitFn;
     exit?: VisitFn;
 };
 
-/** Child slots (from `visitorKeys`) hold nodes or nothing. */
 const isNode = (value: unknown): value is Node => typeof value === "object" && value !== null && typeof (value as { type?: unknown }).type === "string";
 
 /**
- * Per node type, a function reading its child slots in `visitorKeys` order, each slot written out by name: one
- * property load per type and slot, which V8 specialises to the type's shape, where a loop over the keys has one load
- * for every type and key (the walks over large programs spent most of their time there). A slot is read when its turn
- * comes, after the slots before it were walked, as the loop did. `body` gives the code handling one slot's `value`.
+ * Per node type, a generated function reading each child slot by name: V8 specialises each load to the type's shape,
+ * where a loop over keys was the walk's hot spot. Slots are read in turn, after earlier ones were walked.
  */
 const compileSlots = <F>(params: readonly string[], body: (key: string) => string): Readonly<Record<string, F | undefined>> => {
     const compiled: Record<string, F | undefined> = Object.create(null) as Record<string, F | undefined>;
@@ -172,14 +159,12 @@ const compileSlots = <F>(params: readonly string[], body: (key: string) => strin
     return compiled;
 };
 
-/** Calls `fn` on each child node of `node` (see `forEachChild`). */
 const EACH_CHILD = compileSlots<(node: Node, fn: (child: Node) => void) => void>(
     ["fn"],
     () =>
         'if (Array.isArray(value)) { for (let i = 0; i < value.length; i++) { const child = value[i]; if (typeof child === "object" && child !== null && typeof child.type === "string") fn(child); } } else if (typeof value.type === "string") fn(value);'
 );
 
-/** Hands each child slot of `node` to the walk: arrays to `list`, nodes to `one` (see `traverse`). */
 type ListSlot = (value: unknown[], parentPath: Path, key: string, depth: number) => void;
 type OneSlot = (value: Node, parentPath: Path, key: string, depth: number) => void;
 const WALK_SLOTS = compileSlots<(node: Node, parentPath: Path, depth: number, list: ListSlot, one: OneSlot) => void>(
@@ -187,22 +172,15 @@ const WALK_SLOTS = compileSlots<(node: Node, parentPath: Path, depth: number, li
     (key) => `if (Array.isArray(value)) list(value, parentPath, ${key}, depth); else if (typeof value.type === "string") one(value, parentPath, ${key}, depth);`
 );
 
-/** Call `fn` on each direct child node of `node`, in source order. */
 export const forEachChild = (node: Node, fn: (child: Node) => void): void => {
     EACH_CHILD[node.type]?.(node, fn);
 };
 
-/**
- * Walk `root` depth-first in source order (oxc `visitorKeys` order).
- *
- * Visitors may replace or remove the current node and insert siblings; the walk stays consistent.
- * Nodes inserted next to the current one are not visited.
- */
+/** Depth-first in `visitorKeys` order. Visitors may replace/remove the current node and insert siblings (not visited). */
 export const traverse = (root: Node, visitors: Visitors): void => {
     const byType = visitors as Record<string, VisitEntry<Node> | undefined>;
     const enterAny = visitors.enter;
     const exitAny = visitors.exit;
-    // One path per depth, re-pointed for each sibling (paths aren't kept past their visit).
     const paths: Path[] = [];
     const pathAt = (depth: number, node: Node, parentPath: Path | null, key: string | null, cursor: Cursor | null): Path => {
         const existing = paths[depth];
@@ -243,11 +221,7 @@ export const traverse = (root: Node, visitors: Visitors): void => {
     visit(pathAt(0, root, null, null, null), 0);
 };
 
-/**
- * Replace nodes by identity in one walk: for passes that decide first (collecting candidates, asking the sandbox in a
- * batch) and rewrite afterwards. Paths can't be kept for later: their array cursors move on as the walk does.
- * Replacements are not walked into. Returns how many nodes were replaced.
- */
+/** Replace nodes by identity in one walk, for passes that decide before rewriting. Replacements aren't walked into. */
 export const replaceNodes = (root: Node, replacements: ReadonlyMap<Node, Node>): number => {
     if (replacements.size === 0) return 0;
     let replaced = 0;

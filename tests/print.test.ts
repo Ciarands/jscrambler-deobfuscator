@@ -30,7 +30,6 @@ const roundTrips = (code: string): void => {
 const SCRIPT = readFileSync(new URL("fixtures/print-script.txt", import.meta.url), "utf8");
 const MODULE = readFileSync(new URL("fixtures/print-module.txt", import.meta.url), "utf8");
 
-/** A character that shows as itself in a text file: printable ASCII, a line feed, or visible non-ASCII. */
 const isShown = (code: number): boolean =>
     code === 0x0a || (code >= 0x20 && code < 0x7f) || (code > 0xa0 && code !== 0x2028 && code !== 0x2029 && code !== 0x200b && code !== 0xfeff && (code < 0xd800 || code > 0xdfff));
 
@@ -81,7 +80,6 @@ describe("print", () => {
     });
 
     it("parenthesizes a string statement where it would read as a directive", () => {
-        // Built, not parsed: a plain string statement first in a function body.
         const program = parse("function f() { x; return this; }");
         const body = (program.body[0] as { body: { body: Statement[] } }).body.body;
         body[0] = { type: "ExpressionStatement", expression: valueToNode("use strict", [0, 0]), start: 0, end: 0 } as unknown as Statement;
