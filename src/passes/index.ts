@@ -1,7 +1,7 @@
 import type { PipelineStep } from "../pipeline/pass.js";
 import { aliases } from "./aliases.js";
 import { argumentsArrays } from "./arguments-arrays.js";
-import { calculators } from "./calculators.js";
+import { calculators, calculatorsBound } from "./calculators.js";
 import { cleanup } from "./cleanup.js";
 import { codeLocks } from "./code-locks.js";
 import { detectors } from "./detectors.js";
@@ -19,34 +19,16 @@ import { unminify } from "./unminify/index.js";
 import { wrappers } from "./wrappers.js";
 
 /**
- * The pipeline, in run order. Each pass documents why it sits where it does. resolve-calls comes right after emulate:
- * decoded strings turn computed storage keys (`G[G.w(147)]`) into static ones, which the storage analysis of the
- * passes after it (what may change `G` after the prelude) needs. code-locks follows wrappers, which turned calls of
- * the locks' wrappers into direct calls; detectors (anti-debug checks, answered with what they say undebugged) and
- * domain-locks (tests of a hash of the host against the licensed ones, answered as passed) come with it, detectors
- * reading the slot shapes too. calculators comes next: it reads calls of a calculator's methods
- * directly and through the wrappers left (`runtime.wrappers`), the removed lock and detector calls no longer stand
- * between a selector call and its calculation, and the simplify group after it folds the case expressions it puts in
- * (`7735 - 7280`). storage-comparisons folds the matrix predicates (`G.k.m[1][10] != G.k.m[3][10]`) once, before the
- * group: their paths are static from the start. The simplify group repeats until nothing changes: folding decides
- * opaque predicates, dead branches leave sequences for normalize to split, and machines whose states became constant
- * are unflattened in the next round; resolve-calls runs again there for calls of settled string decoders whose
- * arguments only now became constant (`G.w(S[7])` once `S[7] = 2572` is known), and pure-calls evaluates calls of
- * the program's own pure functions whose arguments became constant (a substitution cipher `f9("qjGL")`), in a QuickJS
- * realm of their own.
- * arguments-arrays then turns `var S = [arguments]` slot arrays into parameters and locals: the passes before it
- * (constants, code-locks, builders, calculators) read the slot shapes. It leads the cleanup group, so an array the
- * group's simplify frees (a predicate deciding between two of its definitions) is converted in the next round, and
- * cleanup drops the locals whose reads the passes before already resolved. resolve-calls, calculators, code-locks and
- * domain-locks run again right after it: decoder calls get the constants the group's simplify propagated into locals
- * that were slots, calculations it kept because an argument was a read through the arguments array (a possible
- * getter, read out of turn) now take plain parameters and locals, and lock calls their literal arguments.
- * hash-predicates comes next in both groups:
- * it decides tests on the runtime's pure hash from the locals assigned right before them, so simplify drops the dead
- * branches and loops in the same round; in the cleanup group it sees the predicates whose locals were slots until
- * arguments-arrays. Cleanup comes after, when the runtime has no users left; removing it can make more locals unused,
- * so the group repeats. Unminify is last: it only changes how the code reads, into shapes (`if` for `a && b()`,
- * split declarations) the passes before it don't expect.
+ * The pipeline, in run order; each pass documents why it sits where it does. Ordering constraints:
+ * - resolve-calls right after emulate: decoded strings make computed storage keys static for later storage analyses.
+ * - code-locks, detectors and domain-locks after wrappers, which turned lock wrapper calls into direct calls.
+ * - calculators next: removed lock and detector calls no longer stand between a selector call and its calculation.
+ * - storage-comparisons once before the simplify group: its paths are static from the start.
+ * - The simplify group repeats to a fixpoint; resolve-calls and pure-calls rerun there as arguments become constant.
+ * - arguments-arrays leads the cleanup group (earlier passes read the slot shapes); resolve-calls, calculators,
+ *   code-locks and domain-locks rerun after it on the plain locals; hash-predicates follows in both groups. Only
+ *   calculators there binds arguments: before it, a slot argument may still become a local that goes in directly.
+ * - Unminify last: it produces shapes the earlier passes don't expect.
  */
 export const PIPELINE: readonly PipelineStep[] = [
     normalize,
@@ -62,6 +44,6 @@ export const PIPELINE: readonly PipelineStep[] = [
     calculators,
     storageComparisons,
     { group: "simplify", passes: [hashPredicates, simplify, normalize, unflatten, resolveCalls, pureCalls], maxRounds: 8 },
-    { group: "cleanup", passes: [argumentsArrays, resolveCalls, codeLocks, domainLocks, calculators, hashPredicates, cleanup, simplify], maxRounds: 4 },
+    { group: "cleanup", passes: [argumentsArrays, resolveCalls, codeLocks, domainLocks, calculatorsBound, hashPredicates, cleanup, simplify], maxRounds: 4 },
     unminify,
 ];

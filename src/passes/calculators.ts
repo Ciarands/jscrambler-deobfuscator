@@ -1,6 +1,6 @@
 import type { CallExpression, Expression, Function as FunctionNode, Node, Statement } from "../core/ast.js";
 import { isFunctionNode, isIndexKey, memberPath, propertyKey } from "../core/ast.js";
-import { at, valueToNode } from "../core/build.js";
+import { at, callOf, valueToNode } from "../core/build.js";
 import { globalsEnv } from "../core/constants.js";
 import type { EvaluateEnv, Value } from "../core/evaluate.js";
 import { evaluate } from "../core/evaluate.js";
@@ -16,17 +16,13 @@ import type { RuntimeModel } from "./emulate/model.js";
 import { RUNTIME } from "./emulate/model.js";
 import { rootStatements } from "./emulate/storage.js";
 
-/** One `case` of a calculation: its label, and the expression it computes (or why that can't be used). */
 interface Case {
     readonly label: Value;
     readonly formula: Expression;
     readonly problem: string | undefined;
 }
 
-/**
- * A calculator object `G.k`: a selector method that stores its argument in the builder's state variable, and a
- * calculation that computes the case the state selects from its arguments.
- */
+/** `G.k`: a selector method storing its argument in the builder's state, and a calculation switching on that state. */
 interface Calculator {
     readonly path: PropertyPath;
     readonly name: string;
@@ -38,22 +34,18 @@ interface Calculator {
     readonly definition: Statement;
 }
 
-/** Where a node sits: its parent, and the field (and index, for lists) of the parent holding it. */
 interface Place {
     readonly parent: Node;
     readonly key: string;
     readonly index: number | null;
 }
 
-/** A call of a calculator's selector or calculation, directly (`G.k.m(...)`) or through a wrapper (`G.w(...)`). */
 interface Site {
     readonly call: CallExpression;
     readonly calculator: Calculator;
     readonly role: "selector" | "calculation";
-    /** The reference to `G` the callee starts from. */
     readonly reference: Node;
     readonly wrapper: string | undefined;
-    /** The call's places, from its own up to the function it is in. */
     readonly places: readonly Place[];
 }
 
@@ -69,7 +61,6 @@ const voidZero = (position: Node): Expression => at<Expression>({ type: "UnaryEx
 
 const startsWith = (keys: readonly (string | undefined)[], prefix: PropertyPath): boolean => keys.length >= prefix.length && prefix.every((key, i) => key === keys[i]);
 
-/** The state variable a selector method `function (p) { I = p; }` writes, and the identifier it writes through. */
 const stateWrittenBy = (fn: FunctionNode, scopes: ScopeInfo): { variable: Variable; write: Node } | undefined => {
     const [param] = fn.params;
     const [only] = bodyOf(fn);
@@ -81,7 +72,7 @@ const stateWrittenBy = (fn: FunctionNode, scopes: ScopeInfo): { variable: Variab
     return variable === undefined || given === undefined || variable === given || scopes.variableOf(set.right) !== given ? undefined : { variable, write: set.left };
 };
 
-/** Why a case's expression isn't a formula over the calculation's arguments: literals, `a[i]` and operators. */
+/** Why a case's expression isn't a formula over `a[i]`, literals and operators. */
 const formulaProblem = (node: Node, args: Variable, scopes: ScopeInfo): string | undefined => {
     switch (node.type) {
         case "Literal":
@@ -159,7 +150,6 @@ const calculationOf = (fn: FunctionNode, state: Variable, scopes: ScopeInfo, env
     return { cases, args };
 };
 
-/** Cheap shape test before the full recognition (which logs its refusals): the builder returns a method with a switch. */
 const looksLikeCalculator = (iife: FunctionNode): boolean => {
     const returned = bodyOf(iife).at(-1);
     return (
@@ -198,13 +188,11 @@ const calculatorOf = (iife: FunctionNode, scopes: ScopeInfo, env: EvaluateEnv): 
     return { selector: selector.name, calculation: calculation.name, cases: shape.cases, args: shape.args };
 };
 
-/** The function `node`'s code directly belongs to (`undefined` for the runtime root's top level), or `null` outside the root. */
 const enclosingFunction = (places: readonly Place[], root: Node): Node | undefined | null => {
     for (const { parent } of places) if (isFunctionNode(parent)) return parent === root ? undefined : parent;
     return root.type === "Program" ? undefined : null;
 };
 
-/** The places of `path`'s node, up to its function (inclusive) or the program. */
 const placesOf = (path: Path): Place[] => {
     const places: Place[] = [];
     for (let p: Path | null = path; p !== null && p.parent !== null && p.key !== null; p = p.parentPath) {
@@ -215,39 +203,29 @@ const placesOf = (path: Path): Place[] => {
 };
 
 /**
- * Calculator objects: `G.k.sel(3); x = G.k.calc(a, 7);` computes case 3 of the calculation's switch with `a` and 7 as
- * its arguments. Each calculation whose selector value is known becomes that case's expression, the arguments put in
- * (`a - 7`); constants then fold in simplify.
+ * Calculator objects: `G.k.sel(3); x = G.k.calc(a, 7);` becomes case 3's expression with the arguments put in (`a - 7`).
  *
  * Proof per calculation:
- * - the calculator (`calculatorOf`): built once by the prelude (`definitionOf`), its state written only by the selector
- *   and read only by the calculation's switch; `G.k.sel`, `G.k.calc` and the wrappers used hold the snapshot's methods
- *   when the call runs (one prelude write, data properties, `staleAt`);
- * - the selector value: the nearest selector call before the calculation in evaluation order, in the same function and
- *   on every path to it, with a constant argument, and no explicit code between the two (a call, `new`, a store that
- *   may hit a setter); getters and conversions there run code that doesn't use the calculator (model 8)
- *   (`selectorBefore`): so the state is that constant when the calculation reads it;
- * - the arguments: constants, safe locals and slot reads (`substitutable`): evaluating them has no effect, can't
- *   throw, and gives the same value in the case's expression, which keeps its structure. Model 8 doesn't cover a
- *   getter argument (it may have effects of its own, which dropping or moving it would change), nor conversions inside
- *   the case's expression (they run in the calculation, and may change a local a later argument reads): so a
- *   non-constant argument is only put where no conversion that could run code comes before it (`orderProblem`), and
- *   conversions still happen after every argument is read, in the same order. `a[i]` beyond the arguments is
- *   undefined (relies on model 7: builtins intact, so `Object.prototype` has no index accessors).
- * - a call through a wrapper applies the target with `Function.prototype.apply` (relies on model 7: builtins intact).
+ * - the calculator (`calculatorOf`): built once by the prelude, its state written only by the selector and read only
+ *   by the switch; the methods and wrappers used hold the snapshot's values when called (`staleAt`);
+ * - the selector value: the nearest selector call before it in evaluation order, same function, every path, constant
+ *   argument, no explicit code between; getters and conversions don't use the calculator (model 8) (`selectorBefore`);
+ * - the arguments: constants, safe locals and slot reads (`substitutable`): no effect, can't throw, same value. Model 8
+ *   doesn't cover getter arguments nor conversions inside the case's expression, so a non-constant argument is only
+ *   put where no code-running conversion precedes it (`orderProblem`); otherwise the arguments are bound to an arrow's
+ *   parameters first, as the calculation binds them to `arguments`. `a[i]` past the arguments is undefined and
+ *   wrappers use `Function.prototype.apply` (model 7: builtins intact).
  *
- * Selector calls then only matter to calculations that remain. One goes when the next selector call overwrites its
- * value before anything can read it (`overwrittenAfter`: only quiet code in between, on every path). A calculation
- * whose selector call is proven (kept only for its arguments) reads exactly that call's value, whatever other code did
- * (model 8): so when every calculation that may run after the prelude is replaced or has a proven selector call, the
- * state is read after the prelude only by those calls' values, unless something else reaches the calculator: a
- * reference other than a call or its standard wrapper, or a computed `G[x]` access whose value may reach code running
- * after the prelude (`computedAccessKeeps`). Then every other selector call made after the prelude goes; the prelude's
- * own stay (its remaining calculations may read them).
+ * A selector call goes when the next one overwrites it through quiet code only (`overwrittenAfter`). A proven selector
+ * call is exactly what its calculation reads (model 8): once every post-prelude calculation is replaced or proven, and
+ * nothing else reaches the calculator (escaping reference, or `computedAccessKeeps`), other post-prelude selector calls
+ * go; the prelude's own stay.
  */
-export const calculators: Pass = {
-    name: "calculators",
-    description: "Replace calculations of the runtime's calculator objects with the selected case's expression",
+const calculatorsPass = (bindArguments: boolean): Pass => ({
+    name: bindArguments ? "calculators-bound" : "calculators",
+    description: bindArguments
+        ? "Replace the calculations left, binding arguments a conversion could change first (after arguments-arrays)"
+        : "Replace calculations of the runtime's calculator objects with the selected case's expression",
     run({ program, log, facts, scope }: PassContext): PassResult {
         const runtime = facts.get(RUNTIME);
         if (runtime === undefined || runtime.guest.broken !== undefined) {
@@ -262,11 +240,18 @@ export const calculators: Pass = {
             log.info("no calculator objects");
             return { changed: 0 };
         }
-        return new CalculatorRewrite(program, runtime, matcher.isStorage, effects, scopes, env, log, found).run();
+        return new CalculatorRewrite(program, runtime, matcher.isStorage, effects, scopes, env, log, found, bindArguments).run();
     },
-};
+});
 
-/** Calculators the prelude builds, each checked against the snapshot. */
+/**
+ * Without binding arguments: a slot argument arguments-arrays turns into a plain local later may then go in directly,
+ * so a calculation it would bind stays for that run.
+ */
+export const calculators = calculatorsPass(false);
+
+export const calculatorsBound = calculatorsPass(true);
+
 const recognize = (runtime: RuntimeModel, isStorage: (node: Node) => boolean, effects: StorageEffects, scopes: ScopeInfo, env: EvaluateEnv, log: PassContext["log"]): Calculator[] => {
     const found: Calculator[] = [];
     for (const statement of rootStatements(runtime.root)) {
@@ -301,30 +286,25 @@ const recognize = (runtime: RuntimeModel, isStorage: (node: Node) => boolean, ef
     return found;
 };
 
-/** Outcome of the search for the selector call a calculation follows. */
 type Search = { readonly kind: "found"; readonly selector: Site } | { readonly kind: "stop"; readonly reason: string; readonly node: Node };
 
-/** A calculation's replacement, decided before anything is rewritten. */
 interface Resolution {
     readonly site: Site;
     readonly selected: Case | undefined;
     readonly args: readonly Expression[];
+    /** Why the arguments are bound to parameters before the case's expression runs (`#orderProblem`), if they are. */
+    readonly bound: string | undefined;
 }
 
-/** One run of the pass over the program: sites, decisions, rewrite. */
 class CalculatorRewrite {
     readonly #sites = new Map<CallExpression, Site>();
     /** Per calculator, the first reference that isn't a call of its methods or a wrapper of one. */
     readonly #escapes = new Map<Calculator, Node>();
-    /** Computed `G[x]` accesses (not writes), with their places. */
     readonly #computed: { member: Node; places: Place[] }[] = [];
-    /** Variables some reference uses other than as `S[index]`. */
     readonly #unslotted = new Set<Variable>();
     readonly #slotArrays = new Map<Variable, boolean>();
     #cloned = 0;
-    /** Per function: whether running it can't reach a selector call (see `#cannotReachSelector`). */
     readonly #isolated = new Map<Node, boolean>();
-    /** Functions assumed by the running outermost `#cannotReachSelector` check. */
     #provisional: Node[] | undefined;
 
     constructor(
@@ -335,19 +315,17 @@ class CalculatorRewrite {
         readonly scopes: ScopeInfo,
         readonly env: EvaluateEnv,
         readonly log: PassContext["log"],
-        readonly found: readonly Calculator[]
+        readonly found: readonly Calculator[],
+        readonly bindArguments: boolean
     ) {}
 
     run(): PassResult {
         this.#collect();
-        const counts = { calculators: this.found.length, resolved: 0, refused: 0, selectorsRemoved: 0, selectorsKept: 0 };
+        const counts = { calculators: this.found.length, resolved: 0, bound: 0, refused: 0, selectorsRemoved: 0, selectorsKept: 0 };
         const reasons = new Map<string, number>();
         const resolutions: Resolution[] = [];
-        /** Calculators with a calculation that may run after the prelude and has no proven selector call. */
         const unproven = new Set<Calculator>();
-        /** Calculators with a calculation that stays and may run in the prelude: it may read any selector call made there. */
         const preludeReaders = new Set<Calculator>();
-        /** The proven selector calls of calculations that stay and may run after the prelude: what they read. */
         const read = new Set<CallExpression>();
         for (const site of this.#sites.values()) {
             if (site.role !== "calculation") continue;
@@ -368,10 +346,8 @@ class CalculatorRewrite {
             resolutions.push(resolution);
         }
 
-        // Selector calls that go: those whose value the next selector call overwrites before anything reads it; and,
-        // made after the prelude, those no calculation reads. A calculation whose selector call is proven reads exactly
-        // that call's value (model 8), so when every calculation that may run after the prelude has one, the state is
-        // read after the prelude only at those calculations: every other selector call made after the prelude is dead.
+        // A proven selector call is exactly what its calculation reads (model 8), so once every post-prelude
+        // calculation has one, other post-prelude selector calls are dead.
         const computedKeeps = this.#computedAccessKeeps();
         const resolved = new Map<Node, Resolution>(resolutions.map((resolution) => [resolution.site.call, resolution]));
         const removable = new Set<CallExpression>();
@@ -399,23 +375,26 @@ class CalculatorRewrite {
         }
 
         for (const resolution of resolutions) {
+            const { selected, bound } = resolution;
             this.log.debug(
-                `${resolution.site.calculator.name}: calculation resolved (case ${resolution.selected === undefined ? "none: undefined" : String(resolution.selected.label)})`,
+                `${resolution.site.calculator.name}: calculation resolved (case ${selected === undefined ? "none: undefined" : String(selected.label)}${bound === undefined ? "" : `, arguments bound first: ${bound}`})`,
                 resolution.site.call
             );
         }
         counts.resolved = resolutions.length;
+        counts.bound = resolutions.filter((resolution) => resolution.bound !== undefined).length;
         counts.selectorsRemoved = this.#rewrite(resolved, removable);
         counts.selectorsKept = [...this.#sites.values()].filter((site) => site.role === "selector").length - counts.selectorsRemoved;
 
         const refusals = [...reasons].map(([reason, n]) => `${reason} ${n}`).join("; ");
         this.log.info(
-            `${counts.calculators} calculator(s): resolved ${counts.resolved} calculation(s), kept ${counts.refused}${refusals === "" ? "" : ` (${refusals})`}; removed ${counts.selectorsRemoved} selector call(s), kept ${counts.selectorsKept}`
+            `${counts.calculators} calculator(s): resolved ${counts.resolved} calculation(s) (${counts.bound} with arguments bound first), kept ${counts.refused}${refusals === "" ? "" : ` (${refusals})`}; removed ${counts.selectorsRemoved} selector call(s), kept ${counts.selectorsKept}`
         );
+        // A bound calculation's arrow names only its own parameters (see `PassResult.bindingsChanged`); copied
+        // arguments are new references to existing bindings.
         return { changed: counts.resolved + counts.selectorsRemoved, bindingsChanged: this.#cloned > 0, stats: counts };
     }
 
-    /** One walk: calls of the calculators' methods (also through wrappers), other references, computed accesses, slot uses. */
     #collect(): void {
         const byFirstKey = new Map<string, Calculator[]>();
         for (const calculator of this.found) byFirstKey.set(calculator.path[0] as string, [...(byFirstKey.get(calculator.path[0] as string) ?? []), calculator]);
@@ -461,7 +440,6 @@ class CalculatorRewrite {
                 const [first] = keys;
                 if (keys.length === 0) return;
                 if (first === undefined) {
-                    // Only the first computed member matters; writes are the storage analysis' business.
                     const computed = path.parentPath as Path;
                     if (!computed.isWriteTarget()) this.#computed.push({ member: computed.node, places: placesOf(computed) });
                     return;
@@ -488,7 +466,6 @@ class CalculatorRewrite {
         if (!this.#escapes.has(calculator)) this.#escapes.set(calculator, node);
     }
 
-    /** A call site, once its callee is known to hold the snapshot's method when it runs. */
     #addSite(call: CallExpression, calculator: Calculator, role: Site["role"], reference: Node, wrapper: string | undefined, callPath: Path): void {
         const method = role === "selector" ? calculator.selector : calculator.calculation;
         const stale = (wrapper === undefined ? undefined : this.effects.staleAt(reference, [wrapper])) ?? this.effects.staleAt(reference, [...calculator.path, method]);
@@ -500,10 +477,7 @@ class CalculatorRewrite {
         this.#sites.set(call, { call, calculator, role, reference, wrapper, places: placesOf(callPath) });
     }
 
-    /**
-     * The case a calculation computes and its arguments, or why that isn't proven; a refusal carries the selector call
-     * the calculation surely reads, when that much is proven.
-     */
+    /** A refusal carries the selector call the calculation surely reads, when that much is proven. */
     #resolve(site: Site): Resolution | (Refusal & { readonly selector?: Site }) {
         const { call } = site;
         if (call.arguments.some((arg) => arg.type === "SpreadElement")) return refusal("a spread argument", call);
@@ -514,7 +488,6 @@ class CalculatorRewrite {
         return "ok" in outcome ? { ...outcome, selector: search.selector } : outcome;
     }
 
-    /** The case the selector call `selector` chooses for the calculation at `site`, with its arguments, if they can go in. */
     #caseOf(site: Site, selector: Site, args: readonly Expression[]): Resolution | Refusal {
         const { call, calculator } = site;
         const [chosen] = selector.call.arguments;
@@ -538,14 +511,11 @@ class CalculatorRewrite {
             const problem = this.#readOrderProblem(selected?.formula, args, getters, calculator);
             if (problem !== undefined) return refusal(`a getter argument ${problem}`, call);
         }
-        if (selected !== undefined) {
-            const problem = this.#orderProblem(selected.formula, args, calculator);
-            if (problem !== undefined) return refusal(problem, call);
-        }
-        return { site, selected, args };
+        const bound = selected === undefined ? undefined : this.#orderProblem(selected.formula, args, calculator);
+        if (bound !== undefined && !this.bindArguments) return refusal(bound, call);
+        return { site, selected, args, bound };
     }
 
-    /** Only reads of names and properties, with literal or such keys: no call, store or operator of its own. */
     #readsOnly(node: Node): boolean {
         switch (node.type) {
             case "Literal":
@@ -599,7 +569,6 @@ class CalculatorRewrite {
      */
     #overwrittenAfter(site: Site, resolved: ReadonlyMap<Node, Resolution>): boolean {
         const { calculator } = site;
-        /** `true`: a selector call comes first; `false`: something else may run first; `undefined`: quiet, go on. */
         const pass = (node: Node | null | undefined): boolean | undefined => {
             if (node === null || node === undefined) return undefined;
             if (this.#isOwnSelector(node, calculator)) return after((node as CallExpression).arguments, 0) ?? true;
@@ -667,7 +636,6 @@ class CalculatorRewrite {
                     result = parent.operator === "=" && key === "right" && this.#localStore(parent.left) ? undefined : false;
                     break;
                 case "BlockStatement":
-                    // Falling off its end goes on after it (in a block or an `if`; the next place decides).
                     result = after(parent.body, next);
                     break;
                 case "StaticBlock":
@@ -743,7 +711,6 @@ class CalculatorRewrite {
         }
     }
 
-    /** Quiet code (`#quiet`) whose value is a primitive other than a BigInt. */
     #quietPrimitive(node: Node, resolved: ReadonlyMap<Node, Resolution>): boolean {
         if (evaluate(node, this.env).ok) return true;
         switch (node.type) {
@@ -784,7 +751,6 @@ class CalculatorRewrite {
         };
         const own = before(call.arguments, call.arguments.length);
         if (own !== undefined) return own;
-        // The callee is read before the arguments: storage data properties, nothing runs.
         for (const { parent, key, index } of site.places) {
             const stop = (reason: string): Search => ({ kind: "stop", reason, node: parent });
             let result: Search | undefined;
@@ -859,7 +825,6 @@ class CalculatorRewrite {
                     if (key !== "block") return stop("the calculation is in a catch or finally block");
                     break;
                 case "SwitchCase":
-                    // A case's statements run from its first one, whether its label matched or the case before fell through.
                     if (key !== "consequent") return stop("the calculation is in a case label");
                     result = before(parent.consequent, index ?? 0);
                     if (result === undefined) return stop("no selector call before it in its case");
@@ -1078,7 +1043,6 @@ class CalculatorRewrite {
         return isolated;
     }
 
-    /** The one function a local name is bound to: a function declaration, or a `var` written once with a function. */
     #localFunction(identifier: Node): Node | undefined {
         const variable = this.scopes.variableOf(identifier);
         const [def] = variable?.defs ?? [];
@@ -1089,7 +1053,6 @@ class CalculatorRewrite {
         return init !== null && isFunctionNode(init) ? init : undefined;
     }
 
-    /** A store target that runs no setter: a safe local, or a slot of a slot array. */
     #localStore(target: Node): boolean {
         return target.type === "Identifier" ? this.#safeBinding(target) : this.#isSlotRead(target);
     }
@@ -1141,16 +1104,20 @@ class CalculatorRewrite {
 
     /**
      * Whether reading `node`, an argument, after code it doesn't know has run still gives what reading it first did:
-     * a slot read `S[i]` or a `var` whose binding no other function refers to (code that runs while an operator
-     * converts a value is another function's: only a function that names the binding can change it; a recursive
-     * call of this one gets bindings of its own), in a function no `eval` or `with` can reach into.
+     * a slot read `S[i]`, or a `var` or parameter whose binding no other function refers to (code that runs while an
+     * operator converts a value is another function's: only a function that names the binding can change it; a
+     * recursive call of this one gets bindings of its own), in a function no `eval` or `with` can reach into. A
+     * parameter also counts only in a strict function or an arrow: a sloppy function's `arguments` object maps its
+     * parameters, and code it is handed to (or `f.arguments`) could write them through it; a strict one's doesn't map,
+     * and an arrow has none.
      */
     #stableAcrossCalls(node: Node): boolean {
         const binding = node.type === "Identifier" ? node : this.#isSlotRead(node) && node.type === "MemberExpression" ? node.object : undefined;
         const variable = binding === undefined ? undefined : this.scopes.variableOf(binding);
         if (variable === undefined || variable.scope.dynamic || variable.defs.length !== 1) return false;
         const [def] = variable.defs;
-        if (def?.type !== "Variable" || def.parent.kind !== "var") return false;
+        const unmapped = def?.type === "Parameter" && (variable.scope.isStrict || (variable.scope.block as unknown as Node).type === "ArrowFunctionExpression");
+        if (!unmapped && (def?.type !== "Variable" || def.parent.kind !== "var")) return false;
         const own = variable.scope.variableScope;
         return this.scopes.staticReferences(variable).every((reference) => reference.from.variableScope === own);
     }
@@ -1199,7 +1166,7 @@ class CalculatorRewrite {
     #orderProblem(formula: Expression, args: readonly Expression[], calculator: Calculator): string | undefined {
         let converted = false;
         let problem: string | undefined;
-        /** Whether the value may be an object. */
+        /** Returns whether the value may be an object. */
         const visit = (node: Node): boolean => {
             switch (node.type) {
                 case "MemberExpression": {
@@ -1255,7 +1222,6 @@ class CalculatorRewrite {
 
     #parents = new Map<Node, Map<Node, Node>>();
 
-    /** Parents of the nodes in `block` (a function or the program), built once per block. */
     #parentsIn(block: Node): Map<Node, Node> {
         let parents = this.#parents.get(block);
         if (parents === undefined) {
@@ -1298,7 +1264,6 @@ class CalculatorRewrite {
         return undefined;
     }
 
-    /** Whether `parent` only calls or tests its child `value` (`f()`, `!f`, `typeof f`, a condition). */
     #calledOrTested(parent: Node, value: Node): boolean {
         switch (parent.type) {
             case "CallExpression":
@@ -1343,16 +1308,26 @@ class CalculatorRewrite {
         return undefined;
     }
 
-    /** The replacement of a resolved calculation: the case's expression with the arguments in, after kept selector calls among them. */
-    #replacement({ site, selected, args }: Resolution, removable: ReadonlySet<CallExpression>): Expression {
+    /**
+     * The replacement of a resolved calculation: the case's expression with the arguments in, after kept selector calls
+     * among them. Bound arguments become `((p0, p1) => <expression>)(x, y)` instead, literals (primitive constants:
+     * `#substitutable`) staying in the expression. It names nothing but its parameters, so no name collides.
+     */
+    #replacement({ site, selected, args, bound }: Resolution, removable: ReadonlySet<CallExpression>): Expression {
         const { call, calculator } = site;
         const used = new Set<number>();
+        const parameters = new Map<number, string>();
+        if (bound !== undefined) {
+            for (const [index, arg] of args.entries()) if (arg.type !== "Literal" && !this.#isOwnSelector(arg, calculator)) parameters.set(index, `p${parameters.size}`);
+        }
         const put = (node: Expression): Expression => {
             switch (node.type) {
                 case "MemberExpression": {
                     const index = Number(propertyKey(node));
                     const arg = args[index];
                     if (arg === undefined || this.#isOwnSelector(arg, calculator)) return voidZero(call);
+                    const parameter = parameters.get(index);
+                    if (parameter !== undefined) return at<Expression>({ type: "Identifier", name: parameter }, call);
                     if (!used.has(index)) {
                         used.add(index);
                         return arg;
@@ -1374,7 +1349,26 @@ class CalculatorRewrite {
                     throw new TypeError(`calculators: unexpected ${node.type} in a checked formula`);
             }
         };
-        const value = selected === undefined ? voidZero(call) : put(selected.formula);
+        const computed = selected === undefined ? voidZero(call) : put(selected.formula);
+        const value =
+            bound === undefined
+                ? computed
+                : callOf(
+                      at<Expression>(
+                          {
+                              type: "ArrowFunctionExpression",
+                              id: null,
+                              expression: true,
+                              async: false,
+                              generator: false,
+                              params: [...parameters.values()].map((name) => at<Expression>({ type: "Identifier", name }, call)),
+                              body: computed,
+                          },
+                          call
+                      ),
+                      [...parameters.keys()].map((index) => args[index] as Expression),
+                      call
+                  );
         const kept = args.filter((arg): arg is CallExpression => this.#isOwnSelector(arg, calculator) && !removable.has(arg as CallExpression));
         return kept.length === 0 ? value : at<Expression>({ type: "SequenceExpression", expressions: [...kept, value] }, call);
     }

@@ -2,7 +2,6 @@ import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 
-/** What a script leaves in `result`; `setTimeout` callbacks (code after the prelude) run once it has finished. */
 const observed = (source: string): string => {
     const timers: (() => void)[] = [];
     const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };
@@ -11,17 +10,15 @@ const observed = (source: string): string => {
     return JSON.stringify(context.result);
 };
 
-const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "calculators"] })).code;
+const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "calculators", "calculators-bound"] })).code;
 
-/** The program and its deobfuscation leave the same result; returns the deobfuscation. */
 const sameBehaviour = async (program: string): Promise<string> => {
     const output = await run(program);
     expect(observed(output)).toBe(observed(program));
     return output;
 };
 
-// jscrambler's shape: a builder returns a selector, which stores the case to compute, and the calculation, which
-// switches on it over its arguments. `G.c` and `G.s` are the runtime's wrappers of the two.
+// A builder returns a selector, which stores the case, and the calculation, which switches on it over its arguments.
 const calculator = ({ extra = "" } = {}) => `
 function G() {}
 G.K = function (I) {
@@ -45,7 +42,6 @@ G.c = function () { return typeof G.K.calc === "function" ? G.K.calc.apply(G.K, 
 G.s = function () { return typeof G.K.sel === "function" ? G.K.sel.apply(G.K, arguments) : G.K.sel; };
 `;
 
-/** The calculator, `prelude` code, and `body` as code that runs after the prelude (in a function with a slot array `S`). */
 const later = (body: string, extra = "", prelude = ""): string => `${calculator({ extra })}${prelude}setTimeout(function () {\n  var S = [arguments];\n${body}\n});\n`;
 
 describe("calculators", () => {
@@ -53,7 +49,6 @@ describe("calculators", () => {
         const output = await sameBehaviour(later("  var x = 5;\n  G.K.sel(0);\n  S[1] = G.K.calc(10, 3);\n  G.s(2);\n  S[2] = G.K.calc(x, 2, S[1]);\n  result = [S[1], S[2]];"));
         expect(output).toContain("S[1] = 10 - 3;");
         expect(output).toContain("S[2] = x + 2 * S[1];");
-        // Every calculation is gone: the selector calls only stored what nothing reads any more.
         expect(output).not.toMatch(/G\.K\.(calc|sel)\(|G\.[cs]\(/);
     });
 
@@ -108,7 +103,7 @@ describe("calculators", () => {
     });
 
     it("passes calls of runtime functions that can't reach a selector call", async () => {
-        // An environment check like jscrambler's: it only touches its builder's own state, through local functions.
+        // An environment check touching only its builder's own state, through local functions.
         const check = 'G.D = function () {\n  var code;\n  function probe() { if (!code) code = "j-1"; }\n  return { check: function () { if (!code) probe(); return code; } };\n}();\n';
         const output = await sameBehaviour(later("  G.s(0);\n  result = [G.D.check(), G.c(5, 1)];", "", check));
         expect(output).toContain("result = [G.D.check(), 5 - 1];");
@@ -158,12 +153,19 @@ describe("calculators", () => {
         expect(output).toContain("result = G.c(3, 4);");
     });
 
-    it("keeps calculations whose arguments would be read after a conversion that may run code", async () => {
+    it("binds the arguments first when one would be read after a conversion that may run code", async () => {
         const body = "  var z = 2;\n  var o = { valueOf: function () { z = 100; return 7; } };\n  G.s(4);\n  result = G.c(o, 1, z);";
         // The calculation reads z before o's valueOf changes it: (7 - 1) * 2.
         expect(observed(later(body))).toBe("12");
         const output = await sameBehaviour(later(body));
-        expect(output).toContain("result = G.c(o, 1, z);");
+        expect(output).toContain("result = ((p0, p1) => (p0 - 1) * p1)(o, z);");
+        // Also when a getter argument returns the object whose conversion writes z.
+        const getter = "  var z = 2;\n  var w = { valueOf: function () { z = 100; return 7; } };\n  var o = { get v() { return w; } };\n  G.s(4);\n  result = G.c(o.v, 1, z);";
+        expect(observed(later(getter))).toBe("12");
+        expect(await sameBehaviour(later(getter))).toContain("result = ((p0, p1) => (p0 - 1) * p1)(o.v, z);");
+        // A selector call passed among the arguments isn't bound: the case it chose is already in.
+        const selecting = "  var z = 2;\n  var o = { valueOf: function () { z = 100; return 7; } };\n  result = G.c(o, 1, z, G.s(4));";
+        expect(await sameBehaviour(later(selecting))).toContain("result = ((p0, p1) => (p0 - 1) * p1)(o, z);");
         // No other function names z or the slot array: whatever a conversion runs, they read the same after it.
         const stable = await sameBehaviour(later("  var z = 2;\n  S[2] = 3;\n  var o = { valueOf: function () { return 7; } };\n  G.s(4);\n  result = [G.c(o, 1, z), G.c(o, 1, S[2])];"));
         expect(stable).toContain("result = [(o - 1) * z, (o - 1) * S[2]];");
@@ -171,7 +173,49 @@ describe("calculators", () => {
         const primitive = await sameBehaviour(
             later("  var z = 2;\n  var touch = function () { z = 5; };\n  var n = 3 * 2;\n  var m = 3 * 2;\n  m = touch;\n  G.s(4);\n  result = [G.c(n, 1, z), G.c(m, 1, z)];")
         );
-        expect(primitive).toContain("result = [(n - 1) * z, G.c(m, 1, z)];");
+        expect(primitive).toContain("result = [(n - 1) * z, ((p0, p1) => (p0 - 1) * p1)(m, z)];");
+    });
+
+    it("leaves a bound calculation to the passes after it, which don't know its parameters", async () => {
+        const program = later("  var z = 2;\n  var o = { valueOf: function () { z = 100; return 7; } };\n  G.s(4);\n  result = G.c(o, 1, z);");
+        const { code } = await deobfuscate(program, { passes: ["emulate", "calculators", "calculators-bound", "cleanup", "simplify", "unminify"] });
+        expect(observed(code)).toBe(observed(program));
+        expect(code).toContain("((p0, p1) => (p0 - 1) * p1)(o, z)");
+    });
+
+    it("binds the arguments when the first may hold an object: a global, a parameter, a logical or conditional choice", async () => {
+        const hook = "  var z = 2;\n  var o = { valueOf: function () { z = 100; return 7; } };\n";
+        const bodies = [
+            `${hook}  globalThis.g = o;\n  G.s(4);\n  result = G.c(g, 1, z);`,
+            `${hook}  function f(p) { G.s(4); return G.c(p, 1, z); }\n  result = f(o);`,
+            `${hook}  var n = 0 || o;\n  G.s(4);\n  result = G.c(n, 1, z);`,
+            `${hook}  var n = z ? o : 1;\n  G.s(4);\n  result = G.c(n, 1, z);`,
+        ];
+        for (const body of bodies) {
+            const program = later(body, "", "var g = 6;\n");
+            expect(observed(program)).toBe("12");
+            await sameBehaviour(program);
+        }
+    });
+
+    it("reads parameters after a conversion only where no arguments object can write them", async () => {
+        // The valueOf writes the second parameter through the `arguments` object it was handed, then returns 7.
+        const object = "  var o = { valueOf: function () { this.args[1] = 100; return 7; } };\n";
+        const strict = `${object}  function f(o, p) { "use strict"; o.args = arguments; G.s(4); return G.c(o, 1, p); }\n  var g = (o, p) => { G.s(4); return G.c(o, 1, p); };\n  result = [f(o, 2), g(o, 2)];`;
+        // Strict arguments objects don't map the parameters; an arrow has none.
+        const output = await sameBehaviour(later(strict));
+        expect(output).not.toContain("G.c(");
+        expect(output).not.toContain("p0");
+        expect(output).toContain("return (o - 1) * p;");
+        // A sloppy function's does: the calculation reads p before the write, (7 - 1) * 2.
+        const sloppy = `${object}  function f(o, p) { o.args = arguments; G.s(4); return G.c(o, 1, p); }\n  result = f(o, 2);`;
+        expect(observed(later(sloppy))).toBe("12");
+        expect(await sameBehaviour(later(sloppy))).toContain("return ((p0, p1) => (p0 - 1) * p1)(o, p);");
+        // A strict parameter another function names may change during the conversion too.
+        const closure =
+            '  var o = { valueOf: function () { this.set(); return 7; } };\n  function f(o, p) { "use strict"; o.set = function () { p = 100; }; G.s(4); return G.c(o, 1, p); }\n  result = f(o, 2);';
+        expect(observed(later(closure))).toBe("12");
+        expect(await sameBehaviour(later(closure))).toContain("return ((p0, p1) => (p0 - 1) * p1)(o, p);");
     });
 
     it("puts getter arguments in when each is read once, in the order they were passed", async () => {
@@ -273,5 +317,13 @@ describe("calculators in the whole pipeline", () => {
         const { code } = await deobfuscate(program);
         expect(observed(code)).toBe(observed(program));
         expect(code).toContain("return q << p;");
+    });
+
+    it("binds arguments only once arguments arrays are gone, so those that become plain parameters go in directly", async () => {
+        // Before, `S[0][1]` would be read after converting `S[0][0]`; as a strict function's parameters they read the same.
+        const program = `${calculator()}function f(p, q) {\n  "use strict";\n  var S = [arguments];\n  G.K.sel(4);\n  return G.K.calc(S[0][0], 1, S[0][1]);\n}\nsetTimeout(function () { result = [f(2, 3), f({ valueOf: function () { return 5; } }, 8)]; });\n`;
+        const { code } = await deobfuscate(program);
+        expect(observed(code)).toBe(observed(program));
+        expect(code).toContain("return (p - 1) * q;");
     });
 });

@@ -5,27 +5,22 @@ import type { Facts } from "./facts.js";
 
 export interface PassContext {
     readonly program: Program;
-    /** Logs prefixed with the pass name; give it a node to print where that node was in the original input. */
     readonly log: PassLog;
-    /** What earlier passes learned (e.g. the emulated runtime model), shared for this run. */
     readonly facts: Facts;
-    /**
-     * Scope analysis of the program, computed on first use. It is redone after a pass that changed bindings, and
-     * refreshed (removed references dropped) after passes that changed only expressions.
-     */
+    /** Computed on first use; redone after binding changes, refreshed after expression-only changes. */
     scope(): ScopeInfo;
 }
 
 export interface PassResult {
-    /** Number of changes made. 0 means the program is untouched. */
+    /** 0 means the program is untouched. */
     readonly changed: number;
     /**
-     * `false` when the changes only replaced expressions in place: no declaration added or removed, no code moved to
-     * another scope. The next passes then reuse the scope analysis, refreshed: references that left with the replaced
-     * expressions are dropped, and nodes created since are unknown to it (they resolve to nothing). Defaults to true.
+     * `false` when changes only replaced expressions in place (no declaration added/removed, nothing moved scope): the
+     * scope analysis is then refreshed instead of redone. Also `false` when the only new declarations belong to a new
+     * function whose code names nothing but them: nothing outside can reach them, and identifiers the analysis
+     * doesn't know resolve to nothing, as for any node made since the last refresh. Defaults to true.
      */
     readonly bindingsChanged?: boolean;
-    /** Pass-specific counts, e.g. `{ found: 3, unflattened: 2, skipped: 1 }`. */
     readonly stats?: Readonly<Record<string, number>>;
 }
 
@@ -35,11 +30,11 @@ export interface Pass {
     run(context: PassContext): PassResult | Promise<PassResult>;
 }
 
-/** Passes that feed each other. They run in order, repeatedly, until a full round changes nothing. */
+/** Passes run in order, repeatedly, until a full round changes nothing. */
 export interface FixpointGroup {
     readonly group: string;
     readonly passes: readonly Pass[];
-    /** Safety cap on rounds. Hitting it is logged as a warning. */
+    /** Hitting it is logged as a warning. */
     readonly maxRounds: number;
 }
 
