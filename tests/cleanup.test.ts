@@ -60,10 +60,11 @@ describe("cleanup", () => {
     });
 
     it("removes stores of the runtime as a global the program never names, and keeps one it reads back", async () => {
-        const program = `${RUNTIME}globalThis.Kept = G;\nf(host);\nresult = out;\n`;
+        // Also a definition made through the store: `(globalThis.P = G).k = v`.
+        const program = `${RUNTIME}globalThis.Kept = G;\n(globalThis.Chained = G).x = function () { return G.D; };\nf(host);\nresult = out;\n`;
         const { code } = await deobfuscate(program);
         expect(run(code)).toBe(run(program));
-        expect(code).not.toMatch(/\bG\b|Kept/);
+        expect(code).not.toMatch(/\bG\b|Kept|Chained/);
         const readBack = `${RUNTIME}globalThis.Kept = G;\nf(host);\nresult = [out, typeof globalThis.Kept];\n`;
         const kept = await deobfuscate(readBack);
         expect(run(kept.code)).toBe(run(readBack));
@@ -254,6 +255,19 @@ describe("cleanup: dead stores", () => {
         expect(observed(code)).toBe(observed(input));
         expect(observed(input)).toBe('[4,["ReferenceError","converted","converted"]]');
         expect(code).not.toContain("copy");
+    });
+
+    it("drops a script global's dead table and declaration when only its name could reach it, not when the program spells it or uses the global object with an unknown key", async () => {
+        const dead = 'var table;\ntable = ["a", "b"];\nfunction unusedHelper() { return 1; }\nresult = 2;\n';
+        const { code } = await deobfuscate(dead, { passes: ["cleanup"] });
+        expect(run(code)).toBe(run(dead));
+        expect(code).toBe("result = 2;\n");
+        for (const reach of ['result = "table";', 'var key = host.side() ? "table" : "x";\nresult = typeof globalThis[key];']) {
+            const program = `var table;\ntable = ["a", "b"];\n${reach}\n`;
+            const kept = await deobfuscate(program, { passes: ["cleanup"] });
+            expect(run(kept.code)).toBe(run(program));
+            expect(kept.code).toContain('table = ["a", "b"];');
+        }
     });
 
     it("keeps unused locals a direct eval can see, and removes those it can't", async () => {

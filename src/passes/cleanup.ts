@@ -1,6 +1,8 @@
 import type { CallExpression, Expression, MemberExpression, Node, Program, Statement } from "../core/ast.js";
 import { isFunctionNode, memberPath, propertyKey } from "../core/ast.js";
 import { at } from "../core/build.js";
+import { constantEnv } from "../core/constants.js";
+import type { ConstantEnv } from "../core/constants.js";
 import type { Value } from "../core/evaluate.js";
 import { evaluate } from "../core/evaluate.js";
 import { parse, ParseError } from "../core/parse.js";
@@ -15,7 +17,8 @@ import type { DecoderProof } from "./emulate/decoder.js";
 import { DECODER_PROOF } from "./emulate/decoder.js";
 import type { StorageEffects } from "./emulate/effects.js";
 import { storageAnalysis } from "./emulate/effects.js";
-import { onlyTested, rootStatements } from "./emulate/storage.js";
+import type { StorageMatcher } from "./emulate/storage.js";
+import { onlyTested, rootStatements, storageMatcher } from "./emulate/storage.js";
 import { DETECTOR_BUILDERS } from "./detectors.js";
 import { keySets, mayName } from "./key-sets.js";
 import { inlineStorageAliases } from "./storage-aliases.js";
@@ -87,10 +90,15 @@ const roleOf = (
     if (statement.type !== "ExpressionStatement") return { kind: "other" };
     const e = statement.expression;
     if (e.type === "AssignmentExpression" && e.operator === "=" && isStorage(e.right) && keptAsGlobal(e.right)) return { kind: "store" };
-    if (e.type === "AssignmentExpression" && e.operator === "=" && e.left.type === "MemberExpression" && isStorage(e.left.object)) {
-        const key = propertyKey(e.left);
-        if (key === undefined) return { kind: "other" };
-        return { kind: "def", key, removable: isPure(e.right, scopes) || runtime.pure.has(statement) || detectorBuilders?.has(statement) === true };
+    if (e.type === "AssignmentExpression" && e.operator === "=" && e.left.type === "MemberExpression") {
+        // `(globalThis.P = G).k = v`: `G` kept on the way as a global the program never names (model 2).
+        const object = e.left.object;
+        const holder = object.type === "AssignmentExpression" && object.operator === "=" && isStorage(object.right) && keptAsGlobal(object.right) ? object.right : object;
+        if (isStorage(holder)) {
+            const key = propertyKey(e.left);
+            if (key === undefined) return { kind: "other" };
+            return { kind: "def", key, removable: isPure(e.right, scopes) || runtime.pure.has(statement) || detectorBuilders?.has(statement) === true };
+        }
     }
     const target = e.type === "CallExpression" ? e.callee : e;
     const path = memberPath(target);
@@ -145,25 +153,48 @@ export const cleanup: Pass = {
         let runtime = 0;
         let locals = 0;
         // Removed code takes its references along, which can leave more unused: repeat until nothing more goes, with the
-        // analysis refreshed in between (removed references dropped; no binding is added, so nothing else changes).
+        // analysis told in between what went (`forget`: its references drop; no binding is added, nothing else changes).
+        // The runtime's liveness only changes with removed runtime statements or removed code naming the runtime.
+        let runtimeDirty = true;
         for (let round = 0; ; round++) {
             if (round === MAX_CLEANUP_ROUNDS) {
                 log.warn(`stopped after ${MAX_CLEANUP_ROUNDS} rounds; more may be removable`);
                 break;
             }
-            const removedRuntime = removeRuntime(program, model, facts.get(DECODER_PROOF), facts.get(DETECTOR_BUILDERS), scopes, log);
-            const removedStores = removeDeadStores(program, scopes, log);
-            const removedLocals = removeUnusedLocals(program, scopes, log);
+            const removed: Node[] = [];
+            const removedRuntime: number = runtimeDirty ? removeRuntime(program, model, facts.get(DECODER_PROOF), facts.get(DETECTOR_BUILDERS), scopes, log, removed) : 0;
+            const removedStores = removeDeadStores(program, scopes, log, removed);
+            const removedLocals = removeUnusedLocals(program, scopes, log, removed);
             runtime += removedRuntime;
             locals += removedStores + removedLocals;
             if (removedRuntime + removedStores + removedLocals === 0) break;
-            scopes.refresh(program);
+            runtimeDirty = removedRuntime > 0 || (model !== undefined && namesRuntime(removed, model, storageMatcher(program, model, scopes)));
+            scopes.forget(removed);
         }
         const aliases = model === undefined ? 0 : inlineStorageAliases(model, storageAnalysis(program, model, scopes, log).matcher, scopes, log);
         // Removals only take declarations and references away (what a refresh of the analysis drops); the storage
         // name put in for aliases is a new reference the analysis doesn't know, so only that needs a new analysis.
         return { changed: runtime + locals + aliases, bindingsChanged: aliases > 0, stats: { runtime, locals, aliases } };
     },
+};
+
+/**
+ * Whether removed code names the runtime: the storage object or an alias of it, a root function, or a name the setup
+ * added (alias or global). Removing anything else leaves every runtime statement's liveness as it was.
+ */
+const namesRuntime = (removed: readonly Node[], runtime: RuntimeModel, matcher: StorageMatcher): boolean => {
+    const names = new Set<string>([runtime.storage, ...[...matcher.aliases].map((variable) => variable.name), ...runtime.aliases.map((alias) => alias.alias), ...runtime.setupGlobals]);
+    for (const statement of rootStatements(runtime.root)) if (statement.type === "FunctionDeclaration" && statement.id !== null) names.add(statement.id.name);
+    let found = false;
+    for (const node of removed) {
+        traverse(node, {
+            Identifier(path) {
+                if (names.has(path.node.name)) found = true;
+            },
+        });
+        if (found) return true;
+    }
+    return false;
 };
 
 /** `pure` and `setup` are keyed by the root statement and follow it through one-for-one replacements: one an earlier pass split or removed lost its fact. */
@@ -286,7 +317,8 @@ const removeRuntime = (
     decoders: DecoderProof | undefined,
     detectorBuilders: ReadonlySet<Node> | undefined,
     scopes: ScopeInfo,
-    log: PassContext["log"]
+    log: PassContext["log"],
+    removed: Node[]
 ): number => {
     if (runtime === undefined) return 0;
     const body = rootStatements(runtime.root);
@@ -451,7 +483,7 @@ const removeRuntime = (
     if (log.debugging) logDefinitions(roles, kept, liveBy, unreachable, body, runtime.storage, log);
     for (const index of dropped.toReversed()) {
         log.debug(`removed runtime statement (${roles[index]?.kind})`, body[index]);
-        body.splice(index, 1);
+        removed.push(...body.splice(index, 1));
     }
     if (dropped.length > 0) log.info(`removed ${dropped.length} runtime statement(s)`);
     return dropped.length;
@@ -487,39 +519,51 @@ const logDefinitions = (
  */
 const hiddenUses = (variable: Variable): boolean => variable.scope.dynamic;
 
-const removeUnusedLocals = (program: Node, scopes: ScopeInfo, log: PassContext["log"]): number => {
+/**
+ * Declarations cleanup took out: the scope analysis, refreshed rather than rebuilt, still lists their bindings, so the
+ * next round would find them unused again (and walk the program to remove nothing).
+ */
+const removedDeclarations = new WeakSet<Node>();
+
+const removeUnusedLocals = (program: Node, scopes: ScopeInfo, log: PassContext["log"], out: Node[]): number => {
     const within = scopes.manager.scopes.find((s) => s.type === "with");
     if (within !== undefined) {
         log.info("the program uses with; unused locals stay", within.block as unknown as Node);
         return 0;
     }
     // Candidates first, then which go: a candidate goes when every use but its own initialization is inside code that
-    // goes too, so whole chains (`var a = b; var b = 1;`) go in one pass instead of one per analysis refresh.
+    // goes too, so whole chains (`var a = b; var b = 1;`) go in one pass instead of one per analysis refresh. The
+    // scope analysis lists the declarations (no walk): declarators with a pure initializer, and function declarations
+    // directly in a function body or the script (sloppy-mode block functions are also visible outside their block,
+    // Annex B, which the analysis doesn't model).
+    const env = constantEnv(scopes, log);
     const candidates: { node: Node; variable: Variable; body: Node | null }[] = [];
-    traverse(program, {
-        VariableDeclaration(path) {
-            const parent = path.parent;
-            // A for-in/of head's binding is the loop's assignment target: it stays even when nothing reads it.
-            if ((parent?.type === "ForInStatement" || parent?.type === "ForOfStatement") && path.key === "left") return;
-            for (const declarator of path.node.declarations) {
-                if (declarator.id.type !== "Identifier") continue;
-                const variable = scopes.variableOf(declarator.id);
-                if (variable === undefined || !isLocalScope(variable.scope.type) || variable.defs.length !== 1 || hiddenUses(variable) || !isPure(declarator.init, scopes)) continue;
-                candidates.push({ node: declarator, variable, body: declarator.init });
+    const bodies = new Map<Node, ReadonlySet<Node>>();
+    const directlyIn = (block: Node, node: Node): boolean => {
+        let body = bodies.get(block);
+        if (body === undefined) {
+            body = new Set<Node>(
+                block.type === "Program" ? block.body : isFunctionNode(block) && (block as { body: Node }).body.type === "BlockStatement" ? (block as { body: { body: Node[] } }).body.body : []
+            );
+            bodies.set(block, body);
+        }
+        return body.has(node);
+    };
+    for (const scope of scopes.manager.scopes) {
+        for (const variable of scope.variables) {
+            const [def] = variable.defs;
+            if (def === undefined || variable.defs.length !== 1 || removedDeclarations.has(def.node as unknown as Node) || !mayBeOwn(variable)) continue;
+            const node = def.node as unknown as Node;
+            if (def.type === "Variable" && node.type === "VariableDeclarator" && node.id.type === "Identifier" && isPure(node.init, scopes)) {
+                // A for-in/of head's binding is the loop's assignment target (written there, with no initializer): it
+                // stays even when nothing reads it.
+                if (node.init === null && variable.references.some((reference) => reference.init === true)) continue;
+                candidates.push({ node, variable, body: node.init });
+            } else if (def.type === "FunctionName" && node.type === "FunctionDeclaration" && directlyIn(scope.block as unknown as Node, node)) {
+                candidates.push({ node, variable, body: node });
             }
-        },
-        FunctionDeclaration(path) {
-            const node = path.node as Node;
-            if (node.type !== "FunctionDeclaration" || node.id === null) return;
-            // Only directly in a function body: sloppy-mode block functions are also visible outside their block
-            // (Annex B), which the scope analysis doesn't model.
-            const inFunctionBody = path.parent?.type === "BlockStatement" && isFunctionNode(path.parentPath?.parent);
-            if (!path.isInStatementList() || !inFunctionBody) return;
-            const variable = scopes.variableOf(node.id);
-            if (variable === undefined || !isLocalScope(variable.scope.type) || variable.defs.length !== 1 || hiddenUses(variable)) return;
-            candidates.push({ node, variable, body: node });
-        },
-    });
+        }
+    }
     const dead = new Set<Node>();
     /** Identifiers inside code that goes: their references no longer count. */
     const gone = new Set<Node>();
@@ -527,6 +571,7 @@ const removeUnusedLocals = (program: Node, scopes: ScopeInfo, log: PassContext["
         changed = false;
         for (const candidate of candidates) {
             if (dead.has(candidate.node) || !candidate.variable.references.every((reference) => reference.init || gone.has(reference.identifier as unknown as Node))) continue;
+            if (!ownBinding(candidate.variable, env)) continue;
             dead.add(candidate.node);
             changed = true;
             if (candidate.body !== null) traverse(candidate.body, { Identifier: (path) => void gone.add(path.node) });
@@ -543,6 +588,8 @@ const removeUnusedLocals = (program: Node, scopes: ScopeInfo, log: PassContext["
                 if (unused.length === 0) return;
                 for (const declarator of unused) log.debug(`removed unused ${declaration.kind} ${declarator.id.type === "Identifier" ? declarator.id.name : ""}`, declarator);
                 declaration.declarations = declaration.declarations.filter((declarator) => !dead.has(declarator));
+                for (const declarator of unused) removedDeclarations.add(declarator);
+                out.push(...unused);
                 removed += unused.length;
                 if (declaration.declarations.length > 0) return;
                 if (parent?.type === "ForStatement" && path.key === "init") parent.init = null;
@@ -556,6 +603,8 @@ const removeUnusedLocals = (program: Node, scopes: ScopeInfo, log: PassContext["
                 if (!dead.has(node) || node.type !== "FunctionDeclaration") return;
                 log.debug(`removed unused function ${node.id?.name ?? ""}`, node);
                 path.remove();
+                removedDeclarations.add(node);
+                out.push(node);
                 removed++;
             },
         },
@@ -574,9 +623,9 @@ const isPlainPrimitive = (node: Node | null): boolean => {
 };
 
 /**
- * `x = <primitive>;`, `x += <primitive>;`, `x++;` or `x = y;` (`y` a `var`, function, parameter or catch binding:
- * reading it runs no code and can't throw) as a statement: what it does to its local, and whether it stores a
- * primitive.
+ * `x = <primitive>;`, `x += <primitive>;`, `x++;` or `x = v;` (`v` pure: a binding that exists from its scope's
+ * start, a literal, a function, a plain literal of those) as a statement: what it does to its local, and whether it
+ * stores a primitive.
  */
 const storeOf = (statement: Node, scopes: ScopeInfo): { target: Node; update: boolean; primitive: boolean } | undefined => {
     if (statement.type !== "ExpressionStatement") return undefined;
@@ -584,27 +633,39 @@ const storeOf = (statement: Node, scopes: ScopeInfo): { target: Node; update: bo
     if (e.type === "UpdateExpression") return e.argument.type === "Identifier" ? { target: e.argument, update: true, primitive: true } : undefined;
     if (e.type !== "AssignmentExpression" || e.left.type !== "Identifier") return undefined;
     if (isPlainPrimitive(e.right)) return { target: e.left, update: e.operator !== "=", primitive: true };
-    return e.operator === "=" && e.right.type === "Identifier" && isPlainBinding(scopes.variableOf(e.right)) ? { target: e.left, update: false, primitive: false } : undefined;
+    return e.operator === "=" && isPure(e.right, scopes) ? { target: e.left, update: false, primitive: false } : undefined;
 };
 
-/** A binding whose reads run no code and can't throw: a `var`, a function, a parameter or a catch binding. */
-const isPlainBinding = (variable: Variable | undefined): boolean =>
-    variable !== undefined &&
-    variable.defs.length > 0 &&
-    variable.defs.every(
-        (def) => def.type === "FunctionName" || def.type === "Parameter" || def.type === "CatchClause" || (def.type === "Variable" && (def.parent as { kind?: string } | null)?.kind === "var")
-    );
+/**
+ * Whether `variable` is one only the program's own code, by its name, can reach: a function's binding no direct
+ * `eval` can see, or a script global the program never reaches as a property (`onlyByName`; other scripts don't
+ * touch it: semantic model 2).
+ */
+const ownBinding = (variable: Variable, env: ConstantEnv): boolean => mayBeOwn(variable) && (variable.scope.type !== "global" || env.onlyByName(variable));
+
+/** The cheap half of `ownBinding`: a function's binding no direct `eval` can see, or a script global. */
+const mayBeOwn = (variable: Variable): boolean => (isLocalScope(variable.scope.type) ? !hiddenUses(variable) : variable.scope.type === "global");
+
+/** Whether a statement other than its declaration writes `variable`. */
+const isStoredTo = (variable: Variable): boolean => variable.references.some((reference) => reference.init !== true && reference.isWrite());
 
 /**
- * Stores to locals nothing reads: jscrambler's leftover flattening state (`a = 576049076; S = 2; Z0 += 2; u4++;`) and
- * copies of tables (`t = table;`). A local qualifies when it has one declaration with a primitive (or no) initializer
- * and every other reference is a statement of its own that stores a primitive (`x = 1;`) or a plain binding's value
- * (`x = y;`), or updates it with a primitive (`x += 2;`, `x++`) when it only ever holds primitives. The reads the
- * updates make then run no code, and nothing else ever sees it: the statements go, and the declaration is left with
- * no use for `removeUnusedLocals`.
+ * Stores to locals nothing reads: jscrambler's leftover flattening state (`a = 576049076; S = 2; Z0 += 2; u4++;`),
+ * copies of tables (`t = table;`) and dead tables (`T = ["a", "b"];`). A local (or a script global only reachable by
+ * name, `ownBinding`) qualifies when it has one declaration with a primitive (or no) initializer and every other
+ * reference is a statement of its own that stores a primitive (`x = 1;`) or a pure value (`x = y;`), or updates it
+ * with a primitive (`x += 2;`, `x++`) when it only ever holds primitives. The reads the updates make then run no
+ * code, and nothing else ever sees it: the statements go, and the declaration is left with no use for
+ * `removeUnusedLocals`.
  */
-const removeDeadStores = (program: Node, scopes: ScopeInfo, log: PassContext["log"]): number => {
+const removeDeadStores = (program: Node, scopes: ScopeInfo, log: PassContext["log"], out: Node[]): number => {
     if (scopes.manager.scopes.some((s) => s.type === "with")) return 0;
+    // Only a binding stored to, every reference of which writes it (or initializes it), can qualify: without one, no
+    // walk.
+    const onlyWritten = scopes.manager.scopes.some((scope) =>
+        scope.variables.some((v) => v.defs.length === 1 && isStoredTo(v) && v.references.every((reference) => reference.init === true || reference.isWrite()))
+    );
+    if (!onlyWritten) return 0;
     /** Store statements by the variable they store to. */
     const stores = new Map<Variable, Node[]>();
     traverse(program, {
@@ -617,11 +678,12 @@ const removeDeadStores = (program: Node, scopes: ScopeInfo, log: PassContext["lo
             else list.push(path.node);
         },
     });
+    const env = constantEnv(scopes, log);
     const dead = new Set<Node>();
     for (const [v, statements] of stores) {
         const [def] = v.defs;
         // A `var` only: a store to a `let`/`const` before its declaration throws.
-        if (!isLocalScope(v.scope.type) || v.defs.length !== 1 || def?.type !== "Variable" || (def.parent as { kind?: string } | null)?.kind !== "var" || hiddenUses(v)) continue;
+        if (v.defs.length !== 1 || def?.type !== "Variable" || (def.parent as { kind?: string } | null)?.kind !== "var") continue;
         const declarator = def.node as unknown as { init: Node | null };
         if (declarator.init !== null && !isPlainPrimitive(declarator.init)) continue;
         const parsed = statements.map((statement) => storeOf(statement, scopes) as { target: Node; update: boolean; primitive: boolean });
@@ -629,6 +691,8 @@ const removeDeadStores = (program: Node, scopes: ScopeInfo, log: PassContext["lo
         if (parsed.some((store) => store.update) && !parsed.every((store) => store.primitive)) continue;
         const targets = new Set(parsed.map((store) => store.target));
         if (!v.references.every((reference) => reference.init === true || targets.has(reference.identifier as unknown as Node))) continue;
+        // Last: whether a script global is reachable otherwise takes a look at the whole program.
+        if (!ownBinding(v, env)) continue;
         for (const statement of statements) dead.add(statement);
         log.debug(`removed ${statements.length} store(s) to ${v.name}, which nothing reads`, statements[0]);
     }
@@ -636,6 +700,7 @@ const removeDeadStores = (program: Node, scopes: ScopeInfo, log: PassContext["lo
     traverse(program, {
         ExpressionStatement(path) {
             if (!dead.has(path.node)) return;
+            out.push(path.node);
             if (path.isInStatementList()) path.remove();
             else path.replace(at<Statement>({ type: "EmptyStatement" }, path.node));
         },
