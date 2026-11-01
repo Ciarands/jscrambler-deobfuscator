@@ -161,15 +161,28 @@ const inlineTemplateStrings = (node: TemplateLiteral): TemplateLiteral | undefin
     return at<TemplateLiteral>({ type: "TemplateLiteral", quasis, expressions }, node);
 };
 
-/** Characters an escape in a pattern can stand for as themselves: letters, `_` and space mean the same unescaped. */
-const isPlainPatternChar = (code: number): boolean => (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code === 95 || code === 32;
+/** Characters an escape in a pattern can stand for as themselves: letters, digits, `_` and space mean the same unescaped (see `mergesBefore`). */
+const isPlainPatternChar = (code: number): boolean => (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || (code >= 48 && code <= 57) || code === 95 || code === 32;
 
 /**
  * Punctuation that means itself anywhere in a pattern without the `v` flag (where `&&`, `!!`, ... inside classes are
- * reserved). Not `,` (`{1\x2c2}` is literal text, `{1,2}` a quantifier), digits (`\1\x31` would become `\11`), nor any
- * syntax character.
+ * reserved). `,` too where it can't complete a quantifier (`{1\x2c2}` is literal text, `{1,2}` a quantifier).
  */
-const PLAIN_PUNCTUATION: ReadonlySet<number> = new Set([..."!\"#%&':;<=>@`~"].map((char) => char.charCodeAt(0)));
+const PLAIN_PUNCTUATION: ReadonlySet<number> = new Set([..."!\"#%&',:;<=>@`~"].map((char) => char.charCodeAt(0)));
+
+/** Syntax characters (and `/`, which ends the literal): an identity escape `\.` means the character, with any flag. */
+const SYNTAX_CHARACTERS: ReadonlySet<number> = new Set([..."^$\\.*+?()[]{}|/"].map((char) => char.charCodeAt(0)));
+
+/**
+ * Whether `char`, written after `out` unescaped, would join what comes before into something else: a digit after a
+ * backreference or octal escape (`\1` + `1` is `\11`), a hex digit after an unfinished `\x`/`\u` (non-unicode `\x4`
+ * is the text `x4`, `\x4` + `1` the character `A`), a digit or `,` after an open `{` (`a{1` + `,2}` is a
+ * quantifier).
+ */
+const mergesBefore = (out: string, char: string, inClass: boolean): boolean =>
+    (/\d/.test(char) && /(?:^|[^\\])(?:\\\\)*\\\d+$/.test(out)) ||
+    (/[\dA-Fa-f]/.test(char) && /(?:^|[^\\])(?:\\\\)*\\(?:x[\dA-Fa-f]?|u\{?[\dA-Fa-f]{0,3})$/.test(out)) ||
+    (!inClass && /[\d,]/.test(char) && /(?:^|[^\\])(?:\\\\)*\{[\d,]*$/.test(out));
 
 /** How many capturing groups a pattern has: each `(` not followed by `?`, and each named group `(?<name>`. */
 const capturingGroups = (pattern: string): number => {
@@ -191,16 +204,29 @@ const capturingGroups = (pattern: string): number => {
 };
 
 /**
- * `/\x70\x72\u006fgress/` -> `/progress/`, `/\163\137\164h\072/` -> `/s_th:/`: escapes of letters, `_`, space (and,
- * without the `v` flag, plain punctuation) written as the characters. `\xHH` and `\uHHHH` mean the same in and out
- * of classes with any flag. A three-digit legacy octal escape (`\163`, only without `u`/`v`) is a character in a
- * class and, outside one, when it starts with 0 or its number is past the pattern's capturing groups (else it would
- * be a backreference); one followed by another digit stays (`\1634`: the digits read as one number). Nothing is
- * unescaped after `\c` (`\c\x41` is `\c` and `A` apart, `\cA` a control character).
+ * `/\x70\x72\u006fgress/` -> `/progress/`, `/\163\137\164h\072/` -> `/s_th:/`, `/\u002e(srt|vtt)/` ->
+ * `/\.(srt|vtt)/`: escapes of printable characters written as the characters, unless that joins what comes before
+ * into something else (`mergesBefore`). Letters, digits, `_` and space as themselves; without the `v` flag, plain
+ * punctuation too, syntax characters as identity escapes (`\.`, `\/`), and `-` as itself outside classes and `\-` in
+ * them. `\xHH` and `\uHHHH` mean the same in and out of classes with any flag. A three-digit legacy octal escape
+ * (`\163`, only without `u`/`v`) is a character in a class and, outside one, when it starts with 0 or its number is
+ * past the pattern's capturing groups (else it would be a backreference); one followed by another digit stays
+ * (`\1634`: the digits read as one number). Nothing is unescaped after `\c` (`\c\x41` is `\c` and `A` apart, `\cA` a
+ * control character).
  */
 const readablePattern = (pattern: string, flags: string): string | undefined => {
     const unicode = flags.includes("u") || flags.includes("v");
-    const readable = (code: number): boolean => isPlainPatternChar(code) || (!flags.includes("v") && PLAIN_PUNCTUATION.has(code));
+    const setMode = flags.includes("v");
+    /** How the character `code` reads in the pattern, or undefined when it keeps its escape. */
+    const spelling = (code: number, inClass: boolean): string | undefined => {
+        const char = String.fromCharCode(code);
+        if (isPlainPatternChar(code)) return char;
+        if (setMode) return undefined;
+        if (PLAIN_PUNCTUATION.has(code)) return char;
+        if (SYNTAX_CHARACTERS.has(code)) return `\\${char}`;
+        if (char === "-") return inClass ? "\\-" : "-";
+        return undefined;
+    };
     let groups: number | undefined;
     let out = "";
     let changed = false;
@@ -228,8 +254,9 @@ const readablePattern = (pattern: string, flags: string): string | undefined => 
                 length = 4;
             }
         }
-        if (code !== undefined && readable(code) && !afterControl) {
-            out += String.fromCharCode(code);
+        const spelled = code === undefined || afterControl ? undefined : spelling(code, inClass);
+        if (spelled !== undefined && !mergesBefore(out, spelled.at(-1) as string, inClass)) {
+            out += spelled;
             changed = true;
             afterControl = false;
             i += length;

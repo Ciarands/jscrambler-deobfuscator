@@ -225,14 +225,14 @@ describe("unminify", () => {
         expect(await sameBehaviour("var f = function () { var o = {}; o.v = 1; return o; }.apply(this, arguments);\nresult = f;")).toContain(".apply(this, arguments)");
     });
 
-    it("writes escaped letters of regex patterns as letters, not digits, brackets or a control escape's letter", async () => {
+    it("writes escaped letters of regex patterns as letters and brackets as escapes, not a digit after a backreference or a control escape's letter", async () => {
         const output = await sameBehaviour(
             [
                 "var r = [/\\x70\\x72\\u006fgress/i, /^(?:\\u0055\\x69|\\x49)\\x6e\\u0074$/, /[\\x61-\\x66_]+/, /(a)\\1\\x31/, /\\x5b\\x41\\x5d/, /\\c\\x41/];",
                 'result = r.map(function (x) { return [x.test("PROGRESS"), x.test("Uint"), x.test("cafe"), x.test("aa1"), x.test("[A]"), x.test("\\\\cA")]; });',
             ].join("\n")
         );
-        expect(output).toContain("/progress/i, /^(?:Ui|I)nt$/, /[a-f_]+/, /(a)\\1\\x31/, /\\x5bA\\x5d/, /\\c\\x41/");
+        expect(output).toContain("/progress/i, /^(?:Ui|I)nt$/, /[a-f_]+/, /(a)\\1\\x31/, /\\[A\\]/, /\\c\\x41/");
     });
 
     it("writes legacy octal escapes and plain punctuation as characters, keeping backreferences and syntax", async () => {
@@ -245,7 +245,18 @@ describe("unminify", () => {
             ].join("\n")
         );
         // `[::]` would be a syntax error with the `v` flag.
-        for (const pattern of ["/^s_th:/", "/(a)(b)\\2\\1634/", "/[s\\055]+/", "/[:]/", "/[:\\x3a]/v", "/a{1\\x2c2}/", "/\\061/", `${groups}\\101/`]) expect(output).toContain(pattern);
+        for (const pattern of ["/^s_th:/", "/(a)(b)\\2\\1634/", "/[s\\-]+/", "/[:]/", "/[:\\x3a]/v", "/a{1\\x2c2}/", "/1/", `${groups}\\101/`]) expect(output).toContain(pattern);
+    });
+
+    it("writes escaped digits and syntax characters plainly or as identity escapes, unless they would join what comes before", async () => {
+        const output = await sameBehaviour(
+            [
+                "var r = [/\\u002e(srt|vtt)/, /\\x2f\\053\\x2d/, /[\\x29\\u0028\\x2d]/, /^(\\061|true)$/, /\\x4\\x41/, /a{\\x31}/, /[\\1\\x31]/, /\\x2e/u];",
+                'result = r.map(function (x) { return [x.test("a.vtt"), x.test("/+-"), x.test("-"), x.test("1"), x.test("x4A"), x.test("J"), x.test("a{1}"), x.test("a"), x.test("\\u0001"), x.test("\\t")]; });',
+            ].join("\n")
+        );
+        // Non-unicode `\x4` is the text `x4`, and `{` without a quantifier is a character; `\1` in a class is octal.
+        for (const pattern of ["/\\.(srt|vtt)/", "/\\/\\+-/", "/[\\)\\(\\-]/", "/^(1|true)$/", "/\\x4\\x41/", "/a{\\x31}/", "/[\\1\\x31]/", "/\\./u"]) expect(output).toContain(pattern);
     });
 
     it("writes shuffled classes of letters and digits as sorted ranges and long quantifiers short, not in classes or with v", async () => {
