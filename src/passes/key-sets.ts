@@ -57,6 +57,14 @@ const arraysOnly = (a: Abstract): boolean => a.arrays.size > 0 && !a.numbers && 
 /** Only numbers. */
 const numeric = (a: Abstract): boolean => a.chars === undefined && a.arrays.size === 0 && !a.fromCharCode && [...a.prims].every((v) => typeof v === "number");
 
+/** Unary operators on primitives (never BigInts here): what each gives. */
+const UNARY: Readonly<Record<string, ((v: Value) => Value) | undefined>> = {
+    "-": (v) => -Number(v),
+    "+": (v) => Number(v),
+    "~": (v) => ~Number(v),
+    "!": (v) => !v,
+};
+
 /** Operators whose result is a boolean whatever numbers they compare. */
 const COMPARISONS: Record<string, true> = { "==": true, "!=": true, "===": true, "!==": true, "<": true, "<=": true, ">": true, ">=": true };
 
@@ -89,7 +97,9 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
     const sources = new Map<Node | Variable, ArraySource | undefined>();
     const pending = new Set<Variable>();
 
-    const isGlobal = (node: Node, name: string): boolean => node.type === "Identifier" && node.name === name && scopes.isGlobalReference(node);
+    /** Whether `node` is the global `name`: an identifier a pass made since the analysis names it when no scope declares the name. */
+    const isGlobal = (node: Node, name: string): boolean =>
+        node.type === "Identifier" && node.name === name && !withScope && (scopes.isGlobalReference(node) || (scopes.referenceOf(node) === undefined && !scopes.declaresName(name)));
 
     /** `id`'s parent, when `parents` knows it (references outside the covered code are unknown). */
     const parentOf = (id: Node): Node | undefined => parents.get(id);
@@ -164,18 +174,27 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
         const index = fn.params.findIndex((param) => param === (def?.name as unknown as Node));
         if (index < 0 || fn.params.slice(0, index).some((param) => param.type !== "Identifier")) return undefined;
         if (fn.type !== "ArrowFunctionExpression" && (scopes.scopeOf(fn)?.set.get("arguments")?.references.length ?? 0) > 0) return undefined;
-        // The function's own binding: `function f(...)` or `var f = function (...)`, never written again.
+        // The function's own binding: `function f(...)` or `var f = function (...)`. Writes of other values to it hand
+        // the function to nothing, and every read must be a direct call (whichever function the binding holds then,
+        // the arguments passed cover this one's calls), except reads in the same function after a later declarator of
+        // the same declaration replaced it (`var r = function (e) {...}, s = r(k), r = s;`): from there on, it holds
+        // what that declarator stored until the declaration runs again, which comes before them.
         const parent = parentOf(fn);
         const holder = fn.type === "FunctionDeclaration" ? fn.id : parent?.type === "VariableDeclarator" && parent.init === fn ? parent.id : undefined;
         const binding = holder?.type === "Identifier" ? scopes.staticVariableOf(holder) : undefined;
-        if (binding === undefined || binding.defs.length !== 1) return undefined;
+        if (binding === undefined || !binding.defs.every((d) => d.type === "Variable" || d.type === "FunctionName")) return undefined;
+        const replacedFrom = Math.min(
+            Number.POSITIVE_INFINITY,
+            ...binding.defs.filter((d) => parent !== undefined && d.parent === parentOf(parent) && (d.node as unknown as Node).start > parent.start).map((d) => (d.node as unknown as Node).end)
+        );
         let result: Abstract | undefined = EMPTY;
         let hasArrays = false;
         for (const reference of scopes.staticReferences(binding)) {
-            if (reference.init) continue;
+            if (reference.isWrite() && !reference.isRead()) continue;
             const id = reference.identifier as unknown as Node;
             const call = parentOf(id);
-            if (reference.isWrite() || call?.type !== "CallExpression" || call.callee !== id) return undefined;
+            if (id.start >= replacedFrom && reference.from.variableScope === binding.scope.variableScope) continue;
+            if (call?.type !== "CallExpression" || call.callee !== id) return undefined;
             const args = call.arguments;
             if (args.slice(0, index + 1).some((arg) => arg.type === "SpreadElement")) return undefined;
             const arg = args[index] as Expression | undefined;
@@ -286,6 +305,14 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
             }
             case "CallExpression":
                 return call(node);
+            case "UnaryExpression": {
+                // Operators on primitives run no code: `-49`, `!x`.
+                const operate = UNARY[node.operator];
+                const argument = operate === undefined ? undefined : abstract(node.argument);
+                if (operate === undefined || argument === undefined) return undefined;
+                if (onlyPrims(argument)) return prims(...[...argument.prims].map(operate));
+                return numeric(argument) ? (node.operator === "!" ? prims(true, false) : ANY_NUMBER) : undefined;
+            }
             case "BinaryExpression": {
                 if (node.left.type === "PrivateIdentifier" || node.operator === "in" || node.operator === "instanceof") return undefined;
                 const left = abstract(node.left);

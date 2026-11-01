@@ -130,6 +130,16 @@ describe("code-locks full removal", () => {
         expect(output).not.toContain("G.L.check()");
     });
 
+    it("removes the calls of a lock that a later computed read can't name: a probe of a few characters", async () => {
+        // jscrambler's decoder finds its string by shuffling a few characters into a key of G; "L" isn't one of them.
+        const probe =
+            'var probe = function () { var r = function (e) { var w = []; var t = 0; while (t < e.length) { w[t] = String.fromCharCode(e[t] + 99); t++; } return G[w.sort(function () { return 0; }).join("")]; }, found = r([-2, -1]), r = found; return typeof r; };\n';
+        const program = `${localLock()}${probe}setTimeout(function () { result = [G.L.check(), probe()]; });\n`;
+        const output = await runWithCleanup(program);
+        expect(observed(output)).toBe(observed(program));
+        expect(output).not.toContain("G.L.check()");
+    });
+
     it("removes every call of a lock whose checks read a missing global through a setup-installed getter", async () => {
         // jscrambler's setup installs getters on G whose functions read one global the page lacks; calling one is a
         // read of that global, not a call into code outside the lock, so the prelude's call goes too.

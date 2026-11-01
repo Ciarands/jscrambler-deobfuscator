@@ -4,11 +4,12 @@ import { valueToNode } from "../core/build.js";
 import type { ScopeInfo, Variable } from "../core/scope.js";
 import { replaceNodes, traverse } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
-import { strayReference, survey } from "./code-locks.js";
+import { reachingDynamicUse, strayReference, survey } from "./code-locks.js";
 import { builderOf, definitionOf } from "./emulate/builders.js";
 import { storageAnalysis } from "./emulate/effects.js";
 import type { PropertyPath } from "./emulate/guest.js";
 import { RUNTIME } from "./emulate/model.js";
+import { storageMatcher } from "./emulate/storage.js";
 
 /** A literal argument or comparand: a literal, or a minus or `!` on one. */
 const isLiteral = (node: Node): boolean =>
@@ -53,7 +54,7 @@ export const domainLocks: Pass = {
         const runtime = facts.get(RUNTIME);
         if (runtime === undefined) return { changed: 0 };
         const scopes = scope();
-        const { matcher, effects } = storageAnalysis(program, runtime, scopes, log);
+        const matcher = storageMatcher(program, runtime, scopes);
         /** `G.k.m(literals...)` compared with a literal by one of `operators`. */
         const comparison = (node: Node, operators: ReadonlySet<string>): GateCall | undefined => {
             if (node.type !== "BinaryExpression" || !operators.has(node.operator) || node.left.type === "PrivateIdentifier") return undefined;
@@ -95,6 +96,7 @@ export const domainLocks: Pass = {
         const callsOf = new Map<string, GateCall[]>();
         for (const gate of gates) for (const call of gate.calls) callsOf.set(JSON.stringify(call.path), [...(callsOf.get(JSON.stringify(call.path)) ?? []), call]);
         const { dynamic } = survey(program, matcher, scopes);
+        const { effects } = storageAnalysis(program, runtime, scopes, log);
         const verdicts = new Map<string, boolean>();
         for (const [id, calls] of callsOf) {
             const path = (calls[0] as GateCall).path;
@@ -107,8 +109,8 @@ export const domainLocks: Pass = {
                 const method = builder.methods.get(path[1] as string);
                 if (method === undefined) return { reason: `its builder gives it no plain function ${path[1] as string}`, node: definition.iife };
                 if (!reachesHost(definition.iife, method, scopes)) return { reason: "it reads nothing of the host", node: method };
-                const reaching = dynamic.find(({ node, site }) => !effects.runsBefore(site, definition.statement) && !effects.keptAsGlobal(node));
-                if (reaching !== undefined) return { reason: `${runtime.storage} is used as a value or read with a computed key once the lock is built, which may reach it`, node: reaching.node };
+                const reaching = reachingDynamicUse(dynamic, path[0] as string, definition.statement, runtime, scopes, effects);
+                if (reaching !== undefined) return { reason: `${runtime.storage} is used as a value or read with a computed key once the lock is built, which may reach it`, node: reaching };
                 const callees = new Set(calls.map(({ call }) => (call.callee as MemberExpression).object as Node));
                 const stray = strayReference(path, callees, definition.statement, program, runtime, matcher, effects);
                 if (stray !== undefined) return { reason: `${runtime.storage}.${path[0]} is used other than by lock tests, its builder and unused wrappers`, node: stray };

@@ -9,14 +9,16 @@ import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
 import { factKey } from "../pipeline/facts.js";
 import type { ResolveResult } from "./emulate/guest.js";
 import type { Slot } from "./emulate/builders.js";
-import { bodyOf, builderOf, definitionOf, returnsOf, sameSlot, slotOf, slotsOnly } from "./emulate/builders.js";
+import { bodyOf, builderOf, definitionOf, parentsWithin, returnsOf, sameSlot, slotOf, slotsOnly } from "./emulate/builders.js";
 import { storageAnalysis } from "./emulate/effects.js";
 import type { Staleness, StorageEffects } from "./emulate/effects.js";
 import type { PropertyPath } from "./emulate/guest.js";
 import type { RuntimeModel } from "./emulate/model.js";
 import { RUNTIME } from "./emulate/model.js";
 import type { StorageMatcher } from "./emulate/storage.js";
-import { onlyTested, rootStatements } from "./emulate/storage.js";
+import { onlyTested, rootStatements, storageMatcher } from "./emulate/storage.js";
+import type { KeySet } from "./key-sets.js";
+import { keySets, mayName } from "./key-sets.js";
 import { localityOf } from "./locality.js";
 
 type FastPath =
@@ -265,6 +267,30 @@ const localityRefusal = (fast: FastPath & { ok: true }, context: LockContext): {
     return effect === undefined ? undefined : { reason: `its checks may change more than their own objects: ${effect.reason}`, node: effect.node };
 };
 
+/**
+ * The first use of `G` as a value or read with a computed key (`dynamic`) that may reach the holder key `key` once
+ * `builder` has run: not done before it, not a store of `G` as a global the program never names (model 2), and not a
+ * computed access whose key can't name `key` (`keySets`: the decoder's name probe tries permutations of a few
+ * characters).
+ */
+export const reachingDynamicUse = (dynamic: Survey["dynamic"], key: string, builder: Statement, runtime: RuntimeModel, scopes: ScopeInfo, effects: StorageEffects): Node | undefined => {
+    const roots = rootStatements(runtime.root);
+    const keysByRoot = new Map<Node, (key: Expression) => KeySet | undefined>();
+    return dynamic.find(({ node, site }) => {
+        if (effects.runsBefore(site, builder) || effects.keptAsGlobal(node)) return false;
+        if (node.type !== "MemberExpression" || !node.computed) return true;
+        const root = roots.find((statement) => statement.start <= node.start && node.end <= statement.end);
+        if (root === undefined) return true;
+        let keysOf = keysByRoot.get(root);
+        if (keysOf === undefined) {
+            keysOf = keySets(scopes, parentsWithin(root));
+            keysByRoot.set(root, keysOf);
+        }
+        const keys = keysOf(node.property as Expression);
+        return keys === undefined || mayName(keys, key);
+    })?.node;
+};
+
 /** Why the whole lock can't go (its first call included), if anything stops it. */
 const fullModeRefusal = (lock: Lock, context: LockContext): { reason: string; node: Node } | undefined => {
     const { path, sites, full, staleness, fast, builder } = lock;
@@ -274,8 +300,8 @@ const fullModeRefusal = (lock: Lock, context: LockContext): { reason: string; no
     if (local !== undefined) return local;
     const used = sites.findIndex(({ discarded }, i) => !discarded && full[i] !== "answer");
     if (used !== -1) return { reason: staleness[used]?.reason ?? "a call whose value is used runs in the prelude, where it may be the first call", node: (sites[used] as CallSite).call };
-    const dynamic = uses.dynamic.find(({ node, site }) => !effects.runsBefore(site, builder) && !effects.keptAsGlobal(node));
-    if (dynamic !== undefined) return { reason: `${runtime.storage} is used as a value or read with a computed key once the lock is built, which may reach it`, node: dynamic.node };
+    const dynamic = reachingDynamicUse(uses.dynamic, path[0] as string, builder, runtime, context.scopes, effects);
+    if (dynamic !== undefined) return { reason: `${runtime.storage} is used as a value or read with a computed key once the lock is built, which may reach it`, node: dynamic };
     const callees = new Set(sites.map(({ call }) => (call.callee as MemberExpression).object as Node));
     const stray = strayReference(path, callees, builder, program, runtime, matcher, effects);
     if (stray !== undefined) return { reason: `${runtime.storage}.${path[0]} is used other than by its calls, its builder and unused wrappers`, node: stray };
@@ -333,7 +359,9 @@ export const codeLocks: Pass = {
             return { changed: 0 };
         }
         const scopes = scope();
-        const { matcher, effects } = storageAnalysis(program, runtime, scopes, log);
+        // The storage effects (a walk of every function) only once a builder has a lock's shape.
+        const matcher = storageMatcher(program, runtime, scopes);
+        let effects: StorageEffects | undefined;
         const programSurvey = survey(program, matcher, scopes);
         const probes = facts.get(LOCK_PROBES) ?? new Map<string, ResolveResult | undefined>();
         facts.set(LOCK_PROBES, probes);
@@ -370,18 +398,20 @@ export const codeLocks: Pass = {
                 fast.method
             );
 
-            const staleness = sites.map(({ site }) => effects.staleAt(site, path));
+            effects ??= storageAnalysis(program, runtime, scopes, log).effects;
+            const known = effects;
+            const staleness = sites.map(({ site }) => known.staleAt(site, path));
             // A discarded call's answer is as good as no call; a used one may answer the cached value only after the prelude.
             const full = sites.map(({ statement, discarded, site }, i): Disposition =>
-                staleness[i] !== undefined ? "keep" : statement !== undefined ? "remove" : discarded || fast.constant || effects.runsAfterPrelude(site) ? "answer" : "keep"
+                staleness[i] !== undefined ? "keep" : statement !== undefined ? "remove" : discarded || fast.constant || known.runsAfterPrelude(site) ? "answer" : "keep"
             );
             // A constant lock's later calls may still be its first: no partial mode.
             const partial = sites.map(({ statement, site }, i): Disposition =>
-                fast.constant || staleness[i] !== undefined || !effects.runsAfterPrelude(site) ? "keep" : statement === undefined ? "answer" : "remove"
+                fast.constant || staleness[i] !== undefined || !known.runsAfterPrelude(site) ? "keep" : statement === undefined ? "answer" : "remove"
             );
             // A constant lock's calls answer whoever else may call it: callers the analysis can't see run the checks
             // themselves, which touch only their own objects.
-            const context = { program, runtime, scopes, matcher, effects, uses: programSurvey };
+            const context = { program, runtime, scopes, matcher, effects: known, uses: programSurvey };
             const refusal = fast.constant ? localityRefusal(fast, context) : fullModeRefusal({ path, sites, full, staleness, fast, builder: definition.statement }, context);
             if (refusal === undefined) counts.full++;
             else log.debug(`${name}: ${fast.constant ? "kept" : "partial mode, the prelude's calls stay"}: ${refusal.reason}`, refusal.node);
