@@ -236,7 +236,9 @@ const argsKinds = (fn: Node): Kinds => {
 
 class Analysis {
     readonly #fn: Node;
-    readonly #allowed: Slot;
+    readonly #allowed: Slot | undefined;
+    /** Set when outside code calls what `fn` returns: the path of the call it makes. */
+    readonly #called: readonly string[] | undefined;
     readonly #scopes: ScopeInfo;
     readonly #parents: ReadonlyMap<Node, Node>;
     readonly #isGlobalRead: (call: Node) => boolean;
@@ -266,9 +268,10 @@ class Analysis {
     #thisOwner: Node;
     #returnOwner: Node;
 
-    constructor(fn: Node, allowed: Slot, scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>, isGlobalRead: (call: Node) => boolean) {
+    constructor(fn: Node, allowed: Slot | undefined, called: readonly string[] | undefined, scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>, isGlobalRead: (call: Node) => boolean) {
         this.#fn = fn;
         this.#allowed = allowed;
+        this.#called = called;
         this.#scopes = scopes;
         this.#parents = parents;
         this.#isGlobalRead = isGlobalRead;
@@ -283,16 +286,43 @@ class Analysis {
             this.#compileFunction(this.#fn);
             // Host code may call an own function on any own object (a `valueOf` an operator converts with).
             for (const fn of this.#functions) this.#location(this.#thisKinds, fn as Node).add(union([this.#allSites, PRIMITIVE_KINDS]));
+            if (this.#called !== undefined) this.#facts.push(() => this.#exposeResult());
             for (let round = 0; ; round++) {
                 if (round === MAX_ROUNDS) return { reason: `the analysis didn't settle in ${MAX_ROUNDS} rounds`, node: this.#fn };
                 this.#changed = false;
                 for (const fact of this.#facts) fact();
-                if (!this.#changed) return undefined;
+                if (!this.#changed) return this.#called === undefined ? undefined : this.#calledEffect(this.#called);
             }
         } catch (error) {
             if (error instanceof Refusal) return error.effect;
             throw error;
         }
+    }
+
+    /** Outside code may call any function the result reaches, on anything, with primitive arguments. */
+    #exposeResult(): void {
+        const reached = this.#reach(this.#location(this.#returns, this.#fn));
+        this.#markLive(reached);
+        const self = union([reached, OUTSIDE_KINDS]);
+        for (const site of reached.sites ?? []) {
+            if (!this.#functions.has(site)) continue;
+            this.#grow(this.#thisOf(site as Node), self);
+            this.#grow(this.#argsOf(site as Node), PRIMITIVE_KINDS);
+        }
+    }
+
+    /** Why calling `path` of the result may run more than its own functions: it may hold a value from outside or a builtin, or an own `apply` (a wrapper calls through `apply`). */
+    #calledEffect(path: readonly string[]): Effect | undefined {
+        let value = this.#location(this.#returns, this.#fn);
+        for (const key of path) value = this.#read(value, exact(key));
+        const name = path.length === 0 ? "what it returns" : `${path.join(".")} of what it returns`;
+        if (foreign(value) !== 0) return { reason: `${name} may be a function from outside or a builtin`, node: this.#fn };
+        for (const site of value.sites ?? []) {
+            const apply = new Kinds();
+            this.#collectFields(site, exact("apply"), apply, new Set());
+            if (apply.bits !== 0 || apply.strings !== undefined || apply.sites !== undefined || apply.args !== undefined) return { reason: `${name} may have an own apply`, node: this.#fn };
+        }
+        return undefined;
     }
 
     #grow(target: Kinds, value: Kinds): void {
@@ -487,7 +517,7 @@ class Analysis {
             };
         }
         if (target.type !== "MemberExpression") return refuse(`writes a ${target.type}`, target);
-        if (sameSlot(this.#allowed, slotOf(target, this.#scopes))) return value;
+        if (this.#allowed !== undefined && sameSlot(this.#allowed, slotOf(target, this.#scopes))) return value;
         const slotArray = this.#slotVariable(target.object);
         const index = propertyKey(target);
         if (slotArray !== undefined && index !== undefined) {
@@ -1076,4 +1106,13 @@ class Analysis {
  * (model 5: the environment passes the checks). `isGlobalRead` calls count as reads of a value from outside.
  */
 export const localityOf = (fn: Node, allowed: Slot, scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>, isGlobalRead: (call: Node) => boolean): Effect | undefined =>
-    new Analysis(fn, allowed, scopes, parents, isGlobalRead).run();
+    new Analysis(fn, allowed, undefined, scopes, parents, isGlobalRead).run();
+
+/**
+ * The first effect calling `builder`, and then from outside (on anything, with primitive arguments) any function its
+ * result reaches, may have beyond its variables and objects those calls create; `undefined` when proven local, and
+ * `path` of the result then is one of those functions (if any function: a value from outside or a builtin may be
+ * anything). Analysed as `localityOf`.
+ */
+export const exposedLocalityOf = (builder: Node, path: readonly string[], scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>, isGlobalRead: (call: Node) => boolean): Effect | undefined =>
+    new Analysis(builder, undefined, path, scopes, parents, isGlobalRead).run();

@@ -1,5 +1,5 @@
 import type { Argument, CallExpression, Expression, MemberExpression, Node } from "../core/ast.js";
-import { isIdentifierName, propertyKey } from "../core/ast.js";
+import { isBindingName, propertyKey } from "../core/ast.js";
 import { callOf, identifier, member, memberChain } from "../core/build.js";
 import type { ScopeInfo } from "../core/scope.js";
 import { traverse } from "../core/traverse.js";
@@ -20,7 +20,7 @@ const isDeleted = (parent: Node | null | undefined): boolean => parent?.type ===
  */
 const builtin = (alias: CallAlias, scopes: ScopeInfo, site: Node, origin: Node): Rewrite => {
     const [first, ...rest] = [...alias.owner, alias.original];
-    if (first === undefined || !isIdentifierName(first)) return refused(`${first ?? "the global object"} can't be named`);
+    if (first === undefined || !isBindingName(first)) return refused(`${first ?? "the global object"} can't be named`);
     const bound = scopes.nameBoundAt(site, first);
     if (bound === undefined) return refused("call site is not in the analysed program");
     if (bound) return refused(`${first} is shadowed here`);
@@ -69,7 +69,7 @@ export const aliases: Pass = {
         const candidates = new Map<string, Set<string>>();
         for (const { owner, alias, original } of runtime.aliases) {
             if (owner.length === 0) {
-                if (isIdentifierName(original)) globals.set(alias, original);
+                if (isBindingName(original)) globals.set(alias, original);
                 continue;
             }
             const set = candidates.get(alias) ?? new Set<string>();
@@ -145,7 +145,7 @@ export const aliases: Pass = {
                 if (host !== undefined && scopes.isGlobalReference(node)) {
                     if (tampered.has(node.name)) return refuse("the program deletes the alias or names it as a string (it may redefine it)", node);
                     if (isDeleted(path.parent)) return refuse("deleting the alias isn't deleting what it stands for", node);
-                    if (!isIdentifierName(host)) return refuse(`${host} can't be written as a name`, node);
+                    if (!isBindingName(host)) return refuse(`${host} can't be written as a name`, node);
                     if (scopes.nameBoundAt(node, host) !== false) return refuse(`${host} is shadowed here`, node);
                     path.replace(identifier(host, node));
                     counts.hosts++;

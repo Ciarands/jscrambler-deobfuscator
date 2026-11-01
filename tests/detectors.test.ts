@@ -109,7 +109,7 @@ const withFeature = (code: string): string => {
 };
 
 describe("detectors", () => {
-    it("answers every detector call, the prelude's included, and drops the detectors", async () => {
+    it("answers every detector call whose builder ran alike with and without the host's globals", async () => {
         const program = `${DETECTORS}if (G.w()) { log.push("start"); }
 setTimeout(function () {
   if (!G.N.d()) { log.push("n"); }
@@ -119,9 +119,11 @@ setTimeout(function () {
 });
 `;
         const output = await sameBehaviour(program);
-        expect(output).not.toMatch(/\.d\(\)|G\.w\(\)/);
-        expect(output).not.toContain("j-016");
-        expect(output).toContain('result = [log, undefined, true, false, true, "boolean"];');
+        expect(output).not.toMatch(/G\.[NFH]\.d\(\)/);
+        // G.T's builder reads navigator: without it the guest's run throws, with it (the second lane) it builds G.T,
+        // so what the prelude's G.w() call reaches is unknown and its calls stay.
+        expect(output).toContain("if (G.w()) {");
+        expect(output).toContain("result = [log, undefined, true, false, G.w(), typeof G.T.d()];");
     });
 
     it("answers only the truthiness of a report whose detections aren't all literal codes", async () => {

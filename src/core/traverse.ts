@@ -1,5 +1,6 @@
 import { visitorKeys } from "oxc-parser";
 import type { Node } from "./ast.js";
+import { spliceList } from "./list.js";
 
 type Container = Record<string, unknown>;
 
@@ -91,7 +92,7 @@ export class Path<N extends Node = Node> {
     insertBefore(nodes: readonly Node[]): void {
         const list = this.#list();
         if (list === null || this.#cursor === null) throw new Error(`Can't insert next to ${this.node.type}: not in a list`);
-        list.splice(this.#cursor.index, 0, ...nodes);
+        spliceList(list, this.#cursor.index, 0, nodes);
         this.#cursor.index += nodes.length;
     }
 
@@ -99,7 +100,7 @@ export class Path<N extends Node = Node> {
     insertAfter(nodes: readonly Node[]): void {
         const list = this.#list();
         if (list === null || this.#cursor === null) throw new Error(`Can't insert next to ${this.node.type}: not in a list`);
-        list.splice(this.#cursor.index + 1, 0, ...nodes);
+        spliceList(list, this.#cursor.index + 1, 0, nodes);
         this.#cursor.index += nodes.length;
     }
 
@@ -176,6 +177,16 @@ export const forEachChild = (node: Node, fn: (child: Node) => void): void => {
     EACH_CHILD[node.type]?.(node, fn);
 };
 
+/** The input nests deeper than the walk's stack allows: the file fails (closed) with this instead of a bare RangeError. */
+export class NestingError extends Error {
+    constructor(depth?: number) {
+        super(`the input nests too deeply to process${depth === undefined ? "" : ` (${depth}+ levels)`}`);
+        this.name = "NestingError";
+    }
+}
+
+export const isStackOverflow = (error: unknown): boolean => error instanceof RangeError && error.message.includes("call stack");
+
 /** Depth-first in `visitorKeys` order. Visitors may replace/remove the current node and insert siblings (not visited). */
 export const traverse = (root: Node, visitors: Visitors): void => {
     const byType = visitors as Record<string, VisitEntry<Node> | undefined>;
@@ -218,7 +229,11 @@ export const traverse = (root: Node, visitors: Visitors): void => {
         }
     };
 
-    visit(pathAt(0, root, null, null, null), 0);
+    try {
+        visit(pathAt(0, root, null, null, null), 0);
+    } catch (error) {
+        throw isStackOverflow(error) ? new NestingError(paths.length) : error;
+    }
 };
 
 /** Replace nodes by identity in one walk, for passes that decide before rewriting. Replacements aren't walked into. */

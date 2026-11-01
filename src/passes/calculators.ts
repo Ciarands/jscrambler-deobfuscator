@@ -56,9 +56,6 @@ const refusal = (reason: string, node: Node): Refusal => ({ ok: false, reason, n
 const GETTER = "a property read (possible getter)";
 const GLOBAL_READ = "a global read (possible getter)";
 
-/** `void 0`: undefined, whatever the name `undefined` is bound to there. */
-const voidZero = (position: Node): Expression => at<Expression>({ type: "UnaryExpression", operator: "void", prefix: true, argument: valueToNode(0, position) }, position);
-
 const startsWith = (keys: readonly (string | undefined)[], prefix: PropertyPath): boolean => keys.length >= prefix.length && prefix.every((key, i) => key === keys[i]);
 
 const stateWrittenBy = (fn: FunctionNode, scopes: ScopeInfo): { variable: Variable; write: Node } | undefined => {
@@ -1325,7 +1322,7 @@ class CalculatorRewrite {
                 case "MemberExpression": {
                     const index = Number(propertyKey(node));
                     const arg = args[index];
-                    if (arg === undefined || this.#isOwnSelector(arg, calculator)) return voidZero(call);
+                    if (arg === undefined || this.#isOwnSelector(arg, calculator)) return valueToNode(undefined, call);
                     const parameter = parameters.get(index);
                     if (parameter !== undefined) return at<Expression>({ type: "Identifier", name: parameter }, call);
                     if (!used.has(index)) {
@@ -1349,7 +1346,7 @@ class CalculatorRewrite {
                     throw new TypeError(`calculators: unexpected ${node.type} in a checked formula`);
             }
         };
-        const computed = selected === undefined ? voidZero(call) : put(selected.formula);
+        const computed = selected === undefined ? valueToNode(undefined, call) : put(selected.formula);
         const value =
             bound === undefined
                 ? computed
@@ -1407,7 +1404,7 @@ class CalculatorRewrite {
             if (parent.type === "ExpressionStatement" && inList) prune((outer.parent as unknown as Record<string, Node[]>)[outer.key] as Node[], parent, undefined);
             else if (parent.type === "ExpressionStatement" && outer !== undefined) put(outer, at<Statement>({ type: "EmptyStatement" }, parent));
             else if (parent.type === "SequenceExpression" && own.index !== null && own.index < parent.expressions.length - 1 && outer !== undefined) prune(parent.expressions, call, outer);
-            else put(own, voidZero(call));
+            else put(own, valueToNode(undefined, call));
         }
         for (const [list, { gone, sequenceAt }] of pruned) {
             let length = 0;

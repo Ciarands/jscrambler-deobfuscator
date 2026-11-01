@@ -41,7 +41,7 @@ export const deobfuscate = async (code: string, options: DeobfuscateOptions = {}
         afterPass: afterPass === undefined ? undefined : (report: PassReport, current: Program) => afterPass(report, print(current)),
     });
     return {
-        code: print(program),
+        code: print(program, (message) => logger.warn(`[print] ${message}`)),
         report: { passes: reports, durationMs: performance.now() - start },
     };
 };

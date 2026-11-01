@@ -5,6 +5,10 @@ import type { CustomizeVariantOptions, QuickJSContext, QuickJSHandle, QuickJSRun
 /**
  * QuickJS (WASM) sandbox for the obfuscator's own runtime helpers. Guest gets standard builtins only, nothing from the
  * host; plain values are copied out. Deadline plus memory/stack limits bound hostile code; `Math.random` is seeded.
+ *
+ * The guest is an adversary: everything crossing out goes through functions made before any guest code ran (captured
+ * builtins, own data properties only, no `toJSON` or getters), arrives as text, and is checked again on the host. A
+ * guest exception is described the same way, never rebuilt on the host.
  */
 
 export interface SandboxLimits {
@@ -29,9 +33,14 @@ const baseVariant = variantModule.default as unknown as QuickJSSyncVariant;
 const silent = { print: () => {}, printErr: () => {} } as unknown as NonNullable<CustomizeVariantOptions["emscriptenModule"]>;
 const syncVariant = newVariant(baseVariant, { emscriptenModule: silent });
 const quickjs = (): Promise<QuickJSWASMModule> => (modulePromise ??= newQuickJSWASMModuleFromVariant(syncVariant));
+/** Emscripten aborts throw it; not declared in the project's type libs. */
+const WasmRuntimeError = (globalThis as unknown as { WebAssembly: { RuntimeError: abstract new (...args: never[]) => Error } }).WebAssembly.RuntimeError;
 
-const DETERMINISM = `(() => {
-    let a = 0x9e3779b9 | 0;
+/** The default seed is what every sandbox used so far; another gives another (equally deterministic) sequence. */
+export const DEFAULT_SEED = 0x9e3779b9 | 0;
+
+const determinism = (seed: number): string => `(() => {
+    let a = ${seed | 0};
     Math.random = function random() {
         a = (a + 0x6d2b79f5) | 0;
         let t = Math.imul(a ^ (a >>> 15), 1 | a);
@@ -40,9 +49,31 @@ const DETERMINISM = `(() => {
     };
 })();`;
 
-/** JSON with `undefined`/`NaN`/`±Infinity`/`-0` tagged. Must stay in step with the guest side in `TRANSPORT`. */
+/**
+ * JSON with `undefined`/`NaN`/`±Infinity`/`-0` as exact one-key objects `{ "$jsd": name }`; an object key starting with
+ * the tag gets it once more in front, so no carried object is ever read as a tag. Must stay in step with `TRANSPORT`.
+ */
 const TAG = "$jsd";
-const SPECIAL: Record<string, unknown> = { undefined: undefined, NaN: Number.NaN, Infinity: Number.POSITIVE_INFINITY, "-Infinity": Number.NEGATIVE_INFINITY, "-0": -0 };
+const MAX_DEPTH = 200;
+const SPECIAL_NAMES: readonly string[] = ["undefined", "NaN", "Infinity", "-Infinity", "-0"];
+
+class MalformedAnswer extends Error {}
+
+const specialOf = (name: string): number | undefined => {
+    switch (name) {
+        case "NaN":
+            return Number.NaN;
+        case "Infinity":
+            return Number.POSITIVE_INFINITY;
+        case "-Infinity":
+            return Number.NEGATIVE_INFINITY;
+        case "-0":
+            return -0;
+        default:
+            return undefined;
+    }
+};
+
 const tagOf = (value: unknown): string | undefined => {
     if (value === undefined) return "undefined";
     if (typeof value !== "number") return undefined;
@@ -51,50 +82,152 @@ const tagOf = (value: unknown): string | undefined => {
     if (value === Number.NEGATIVE_INFINITY) return "-Infinity";
     return Object.is(value, -0) ? "-0" : undefined;
 };
-const encode = (value: unknown): string =>
-    JSON.stringify(value, function (this: Record<string, unknown>, key: string, raw: unknown) {
-        // `raw` has been through JSON's own conversion (-0 is already 0); the holder still has the original.
-        const tag = tagOf(this[key]);
-        return tag === undefined ? raw : { [TAG]: tag };
-    }) ?? JSON.stringify({ [TAG]: "undefined" });
-const decode = (text: string): unknown =>
-    JSON.parse(text, (_key, raw: unknown) => (typeof raw === "object" && raw !== null && TAG in raw ? SPECIAL[String((raw as Record<string, unknown>)[TAG])] : raw));
 
+const ownData = (target: object, key: string, value: unknown): void => {
+    Object.defineProperty(target, key, { value, writable: true, enumerable: true, configurable: true });
+};
+
+const toWire = (value: unknown, depth: number): unknown => {
+    if (depth > MAX_DEPTH) throw new MalformedAnswer("nested too deeply");
+    const tag = tagOf(value);
+    if (tag !== undefined) return { [TAG]: tag };
+    if (Array.isArray(value)) return value.map((item: unknown) => toWire(item, depth + 1));
+    if (typeof value !== "object" || value === null) return value;
+    const out = {};
+    for (const [key, item] of Object.entries(value)) ownData(out, key.startsWith(TAG) ? TAG + key : key, toWire(item, depth + 1));
+    return out;
+};
+
+const fromWire = (raw: unknown, depth: number): unknown => {
+    if (depth > MAX_DEPTH) throw new MalformedAnswer("nested too deeply");
+    if (Array.isArray(raw)) return raw.map((item: unknown) => fromWire(item, depth + 1));
+    if (typeof raw !== "object" || raw === null) return raw;
+    const record = raw as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (Object.hasOwn(record, TAG)) {
+        const name = record[TAG];
+        if (keys.length !== 1 || typeof name !== "string" || !SPECIAL_NAMES.includes(name)) throw new MalformedAnswer("a malformed tag");
+        return specialOf(name);
+    }
+    const out = {};
+    for (const key of keys) ownData(out, key.startsWith(TAG) ? key.slice(TAG.length) : key, fromWire(record[key], depth + 1));
+    return out;
+};
+
+const encode = (value: unknown): string => JSON.stringify(toWire(value, 0));
+
+const safeMessage = (error: unknown): string => {
+    try {
+        return error instanceof Error ? String(error.message) : String(error);
+    } catch {
+        return "an error that can't be printed";
+    }
+};
+
+/**
+ * Guest side: `[decode, encode, describe]`, made from builtins captured before any guest code runs. Payloads become
+ * null-prototype objects (a helper reading an absent key gets `undefined`, never an inherited value); results are
+ * written by hand from own data properties (an accessor, a hole or a non-plain value is refused); `describe` gives a
+ * thrown value's message and stack as text, reading own data properties only.
+ */
 const TRANSPORT = `(function () {
-    var TAG = ${JSON.stringify(TAG)};
-    var SPECIAL = { "undefined": undefined, "NaN": NaN, "Infinity": Infinity, "-Infinity": -Infinity, "-0": -0 };
-    function tagOf(v) {
-        if (v === undefined) return "undefined";
-        if (typeof v !== "number") return undefined;
-        if (v !== v) return "NaN";
-        if (v === Infinity) return "Infinity";
-        if (v === -Infinity) return "-Infinity";
-        return v === 0 && 1 / v < 0 ? "-0" : undefined;
+    "use strict";
+    var TAG = ${JSON.stringify(TAG)}, MAX = ${MAX_DEPTH};
+    var uncurry = Function.prototype.bind.bind(Function.prototype.call);
+    var parse = JSON.parse, quote = JSON.stringify, isArray = Array.isArray, toText = String;
+    var names = Object.getOwnPropertyNames, describe = Object.getOwnPropertyDescriptor, hasOwn = Object.hasOwn, define = Object.defineProperty, create = Object.create;
+    var startsWith = uncurry(String.prototype.startsWith), slice = uncurry(String.prototype.slice);
+    var Refused = TypeError;
+    function special(name) {
+        switch (name) {
+            case "undefined": return void 0;
+            case "NaN": return 0 / 0;
+            case "Infinity": return 1 / 0;
+            case "-Infinity": return -1 / 0;
+            case "-0": return -0;
+        }
+        throw new Refused("a malformed tag");
+    }
+    function fromWire(raw, depth) {
+        if (depth > MAX) throw new Refused("nested too deeply");
+        if (raw === null || typeof raw !== "object") return raw;
+        var out, i;
+        if (isArray(raw)) {
+            out = [];
+            for (i = 0; i < raw.length; i++) define(out, i, { __proto__: null, value: fromWire(raw[i], depth + 1), writable: true, enumerable: true, configurable: true });
+            return out;
+        }
+        var keys = names(raw);
+        if (hasOwn(raw, TAG)) {
+            if (keys.length !== 1 || typeof raw[TAG] !== "string") throw new Refused("a malformed tag");
+            return special(raw[TAG]);
+        }
+        out = create(null);
+        for (i = 0; i < keys.length; i++) out[startsWith(keys[i], TAG) ? slice(keys[i], TAG.length) : keys[i]] = fromWire(raw[keys[i]], depth + 1);
+        return out;
+    }
+    function dataOf(object, key) {
+        var d = describe(object, key);
+        if (d === undefined || !hasOwn(d, "value")) throw new Refused("not a data property: " + key);
+        return d;
+    }
+    function toWire(v, depth) {
+        switch (typeof v) {
+            case "undefined": return '{"' + TAG + '":"undefined"}';
+            case "number":
+                if (v !== v) return '{"' + TAG + '":"NaN"}';
+                if (v === 1 / 0) return '{"' + TAG + '":"Infinity"}';
+                if (v === -1 / 0) return '{"' + TAG + '":"-Infinity"}';
+                if (v === 0 && 1 / v < 0) return '{"' + TAG + '":"-0"}';
+                return toText(v);
+            case "string": return quote(v);
+            case "boolean": return v ? "true" : "false";
+            case "object": if (v === null) return "null"; break;
+            default: throw new Refused("can't carry a " + typeof v);
+        }
+        if (depth > MAX) throw new Refused("nested too deeply");
+        var out, i;
+        if (isArray(v)) {
+            var length = dataOf(v, "length").value;
+            out = "[";
+            for (i = 0; i < length; i++) out += (i === 0 ? "" : ",") + toWire(dataOf(v, toText(i)).value, depth + 1);
+            return out + "]";
+        }
+        var keys = names(v), first = true;
+        out = "{";
+        for (i = 0; i < keys.length; i++) {
+            var d = dataOf(v, keys[i]);
+            if (!d.enumerable) continue;
+            out += (first ? "" : ",") + quote(startsWith(keys[i], TAG) ? TAG + keys[i] : keys[i]) + ":" + toWire(d.value, depth + 1);
+            first = false;
+        }
+        return out + "}";
+    }
+    function ownText(value, key) {
+        var d = describe(value, key);
+        return d !== undefined && hasOwn(d, "value") && typeof d.value === "string" ? d.value : "";
     }
     return [
-        function (text) {
-            return JSON.parse(text, function (k, v) { return v !== null && typeof v === "object" && TAG in v ? SPECIAL[v[TAG]] : v; });
-        },
-        function (value) {
-            var text = JSON.stringify(value, function (k, v) {
-                var tag = tagOf(this[k]);
-                if (tag === undefined) return v;
-                var out = {};
-                out[TAG] = tag;
-                return out;
-            });
-            return text === undefined ? '{"' + TAG + '":"undefined"}' : text;
+        function (text) { return fromWire(parse(text), 0); },
+        function (value) { return toWire(value, 0); },
+        function (thrown) {
+            var isObject = thrown !== null && (typeof thrown === "object" || typeof thrown === "function");
+            var message = isObject ? ownText(thrown, "message") : typeof thrown === "symbol" ? "a symbol" : toText(thrown);
+            return "[" + quote(message) + "," + quote(isObject ? ownText(thrown, "stack") : "") + "]";
         }
     ];
 })()`;
+
+/** Time to describe a thrown value after the run's own deadline passed. */
+const DESCRIBE_TIMEOUT_MS = 200;
 
 export class Sandbox {
     readonly #runtime: QuickJSRuntime;
     readonly #context: QuickJSContext;
     readonly #limits: SandboxLimits;
-    readonly #quote: QuickJSHandle;
     readonly #decode: QuickJSHandle;
     readonly #encode: QuickJSHandle;
+    readonly #describe: QuickJSHandle;
     readonly #functions = new Map<string, { fn: QuickJSHandle; owner: QuickJSHandle }>();
     readonly #held = new Map<number, QuickJSHandle>();
     #deadline = 0;
@@ -113,27 +246,32 @@ export class Sandbox {
         });
         this.#context = this.#runtime.newContext();
         this.#arm(limits.timeoutMs);
-        this.#quote = this.#context.unwrapResult(this.#context.evalCode("(function (v) { return JSON.stringify(v); })"));
-        const transport = this.#context.unwrapResult(this.#context.evalCode(TRANSPORT));
-        this.#decode = this.#context.getProp(transport, 0);
-        this.#encode = this.#context.getProp(transport, 1);
-        transport.dispose();
-    }
-
-    /** Strings go through guest `JSON.stringify`: copied directly they cross as C strings and truncate at NUL. */
-    #copy(handle: QuickJSHandle): unknown {
-        if (this.#context.typeof(handle) !== "string") return this.#context.dump(handle);
-        const quoted = this.#context.unwrapResult(this.#context.callFunction(this.#quote, this.#context.undefined, handle));
-        try {
-            return JSON.parse(this.#context.getString(quoted)) as unknown;
-        } finally {
-            quoted.dispose();
+        const transport = this.#context.evalCode(TRANSPORT, "transport.js", { type: "global" });
+        if (transport.error !== undefined) {
+            transport.error.dispose();
+            this.#context.dispose();
+            this.#runtime.dispose();
+            throw new Error("sandbox setup failed: the transport didn't install");
         }
+        this.#decode = this.#context.getProp(transport.value, 0);
+        this.#encode = this.#context.getProp(transport.value, 1);
+        this.#describe = this.#context.getProp(transport.value, 2);
+        transport.value.dispose();
     }
 
-    static async create(limits: SandboxLimits = DEFAULT_LIMITS): Promise<Sandbox> {
-        const sandbox = new Sandbox(await quickjs(), limits);
-        const setup = sandbox.run(DETERMINISM);
+    static async create(limits: SandboxLimits = DEFAULT_LIMITS, seed = DEFAULT_SEED): Promise<Sandbox> {
+        return Sandbox.fromModule(await Sandbox.load(), limits, seed);
+    }
+
+    /** The QuickJS module sandboxes run in (loaded once, shared). */
+    static load(): Promise<QuickJSWASMModule> {
+        return quickjs();
+    }
+
+    /** A sandbox in an already loaded module: synchronous, for one made only when first needed. */
+    static fromModule(module: QuickJSWASMModule, limits: SandboxLimits = DEFAULT_LIMITS, seed = DEFAULT_SEED): Sandbox {
+        const sandbox = new Sandbox(module, limits);
+        const setup = sandbox.run(determinism(seed));
         if (!setup.ok) throw new Error(`sandbox setup failed: ${setup.error}`);
         return sandbox;
     }
@@ -144,7 +282,7 @@ export class Sandbox {
 
     /** An abort kills the WASM instance it happened in; drop it so the next sandbox loads a fresh one. */
     #abort(error: unknown): RunResult {
-        this.#broken = error instanceof Error ? error.message : String(error);
+        this.#broken = safeMessage(error);
         modulePromise = undefined;
         return { ok: false, error: `sandbox aborted: ${this.#broken}`, timedOut: false };
     }
@@ -154,7 +292,25 @@ export class Sandbox {
         this.#interrupted = false;
     }
 
-    /** Only a WASM abort breaks the sandbox; a host-side copy failure (e.g. cyclic value) is an ordinary error. */
+    /** The value as the guest's `encode` writes it, read back on the host; frees the handle. */
+    #copy(handle: QuickJSHandle): RunResult {
+        const encoded = this.#context.callFunction(this.#encode, this.#context.undefined, handle);
+        handle.dispose();
+        if (encoded.error !== undefined) {
+            const failure = this.#failure(encoded.error);
+            return failure.ok ? failure : { ...failure, error: `couldn't copy the result out: ${failure.error}` };
+        }
+        const text = this.#context.typeof(encoded.value) === "string" ? this.#context.getString(encoded.value) : undefined;
+        encoded.value.dispose();
+        if (text === undefined) return { ok: false, error: "malformed answer: not text", timedOut: false };
+        try {
+            return { ok: true, value: fromWire(JSON.parse(text) as unknown, 0) };
+        } catch (error) {
+            return { ok: false, error: `malformed answer: ${safeMessage(error)}`, timedOut: false };
+        }
+    }
+
+    /** Only a WASM abort breaks the sandbox; a value that can't be copied out is an ordinary error. */
     run(code: string, timeoutMs = this.#limits.timeoutMs): RunResult {
         return this.#evaluate(code, timeoutMs, true);
     }
@@ -168,25 +324,25 @@ export class Sandbox {
         try {
             this.#arm(timeoutMs);
             const result = this.#context.evalCode(code, "sandbox.js", { type: "global" });
-            const handle = result.error ?? result.value;
-            try {
-                if (result.error === undefined) return { ok: true, value: copy ? this.#copy(handle) : undefined };
-                return this.#failure(handle);
-            } finally {
-                handle.dispose();
-            }
+            if (result.error !== undefined) return this.#failure(result.error);
+            if (copy) return this.#copy(result.value);
+            result.value.dispose();
+            return { ok: true, value: undefined };
         } catch (error) {
             return this.#hostFailure(error);
         }
     }
 
-    /** Keep an expression's value host-side only, so helpers can't collide with or show up among program globals. */
-    hold(code: string, timeoutMs = this.#limits.timeoutMs): { readonly ok: true; readonly held: Held } | (RunResult & { readonly ok: false }) {
+    /**
+     * Keep an expression's value host-side only, so helpers can't collide with or show up among program globals.
+     * `filename` names its frames in guest stacks (`RunResult.at` looks for the program's).
+     */
+    hold(code: string, timeoutMs = this.#limits.timeoutMs, filename = "sandbox.js"): { readonly ok: true; readonly held: Held } | (RunResult & { readonly ok: false }) {
         if (this.#broken !== undefined) return { ok: false, error: `sandbox aborted earlier: ${this.#broken}`, timedOut: false };
         try {
             this.#arm(timeoutMs);
-            const result = this.#context.evalCode(code, "sandbox.js", { type: "global" });
-            if (result.error !== undefined) return this.#failure(result.error, true) as RunResult & { readonly ok: false };
+            const result = this.#context.evalCode(code, filename, { type: "global" });
+            if (result.error !== undefined) return this.#failure(result.error) as RunResult & { readonly ok: false };
             const held = { id: this.#held.size + 1 };
             this.#held.set(held.id, result.value);
             return { ok: true, held };
@@ -206,16 +362,11 @@ export class Sandbox {
             const text = context.newString(encode(payload));
             const argument = context.callFunction(this.#decode, context.undefined, text);
             text.dispose();
-            if (argument.error) return this.#failure(argument.error, true);
+            if (argument.error !== undefined) return this.#failure(argument.error);
             const result = context.callFunction(target.fn, target.owner, argument.value);
             argument.value.dispose();
-            if (result.error) return this.#failure(result.error, true);
-            const encoded = context.callFunction(this.#encode, context.undefined, result.value);
-            result.value.dispose();
-            if (encoded.error) return this.#failure(encoded.error, true);
-            const json = context.getString(encoded.value);
-            encoded.value.dispose();
-            return { ok: true, value: decode(json) };
+            if (result.error !== undefined) return this.#failure(result.error);
+            return this.#copy(result.value);
         } catch (error) {
             return this.#hostFailure(error);
         }
@@ -246,23 +397,34 @@ export class Sandbox {
         return entry;
     }
 
-    #failure(handle: QuickJSHandle, dispose = false): RunResult {
+    /** The thrown value as the guest's `describe` tells it (own data properties only); frees the handle. */
+    #failure(handle: QuickJSHandle): RunResult & { readonly ok: false } {
+        const timedOut = this.#interrupted;
+        let message = "a failure the guest couldn't describe";
+        let stack = "";
         try {
-            const thrown: unknown = this.#copy(handle);
-            const message = typeof thrown === "object" && thrown !== null && "message" in thrown ? String(thrown.message) : String(thrown);
-            const stack = typeof thrown === "object" && thrown !== null && "stack" in thrown ? String(thrown.stack) : "";
-            const frame = /sandbox\.js:(\d+):(\d+)/.exec(stack);
-            const at = frame === null ? undefined : { line: Number(frame[1]), column: Number(frame[2]) };
-            return { ok: false, error: message, timedOut: this.#interrupted, ...(at === undefined ? {} : { at }) };
+            this.#arm(DESCRIBE_TIMEOUT_MS);
+            const described = this.#context.callFunction(this.#describe, this.#context.undefined, handle);
+            if (described.error !== undefined) described.error.dispose();
+            else {
+                const text = this.#context.typeof(described.value) === "string" ? this.#context.getString(described.value) : "";
+                described.value.dispose();
+                const parsed: unknown = text === "" ? undefined : JSON.parse(text);
+                if (Array.isArray(parsed) && typeof parsed[0] === "string" && typeof parsed[1] === "string") [message, stack] = parsed as [string, string];
+            }
+        } catch (error) {
+            if (error instanceof WasmRuntimeError) return this.#abort(error) as RunResult & { readonly ok: false };
         } finally {
-            if (dispose) handle.dispose();
+            if (handle.alive) handle.dispose();
         }
+        const frame = /sandbox\.js:(\d+):(\d+)/.exec(stack);
+        const at = frame === null ? undefined : { line: Number(frame[1]), column: Number(frame[2]) };
+        return { ok: false, error: message, timedOut, ...(at === undefined ? {} : { at }) };
     }
 
     #hostFailure(error: unknown): RunResult {
-        // Emscripten aborts throw `WebAssembly.RuntimeError` (not declared in the project's type libs).
-        if (error instanceof Error && error.name === "RuntimeError") return this.#abort(error);
-        return { ok: false, error: `couldn't copy the result out: ${error instanceof Error ? error.message : String(error)}`, timedOut: false };
+        if (error instanceof WasmRuntimeError) return this.#abort(error);
+        return { ok: false, error: `sandbox host error: ${safeMessage(error)}`, timedOut: false };
     }
 
     /** Free the sandbox. Never throws: a runtime QuickJS can't free cleanly only costs the WASM instance. */
@@ -276,9 +438,9 @@ export class Sandbox {
             this.#functions.clear();
             for (const handle of this.#held.values()) if (handle.alive) handle.dispose();
             this.#held.clear();
-            this.#quote.dispose();
             this.#decode.dispose();
             this.#encode.dispose();
+            this.#describe.dispose();
             this.#context.dispose();
             this.#runtime.dispose();
         } catch (error) {

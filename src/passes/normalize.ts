@@ -1,6 +1,7 @@
 import type { Expression, MemberExpression, Node, Statement, VariableDeclaration, VariableDeclarator } from "../core/ast.js";
 import { isIdentifierName } from "../core/ast.js";
 import { at } from "../core/build.js";
+import { pushAll, spliceList } from "../core/list.js";
 import { traverse } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
 
@@ -123,23 +124,28 @@ export const normalize: Pass = {
 
         /** Split the statements of a list in place, then merge declarations whose initial value is overwritten at once. */
         const splitList = (list: Statement[]): void => {
+            let out: Statement[] | undefined;
             for (let i = 0; i < list.length; i++) {
                 const original = list[i] as Statement;
                 const statements = splitFully(original);
-                if (statements === undefined) continue;
+                if (statements === undefined) {
+                    out?.push(original);
+                    continue;
+                }
                 if (log.debugging) log.debug(`split into ${statements.length} statements`, original);
                 facts.replaced([original], statements);
-                list.splice(i, 1, ...statements);
-                i += statements.length - 1;
+                out ??= list.slice(0, i);
+                pushAll(out, statements);
                 sequences++;
             }
+            if (out !== undefined) spliceList(list, 0, list.length, out);
             for (let i = 0; i < list.length; i++) {
                 const merged = mergeDeclaration(list[i] as Statement, list[i + 1]);
                 if (merged === undefined) continue;
                 const originals = list.slice(i, i + merged.consumed);
                 if (log.debugging) log.debug("merged a declaration whose value is overwritten at once", list[i] as Statement);
                 facts.replaced(originals, merged.replacement);
-                list.splice(i, merged.consumed, ...merged.replacement);
+                spliceList(list, i, merged.consumed, merged.replacement);
                 i = Math.max(-1, i - 2);
                 declarations++;
             }

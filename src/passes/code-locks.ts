@@ -238,7 +238,7 @@ interface Lock {
 }
 
 /** `G.key()` with `key` a global-read getter (emulate's fact) the program never replaces: a read of that global property. */
-const isGlobalRead = (call: Node, runtime: RuntimeModel, matcher: StorageMatcher, effects: StorageEffects): boolean => {
+export const isGlobalRead = (call: Node, runtime: RuntimeModel, matcher: StorageMatcher, effects: StorageEffects): boolean => {
     if (call.type !== "CallExpression" || call.arguments.length > 0 || call.callee.type !== "MemberExpression") return false;
     const key = propertyKey(call.callee);
     return key !== undefined && runtime.globalReads.has(key) && matcher.isStorage(call.callee.object) && effects.staleAt(call.callee.object, [key]) === undefined;
@@ -400,7 +400,7 @@ export const codeLocks: Pass = {
                     const stale = staleness[i];
                     log.debug(`kept: ${stale?.reason ?? "the call runs in the prelude, which makes the first call"}`, stale?.node ?? call);
                 } else if (disposition === "answer") {
-                    replacements.set(call, valueToNode(fast.answer, call));
+                    replacements.set(call, valueToNode(fast.answer, call, scopes));
                     lock.answered++;
                 } else {
                     removals.add(statement as Statement);

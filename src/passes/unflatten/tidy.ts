@@ -2,6 +2,7 @@ import type { BlockStatement, Expression, Function as FunctionDeclaration, IfSta
 import { isBreakTarget, isFunctionNode, isJump } from "../../core/ast.js";
 import { at } from "../../core/build.js";
 import { bindingNames, hoistedDeclarations, placeholderDeclaration } from "../../core/hoisting.js";
+import { pushAll } from "../../core/list.js";
 import type { PassLog } from "../../core/log.js";
 import { forEachChild } from "../../core/traverse.js";
 
@@ -332,7 +333,7 @@ const tidyList = (cx: Context, statements: readonly Statement[]): Statement[] =>
         }
         push(statement);
     }
-    if (dead !== undefined) out.push(...deadRemainder(cx, dead));
+    if (dead !== undefined) pushAll(out, deadRemainder(cx, dead));
     return out;
 };
 

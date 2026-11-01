@@ -170,6 +170,65 @@ describe("cleanup: statement facts across rewrites", () => {
     });
 });
 
+// A builder whose method the prelude calls directly and through a wrapper (whose receiver is `receiver`). Later code
+// reads what such a call may change outside the builder's state, but never `G.k`.
+const withStage = ({ method = "n += x;", builder = "", holder = "{ m: m }", before = "", receiver = "G.k" } = {}) => `
+(function () {
+  function G() {}
+  var A = (function () { return arguments; })(0);
+  var box = { f: function (x) { box.v = x; } };
+  G.j = {};
+  G.k = (function () {
+    var n = 0, T = [];
+    var m = function (x) { ${method} return n; };
+    ${builder}
+    return ${holder};
+  })();
+  G.w = function () { return typeof G.k.m === "function" ? G.k.m.apply(${receiver}, arguments) : G.k.m; };
+  ${before}
+  G.k.m(3);
+  G.w(4);
+  setTimeout(function () { result = [A[0], box.v, box.state && box.state.length, G.extra, G.j.v, typeof leaked, String.marked]; });
+})();
+`;
+
+describe("cleanup: stage calls", () => {
+    it("removes stage calls whose function changes only its builder's state", async () => {
+        for (const method of ["n += x;", "T.push(x); n = T.length;"]) {
+            const program = withStage({ method });
+            const { code } = await deobfuscate(program, { passes: ["emulate", "cleanup"] });
+            expect(observed(code), method).toBe(observed(program));
+            expect(code, method).not.toMatch(/G\.k|G\.w/);
+        }
+    });
+
+    it("keeps stage calls that may change more than their builder's state", async () => {
+        const cases = {
+            global: { method: "leaked = x;" },
+            storageKey: { method: "G.extra = x;" },
+            builtin: { method: "String.marked = x;" },
+            argumentsObject: { method: "A[0] = x;" },
+            outerObject: { method: "box.v = x;" },
+            // The builder hands its state out.
+            leakedState: { method: "T.push(x);", builder: "box.state = T;" },
+            methodFromOutside: { holder: "{ m: box.f }" },
+            // Code that stays replaces what the builder made before the calls.
+            replacedHolder: { before: "(function () { G.k = { m: box.f }; })();" },
+            rebound: { before: "(function () { var o = function () {}; o.j = G.j; o.k = { m: box.f }; o.w = function (x) { o.k.m(x); }; G = o; })();" },
+            // Called through the wrapper, `this` is another key's object.
+            writesReceiver: { method: "this.v = x;", receiver: "G.j" },
+            // The wrapper's `apply` is the method's own, which writes the wrapper's receiver.
+            ownApply: { builder: "m.apply = function (self, args) { self.v = args[0]; };", receiver: "G.j" },
+        };
+        for (const [name, options] of Object.entries(cases)) {
+            const program = withStage(options);
+            const { code } = await deobfuscate(program, { passes: ["emulate", "cleanup"] });
+            expect(observed(code), name).toBe(observed(program));
+            expect(code, name).toContain("G.w(4);");
+        }
+    });
+});
+
 // A setup call like jscrambler's: it adds a builtin alias (`q1` for split) and a global holding another one.
 const withSetup = (later: string, setup = "") => `
 function G() {}

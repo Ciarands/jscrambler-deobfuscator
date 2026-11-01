@@ -55,7 +55,7 @@ for (const file of files) {
             logger,
             passes: list(values.passes),
             skip: list(values.skip),
-            ...(values.dump ? dumpHooks(path.join(dir, "passes")) : {}),
+            ...(values.dump ? dumpHooks(path.join(dir, "passes"), true) : {}),
         });
         const ms = performance.now() - start;
         writeFileSync(path.join(dir, "out.js"), result.code);

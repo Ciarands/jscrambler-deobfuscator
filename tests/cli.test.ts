@@ -23,12 +23,13 @@ const write = async (relative: string, content: string): Promise<string> => {
 
 const read = (relative: string): Promise<string> => fs.readFile(path.join(dir, relative), "utf8");
 
-const run = async (argv: string[], stdin?: string) => {
+const run = async (argv: string[], stdin?: string, stdoutIsTTY = false) => {
     let stdout = "";
     let stderr = "";
     const code = await runCli(argv, {
         cwd: dir,
         stdout: (text) => (stdout += text),
+        stdoutIsTTY,
         stderr: (text) => (stderr += text),
         readStdin: async () => stdin ?? "",
         stdinIsTTY: stdin === undefined,
@@ -44,6 +45,14 @@ describe("cli", () => {
         expect(result.code).toBe(EXIT_OK);
         expect(result.stdout).toBe("x = 3;\n");
         expect(result.stderr).toBe("");
+    });
+
+    it("escapes control characters a tagged template keeps in its raw text when stdout is a terminal, not in a pipe", async () => {
+        await write("tagged.js", "f`a\x1b]0;title\x07b`;\n");
+        const terminal = await run(["tagged.js"], undefined, true);
+        expect(terminal.stdout).toBe("f`a\\x1B]0;title\\x07b`;\n");
+        const piped = await run(["tagged.js"]);
+        expect(piped.stdout).toBe("f`a\x1b]0;title\x07b`;\n");
     });
 
     it("reads stdin when no input is given", async () => {
@@ -111,7 +120,7 @@ describe("cli", () => {
         expect(result.code).toBe(EXIT_FAILED);
         expect(await read("out/a.js")).toBe("a = 1;\n");
         expect(await read("out/c.js")).toBe("c = 3;\n");
-        expect(result.stderr).toMatch(/error: src[\\/]broken\.js: .*\(1:9\)/);
+        expect(result.stderr).toMatch(/error: "src(\\\\|\/)broken\.js": .*\(1:9\)/);
         expect(result.stderr).toContain("3 file(s): 2 ok, 1 failed");
     });
 
@@ -120,7 +129,7 @@ describe("cli", () => {
         await write("src/broken.js", "var x = ;");
         const result = await run(["src", "-o", "out", "--quiet"]);
         expect(result.code).toBe(EXIT_FAILED);
-        expect(result.stderr.trim().split("\n")).toEqual([expect.stringMatching(/^error: src[\\/]broken\.js/)]);
+        expect(result.stderr.trim().split("\n")).toEqual([expect.stringMatching(/^error: "src(\\\\|\/)broken\.js"/)]);
     });
 
     it("rejects unknown passes and flags with a usage error", async () => {

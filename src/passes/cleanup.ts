@@ -5,23 +5,27 @@ import { constantEnv } from "../core/constants.js";
 import type { ConstantEnv } from "../core/constants.js";
 import type { Value } from "../core/evaluate.js";
 import { evaluate } from "../core/evaluate.js";
+import { pushAll } from "../core/list.js";
 import { parse, ParseError } from "../core/parse.js";
 import type { ScopeInfo, Variable } from "../core/scope.js";
 import { traverse } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
-import type { ResolveRequest } from "./emulate/guest.js";
+import type { PropertyPath, ResolveRequest } from "./emulate/guest.js";
 import type { RuntimeModel } from "./emulate/model.js";
 import { RUNTIME } from "./emulate/model.js";
-import { parentsWithin } from "./emulate/builders.js";
+import { definitionOf, parentsWithin } from "./emulate/builders.js";
 import type { DecoderProof } from "./emulate/decoder.js";
 import { DECODER_PROOF } from "./emulate/decoder.js";
 import type { StorageEffects } from "./emulate/effects.js";
 import { storageAnalysis } from "./emulate/effects.js";
 import type { StorageMatcher } from "./emulate/storage.js";
 import { onlyTested, rootStatements, storageMatcher } from "./emulate/storage.js";
+import { isGlobalRead } from "./code-locks.js";
 import { DETECTOR_BUILDERS } from "./detectors.js";
 import { keySets, mayName } from "./key-sets.js";
 import { inlineStorageAliases } from "./storage-aliases.js";
+import type { Effect } from "./locality.js";
+import { exposedLocalityOf } from "./locality.js";
 
 /** Evaluation can't throw or have effects. */
 const isPure = (node: Node | null | undefined, scopes: ScopeInfo): boolean => {
@@ -278,6 +282,67 @@ const targetId = (runtime: RuntimeModel, path: readonly string[]): string => {
     return JSON.stringify(wrapper?.target ?? path);
 };
 
+/** What each root statement does with the storage object, for `stageRefusal`. */
+interface RootUses {
+    readonly body: readonly Statement[];
+    readonly roles: readonly Role[];
+    readonly reads: readonly ReadonlySet<string>[];
+    readonly writes: readonly ReadonlySet<string>[];
+    /** Uses as a value or with a computed key. */
+    readonly escapes: readonly (Node | undefined)[];
+    readonly rebinds: readonly (Node | undefined)[];
+}
+
+/**
+ * Why the stage call `G.path(...)` at `index`, on key `k`, may change more than the state of the builder `G.k` holds;
+ * `undefined` when it can't.
+ *
+ * `G.k` is built once, by `G.k = (function () {...})()` before the call. No other root statement names `G.k` or a
+ * wrapper of something under it (one with a storage path for its receiver), but those wrappers' definitions and
+ * stage calls on `k` (static paths, primitive arguments), and none rebinds `G` or uses it as a value or with a
+ * computed key. So, if the builder leaks nothing, what it made is reachable only through `G.k`, and only those calls
+ * run its functions afterwards. `exposedLocalityOf` proves that the builder, and any of its functions called that way
+ * (this call's target among them), change nothing but the builder's variables and objects it and they create: no
+ * builtin, global or storage key. (Model 7: builtins intact; the wrapper's `apply` is the builtin.)
+ */
+const stageRefusal = (
+    index: number,
+    key: string,
+    path: PropertyPath,
+    uses: RootUses,
+    runtime: RuntimeModel,
+    matcher: StorageMatcher,
+    effects: StorageEffects,
+    scopes: ScopeInfo,
+    proofs: Map<string, Effect | undefined>
+): string | undefined => {
+    const name = `${runtime.storage}.${key}`;
+    const definition = definitionOf(runtime, matcher.isStorage, [key]);
+    if (typeof definition === "string") return `${name}: ${definition}`;
+    if (uses.body.indexOf(definition.statement) > index) return `it runs before ${name} is built`;
+    const wrappers = [...runtime.wrappers.values()].filter((wrapper) => wrapper.target[0] === key && wrapper.receiver !== undefined);
+    const [first] = path;
+    const wrapper = first === undefined ? undefined : runtime.wrappers.get(first);
+    if (wrapper !== undefined && path.length > 1) return "it calls a property of a wrapper";
+    const named = new Set([key, ...wrappers.map((w) => w.key)]);
+    const allowed = new Set<Node>([definition.statement, ...wrappers.map((w) => w.definition)]);
+    for (const [other, statement] of uses.body.entries()) {
+        const role = uses.roles[other];
+        if (allowed.has(statement) || (role?.kind === "stage" && role.key === key)) continue;
+        if ((uses.escapes[other] ?? uses.rebinds[other]) !== undefined) return `root statement ${other} rebinds ${runtime.storage} or uses it as a value or with a computed key`;
+        if ([...named].some((k) => uses.reads[other]?.has(k) === true || uses.writes[other]?.has(k) === true)) return `root statement ${other} names ${name} or a wrapper of it`;
+    }
+    const called = (wrapper?.target ?? path).slice(1);
+    const id = JSON.stringify([key, called]);
+    if (!proofs.has(id))
+        proofs.set(
+            id,
+            exposedLocalityOf(definition.iife, called, scopes, parentsWithin(definition.iife), (call) => isGlobalRead(call, runtime, matcher, effects))
+        );
+    const effect = proofs.get(id);
+    return effect === undefined ? undefined : `its builder, or a call of what it built, may change more than the builder's own state: ${effect.reason}`;
+};
+
 interface EvalUses {
     readonly keys: Set<string>;
     escape: boolean;
@@ -350,6 +415,9 @@ const removeRuntime = (
     const reads = body.map(() => new Set<string>());
     const names = body.map(() => new Set<string>());
     const escapes: (Node | undefined)[] = body.map(() => undefined);
+    // For stage calls' proofs: static writes to storage keys, and writes of the storage binding.
+    const writes = body.map(() => new Set<string>());
+    const rebinds: (Node | undefined)[] = body.map(() => undefined);
     const aliasUses: (Node | undefined)[] = body.map(() => undefined);
     const computed = body.map((): MemberExpression[] => []);
     const aliasNames = new Set(runtime.aliases.map((a) => a.alias));
@@ -379,7 +447,8 @@ const removeRuntime = (
                     return;
                 }
                 const isDefTarget = role.kind === "def" && path.parent === (statement as { expression?: Node }).expression && path.key === "left";
-                if (!isDefTarget && !path.isWriteTarget()) reads[index]?.add(key);
+                if (path.isWriteTarget()) writes[index]?.add(key);
+                else if (!isDefTarget) reads[index]?.add(key);
                 if (runtime.callAliases.has(key)) aliasUses[index] ??= node;
             },
             CallExpression(path) {
@@ -402,7 +471,8 @@ const removeRuntime = (
                 const asObject = path.parent?.type === "MemberExpression" && path.key === "object";
                 const asDeclaration = path.parent?.type === "FunctionDeclaration" && path.key === "id";
                 // Keeping G as a global isn't an escape (model 2).
-                if (!asObject && !asDeclaration && !isAliasDeclarator(path.parent) && !path.isWriteTarget() && !onlyTested(path) && !effects.keptAsGlobal(node)) escapes[index] ??= node;
+                if (path.isWriteTarget()) rebinds[index] ??= node;
+                else if (!asObject && !asDeclaration && !isAliasDeclarator(path.parent) && !onlyTested(path) && !effects.keptAsGlobal(node)) escapes[index] ??= node;
             },
         });
     }
@@ -418,6 +488,7 @@ const removeRuntime = (
     }
 
     let kept = new Set<number>();
+    const proofs = new Map<string, Effect | undefined>();
     const liveBy = new Map<string, number>();
     for (let settled = false; !settled;) {
         settled = true;
@@ -469,16 +540,21 @@ const removeRuntime = (
         // Stage calls about to go must be effect-free; ones that aren't become ordinary statements.
         for (const [index, role] of roles.entries()) {
             if (role.kind !== "stage" || kept.has(index)) continue;
-            // A re-run shows nothing for code that acts once (a lock's checks), so its own run must be pure too. A
-            // templated decoder writes only its own, dead, state (model 7: builtins intact).
-            const harmless =
-                "read" in role.probe
-                    ? runtime.guest.inspect(role.probe.read)?.data === true
-                    : decoders?.templated.has(targetId(runtime, role.probe.call.path)) === true || (runtime.pure.has(body[index] as Node) && runtime.guest.effectFree(role.probe.call));
-            if (harmless) continue;
+            // Its own run must have completed (a static proof ignores throws). A templated decoder writes only its own,
+            // dead, state (model 7: builtins intact).
+            let why = "runtime call has effects outside its own state";
+            if ("read" in role.probe) {
+                if (runtime.guest.inspect(role.probe.read)?.data === true) continue;
+            } else if (decoders?.templated.has(targetId(runtime, role.probe.call.path)) === true) continue;
+            else if (!runtime.pure.has(body[index] as Node)) why = "its own run in the guest wasn't seen to change nothing outside the storage object";
+            else {
+                const refusal = stageRefusal(index, role.key, role.probe.call.path, { body, roles, reads, writes, escapes, rebinds }, runtime, matcher, effects, scopes, proofs);
+                if (refusal === undefined) continue;
+                why = refusal;
+            }
             roles[index] = { kind: "other" };
             settled = false;
-            log.debug("kept: runtime call has effects outside its own state", body[index]);
+            log.debug(`kept: ${why}`, body[index]);
         }
     }
 
@@ -589,7 +665,7 @@ const removeUnusedLocals = (program: Node, scopes: ScopeInfo, log: PassContext["
                 for (const declarator of unused) log.debug(`removed unused ${declaration.kind} ${declarator.id.type === "Identifier" ? declarator.id.name : ""}`, declarator);
                 declaration.declarations = declaration.declarations.filter((declarator) => !dead.has(declarator));
                 for (const declarator of unused) removedDeclarations.add(declarator);
-                out.push(...unused);
+                pushAll(out, unused);
                 removed += unused.length;
                 if (declaration.declarations.length > 0) return;
                 if (parent?.type === "ForStatement" && path.key === "init") parent.init = null;

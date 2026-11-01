@@ -496,7 +496,7 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
             return (parent?.type === "AssignmentExpression" && parent.left === identifier) || (parent?.type === "VariableDeclarator" && parent.id === identifier) ? parent : undefined;
         };
         const writes = own.filter(({ identifier }) => writeOf(identifier) !== undefined);
-        const lastIndex = Math.max(...writes.map(({ index }) => index));
+        const lastIndex = writes.reduce((highest, { index }) => Math.max(highest, index), Number.NEGATIVE_INFINITY);
         const last = writes.filter(({ index }) => index === lastIndex);
         const [final] = last;
         const write = final === undefined ? undefined : writeOf(final.identifier);
@@ -534,7 +534,7 @@ const propertyName = (key: Node): string | undefined => {
 
 /** The first call, made while the guest followed a real run, leaving S in place and the counter past every guard. */
 const settlingCall = (calls: readonly LoggedCall[], order: ReadonlyMap<LoggedCall, number>, template: Template, holderId: number, stageId: number): LoggedCall | undefined => {
-    const highest = Math.max(...template.stages.map((stage) => stage.state));
+    const highest = template.stages.reduce((most, stage) => Math.max(most, stage.state), Number.NEGATIVE_INFINITY);
     return calls.find((call) => {
         const [argument] = call.args;
         const { result } = call;

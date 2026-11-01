@@ -48,6 +48,17 @@ export const memberPath = (node: Node): { root: Node; keys: string[] } | undefin
 
 export const isIdentifierName = (name: string): boolean => /^[\p{ID_Start}$_][\p{ID_Continue}$\u200C\u200D]*$/u.test(name);
 
+const NOT_BINDABLE: ReadonlySet<string> = new Set(
+    (
+        "break case catch class const continue debugger default delete do else enum export extends false finally for function if import in " +
+        "instanceof new null return super switch this throw true try typeof var void while with yield await let static implements interface " +
+        "package private protected public arguments eval"
+    ).split(" ")
+);
+
+/** A name that may stand as an identifier reference anywhere: not a keyword, literal, strict-mode reserved word, `arguments` or `eval`. */
+export const isBindingName = (name: string): boolean => isIdentifierName(name) && !NOT_BINDABLE.has(name);
+
 export const isIndexKey = (key: string): boolean => {
     const n = Number(key);
     return key !== "" && Number.isSafeInteger(n) && n >= 0 && String(n) === key;

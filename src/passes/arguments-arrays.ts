@@ -12,6 +12,7 @@ import type {
 } from "../core/ast.js";
 import { isFunctionNode, isIndexKey, propertyKey } from "../core/ast.js";
 import { at, identifier } from "../core/build.js";
+import { pushAll } from "../core/list.js";
 import type { Scope, ScopeInfo, Variable } from "../core/scope.js";
 import type { Path } from "../core/traverse.js";
 import { forEachChild, traverse } from "../core/traverse.js";
@@ -564,7 +565,7 @@ const convertArguments = (conversion: Conversion, references: ReadonlyMap<Variab
     const own = candidate.argumentsObject === undefined ? undefined : references.get(candidate.argumentsObject);
     if (candidate.argumentsWritten || own === undefined) {
         log.debug(candidate.argumentsWritten ? "S[0] is written: it becomes a local" : "element 0 isn't this function's own unwritten arguments: S[0] becomes a local", candidate.site);
-        toLocal.push(...uses);
+        pushAll(toLocal, uses);
     } else {
         const refusal = parametersRefusal(candidate, own);
         if (refusal !== undefined) log.debug(`S[0][i] stay uses of arguments: ${refusal}`, candidate.site);
@@ -643,7 +644,7 @@ const convert = (conversion: Conversion, references: ReadonlyMap<Variable, Argum
     const declarators = convertArguments(conversion, references, scopes, counts);
     const slots = convertSlots(conversion);
     counts.slots += slots.length;
-    declarators.push(...slots);
+    pushAll(declarators, slots);
     const { declarator, scope, variable, site } = candidate;
     const removed = rewrite.removed.get(scope) ?? new Set<string>();
     rewrite.removed.set(scope, removed);

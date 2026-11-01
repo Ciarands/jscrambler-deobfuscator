@@ -3,8 +3,9 @@ import { isFunctionNode, propertyKey } from "../core/ast.js";
 import { constantEnv } from "../core/constants.js";
 import type { EvaluateEnv } from "../core/evaluate.js";
 import { evaluate } from "../core/evaluate.js";
-import { at, valueToNode } from "../core/build.js";
+import { valueToNode } from "../core/build.js";
 import type { Primitive } from "../core/build.js";
+import { pushAll } from "../core/list.js";
 import type { ScopeInfo, Variable } from "../core/scope.js";
 import { traverse } from "../core/traverse.js";
 import type { Facts } from "../pipeline/facts.js";
@@ -549,6 +550,12 @@ export const detectors: Pass = {
                 log.debug(`${name} looks like a detector answering ${shown}, but the guest, which isn't debugged, doesn't answer that repeatably`, detector.slowPaths[0]);
                 continue;
             }
+            // An answer that depends on the environment (time, host globals) confirms nothing, but one contradicting
+            // the detector's answer still shows its check may fire undebugged.
+            if (probe?.ok === false && probe.env === true && probe.seen !== undefined && (answer.exact ? !Object.is(probe.seen, answer.value) : Boolean(probe.seen) !== Boolean(answer.value))) {
+                log.debug(`${name} looks like a detector answering ${shown}, but in the guest (${probe.error}) it answered otherwise`, detector.slowPaths[0]);
+                continue;
+            }
             if (!confirmed && !answer.literal) {
                 log.debug(`${name} looks like a detector answering ${shown}, but the guest can't confirm it and it stores reports other than detection codes`, detector.slowPaths[0]);
                 continue;
@@ -566,14 +573,8 @@ export const detectors: Pass = {
                     removals.add(site.statement);
                     tally.removed++;
                 } else if (answer.exact || site.discarded || site.tested) {
-                    // `void 0`: `undefined` may be shadowed there.
                     const value = site.tested || !answer.exact ? Boolean(answer.value) : answer.value;
-                    replacements.set(
-                        site.call,
-                        value === undefined
-                            ? at<Expression>({ type: "UnaryExpression", operator: "void", prefix: true, argument: valueToNode(0, site.call) }, site.call)
-                            : valueToNode(value, site.call)
-                    );
+                    replacements.set(site.call, valueToNode(value, site.call));
                     tally.answered++;
                 } else {
                     tally.kept++;
@@ -586,7 +587,7 @@ export const detectors: Pass = {
             counts.kept += tally.kept;
             const entry = proven.get(statement) ?? { builder: found.builder, iife: found.iife, names: new Set<string>(), slowPaths: [] };
             entry.names.add(path[1] as string);
-            entry.slowPaths.push(...detector.slowPaths);
+            pushAll(entry.slowPaths, detector.slowPaths);
             proven.set(statement, entry);
         }
 

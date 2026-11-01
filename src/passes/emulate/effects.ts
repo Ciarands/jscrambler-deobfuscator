@@ -1,4 +1,4 @@
-import type { MemberExpression, Node } from "../../core/ast.js";
+import type { MemberExpression, Node, VariableDeclarator } from "../../core/ast.js";
 import { isFunctionNode, propertyKey } from "../../core/ast.js";
 import type { PassLog } from "../../core/log.js";
 import type { Reference, Scope, ScopeInfo, Variable } from "../../core/scope.js";
@@ -196,12 +196,14 @@ const describe = (storage: string, keys: KeyPattern): string => storage + keys.m
  * use a direct call from prelude code; least fixpoint). Unreferenced functions never run. The script is taken to be
  * closed: other scripts don't call its functions. A mention of `.callee`/`.caller` disables prelude-only functions.
  */
-const timeline = (runtime: RuntimeModel, scopes: ScopeInfo, log: PassLog): ((fn: Node) => Timing) => {
+const timeline = (runtime: RuntimeModel, scopes: ScopeInfo, log: PassLog): { timingOf: (fn: Node) => Timing; memberDeclarators: readonly VariableDeclarator[] } => {
     const statements = rootStatements(runtime.root);
     const parentOf = new Map<Node, { fn: Node | undefined; index: number; inPlace: boolean }>();
     const topLevelIndex = new Map<Node, number>();
     const directCallees = new Set<Node>();
     const candidates: { fn: Node; references: readonly Reference[] }[] = [];
+    /** `var t = a.b` declarators, in document order (for `storageEffects`' static parts of `G`). */
+    const memberDeclarators: VariableDeclarator[] = [];
     let reflective = false;
     /** Bound once, by its definition alone (no write reference, or `var f = function`'s initializer only). */
     const candidate = (fn: Node, id: Node): void => {
@@ -228,6 +230,7 @@ const timeline = (runtime: RuntimeModel, scopes: ScopeInfo, log: PassLog): ((fn:
             VariableDeclarator(path) {
                 const { id, init } = path.node;
                 if (id.type === "Identifier" && (init?.type === "FunctionExpression" || init?.type === "ArrowFunctionExpression")) candidate(init, id);
+                if (id.type === "Identifier" && init?.type === "MemberExpression") memberDeclarators.push(path.node);
             },
             Identifier(path) {
                 const node = path.node;
@@ -303,13 +306,16 @@ const timeline = (runtime: RuntimeModel, scopes: ScopeInfo, log: PassLog): ((fn:
             }
         }
     }
-    return (fn) => {
-        let timing = memo.get(fn);
-        if (timing === undefined) {
-            timing = timingOf(fn);
-            memo.set(fn, timing);
-        }
-        return timing;
+    return {
+        timingOf: (fn) => {
+            let timing = memo.get(fn);
+            if (timing === undefined) {
+                timing = timingOf(fn);
+                memo.set(fn, timing);
+            }
+            return timing;
+        },
+        memberDeclarators,
     };
 };
 
@@ -329,7 +335,7 @@ const timeline = (runtime: RuntimeModel, scopes: ScopeInfo, log: PassLog): ((fn:
  */
 export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, scopes: ScopeInfo, log: PassLog, keyOf?: (property: Node) => string | undefined): StorageEffects => {
     const statements = rootStatements(runtime.root);
-    const timingOf = timeline(runtime, scopes, log);
+    const { timingOf, memberDeclarators } = timeline(runtime, scopes, log);
     const later: StorageEffect[] = [];
     const preludeWrites: { keys: KeyPattern; last: number }[] = [];
     const sites = new Map<Node, Timing>();
@@ -369,17 +375,11 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
         const variable = scopes.staticVariableOf(node);
         return variable === undefined ? undefined : parts.get(variable);
     };
-    for (const statement of statements) {
-        traverse(statement, {
-            VariableDeclarator(path) {
-                const { id, init } = path.node;
-                if (id.type !== "Identifier" || init?.type !== "MemberExpression") return;
-                const keys = pathOf(init);
-                const variable = keys === undefined ? undefined : scopes.staticVariableOf(id);
-                if (keys === undefined || variable === undefined || variable.defs.length !== 1) return;
-                if (scopes.staticReferences(variable).filter((reference) => reference.isWrite()).length === 1) parts.set(variable, keys);
-            },
-        });
+    for (const { id, init } of memberDeclarators) {
+        const keys = init === null ? undefined : pathOf(init);
+        const variable = keys === undefined ? undefined : scopes.staticVariableOf(id);
+        if (keys === undefined || variable === undefined || variable.defs.length !== 1) continue;
+        if (scopes.staticReferences(variable).filter((reference) => reference.isWrite()).length === 1) parts.set(variable, keys);
     }
     const partOf = (node: Node): KeyPattern | undefined => {
         const variable = node.type === "Identifier" ? scopes.staticVariableOf(node) : undefined;

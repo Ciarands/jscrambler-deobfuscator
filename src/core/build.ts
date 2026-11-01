@@ -33,12 +33,12 @@ export interface DeclaredNames {
 }
 
 /**
- * `undefined`, `NaN` and `Infinity` are written as their global names unless `names` says the program declares a
- * binding of that name; then as `void 0`, `0 / 0` and `1e999` (literals), which no binding can change.
+ * `undefined`, `NaN` and `Infinity` are written as their global names only when `names` says the program declares no
+ * binding of that name; otherwise as `void 0`, `0 / 0` and `1e999` (literals), which no binding can change.
  */
 export const valueToNode = (value: Primitive, position: At, names?: DeclaredNames): Expression => {
     const pos = positionOf(position);
-    const free = (name: string): boolean => names === undefined || !names.declaresName(name);
+    const free = (name: string): boolean => names !== undefined && !names.declaresName(name);
     if (value === undefined) {
         if (free("undefined")) return { type: "Identifier", name: "undefined", ...pos };
         return { type: "UnaryExpression", operator: "void", prefix: true, argument: { type: "Literal", value: 0, raw: null, ...pos }, ...pos } as Expression;

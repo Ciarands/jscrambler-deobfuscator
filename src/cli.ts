@@ -13,6 +13,7 @@ const { version } = JSON.parse(readFileSync(new URL("../package.json", import.me
 process.exitCode = await runCli(process.argv.slice(2), {
     cwd: process.cwd(),
     stdout: (text) => process.stdout.write(text),
+    stdoutIsTTY: process.stdout.isTTY === true,
     stderr: (text) => process.stderr.write(text),
     readStdin,
     stdinIsTTY: process.stdin.isTTY === true,

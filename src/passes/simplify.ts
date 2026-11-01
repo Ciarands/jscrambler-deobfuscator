@@ -1,6 +1,7 @@
 import type { Expression, Node, SequenceExpression, Statement } from "../core/ast.js";
 import { isJump } from "../core/ast.js";
 import { at, valueToNode } from "../core/build.js";
+import { pushAll } from "../core/list.js";
 import { constantEnv } from "../core/constants.js";
 import type { EvaluateEnv, Evaluation, Value } from "../core/evaluate.js";
 import { evaluate } from "../core/evaluate.js";
@@ -26,14 +27,18 @@ const FOLDABLE = new Set([
     "CallExpression",
 ]);
 
-const isCanonical = (node: Node, value: Value): boolean => {
+/** `shadowed`: `void 0` and `0 / 0` are canonical too, as the names `undefined`/`NaN` are declared. */
+const isCanonical = (node: Node, value: Value, shadowed = false): boolean => {
     switch (node.type) {
         case "Literal":
             return Object.is(node.value, value);
         case "Identifier":
             return (node.name === "undefined" && value === undefined) || (node.name === "NaN" && Number.isNaN(value)) || (node.name === "Infinity" && value === Number.POSITIVE_INFINITY);
         case "UnaryExpression":
-            return node.operator === "-" && typeof value === "number" && (value < 0 || Object.is(value, -0)) && isCanonical(node.argument, -value);
+            if (node.operator === "void") return shadowed && value === undefined && node.argument.type === "Literal" && node.argument.value === 0;
+            return node.operator === "-" && typeof value === "number" && (value < 0 || Object.is(value, -0)) && isCanonical(node.argument, -value, shadowed);
+        case "BinaryExpression":
+            return shadowed && node.operator === "/" && Number.isNaN(value) && isCanonical(node.left, 0) && isCanonical(node.right, 0);
         default:
             return false;
     }
@@ -104,12 +109,11 @@ export const simplify: Pass = {
         const fold = (path: Path, node: Expression): boolean => {
             if (!foldablePosition(path)) return false;
             const result = evaluate(node, env);
-            if (!result.ok || isCanonical(node, result.value)) return false;
+            if (!result.ok) return false;
+            const shadowed = (result.value === undefined && scopes.declaresName("undefined")) || (Number.isNaN(result.value) && scopes.declaresName("NaN"));
+            if (isCanonical(node, result.value, shadowed)) return false;
             const value: Value = result.value;
-            const replacement = valueToNode(value, node);
-            // `undefined`, `NaN`, `Infinity` (possibly under a minus) are names: not usable where a local takes them.
-            const named = replacement.type === "UnaryExpression" ? replacement.argument : replacement;
-            if (named.type === "Identifier" && scopes.declaresName(named.name)) return false;
+            const replacement = valueToNode(value, node, scopes);
             if (node.type === "Identifier") {
                 if (typeof value === "string" && value.length > MAX_PROPAGATED_STRING) return false;
                 counts.propagated++;
@@ -237,7 +241,7 @@ export const simplify: Pass = {
             if (terminal !== -1 && terminal < body.length - 1 && !body.slice(terminal + 1).every(isPlaceholder)) {
                 const end = body[terminal] as Statement;
                 const dead = body.splice(terminal + 1);
-                body.push(...deadRemainder(dead, end));
+                pushAll(body, deadRemainder(dead, end));
                 const dropped = dead.filter((s) => !isPlaceholder(s)).length;
                 counts.unreachable += dropped;
                 log.debug(`removed ${dropped} unreachable statement(s)`, end);

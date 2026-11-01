@@ -1,4 +1,5 @@
 import type { Expression, Function as FunctionNode, Node, Program, Statement, TemplateElement } from "./ast.js";
+import { isStackOverflow, NestingError } from "./traverse.js";
 
 /*
  * ESTree printer for readable output. Re-parsing the output gives the same tree: parentheses are added only where the
@@ -156,6 +157,50 @@ export const templateRaw = (cooked: string): string =>
         return undefined;
     });
 
+/** What a terminal may act on or an editor may hide or reorder (controls, bidi and other format characters, ...). */
+const isUnsafe = (code: number): boolean => code !== 0x09 && code !== 0x0a && code !== 0x20 && ((code >= 0xd800 && code <= 0xdfff) || INVISIBLE.test(String.fromCodePoint(code)));
+
+const UNSAFE_CANDIDATE = /[^\x20-\x7e\t\n]/;
+
+const hasUnsafe = (text: string): boolean => {
+    if (!UNSAFE_CANDIDATE.test(text)) return false;
+    for (const char of text) if (isUnsafe(char.codePointAt(0) as number)) return true;
+    return false;
+};
+
+const unicodeEscape = (code: number, braces: boolean): string => {
+    if (code <= 0xff) return `\\x${hex(code, 2)}`;
+    if (code <= 0xffff) return `\\u${hex(code, 4)}`;
+    if (braces) return `\\u{${hex(code, 0)}}`;
+    const offset = code - 0x10000;
+    return `\\u${hex(0xd800 + (offset >> 10), 4)}\\u${hex(0xdc00 + (offset & 0x3ff), 4)}`;
+};
+
+/**
+ * Source text (a regex body, a string literal's raw text) with each unsafe character written as an escape that stands
+ * for the same character: `\<c>` (an identity escape) is replaced whole. In a string, `\` before a line terminator is
+ * a line continuation, which stands for nothing.
+ */
+export const escapeUnsafeSource = (text: string, braces: boolean, inString: boolean): string => {
+    if (!hasUnsafe(text)) return text;
+    let out = "";
+    let from = 0;
+    let escaped = false;
+    for (let i = 0; i < text.length;) {
+        const code = text.codePointAt(i) as number;
+        let width = code > 0xffff ? 2 : 1;
+        if (isUnsafe(code)) {
+            const continuation = escaped && inString && (code === 0x0d || code === 0x2028 || code === 0x2029);
+            if (continuation && code === 0x0d && text.charCodeAt(i + 1) === 0x0a) width = 2;
+            out += text.slice(from, escaped ? i - 1 : i) + (continuation ? "" : unicodeEscape(code, braces));
+            from = i + width;
+            escaped = false;
+        } else escaped = !escaped && code === 0x5c;
+        i += width;
+    }
+    return out + text.slice(from);
+};
+
 /** Non-negative finite numbers only. */
 const formatNumber = (value: number): string => {
     if (value === Infinity) return "1e999";
@@ -253,8 +298,15 @@ class Printer {
     #abortAt = Infinity;
     readonly #indents: string[] = ["\n"];
 
-    constructor(layout: boolean) {
+    /** Output for people, not for the sandbox: text printed raw gets its unsafe characters escaped. */
+    readonly #display: boolean;
+    readonly #warn: ((message: string) => void) | undefined;
+    readonly #warned = new Set<Node>();
+
+    constructor(layout: boolean, display: boolean, warn?: (message: string) => void) {
         this.#layout = layout;
+        this.#display = display;
+        this.#warn = warn;
     }
 
     get output(): string {
@@ -402,7 +454,7 @@ class Printer {
     }
 
     program(program: Program): void {
-        if (program.hashbang !== null) this.write(`#!${program.hashbang.value}`);
+        if (program.hashbang !== null) this.write(`#!${this.#display ? escapeUnsafeSource(program.hashbang.value, true, false) : program.hashbang.value}`);
         const body = program.body as Statement[];
         if (body.length === 0) return;
         this.statements(body, true);
@@ -421,9 +473,13 @@ class Printer {
                 continue;
             }
             const expression = statement.expression;
-            if (typeof statement.directive === "string" && expression.type === "Literal") {
-                const directive = statement.directive;
-                this.write(`${expression.raw ?? (directive.includes('"') ? `'${directive}'` : `"${directive}"`)};`);
+            // A pass may have replaced the directive's literal (or copied it, raw text and all, with another value): then
+            // the statement prints as what it now holds.
+            const directive = statement.directive;
+            const raw = expression.type === "Literal" ? expression.raw : undefined;
+            const value = expression.type === "Literal" ? expression.value : undefined;
+            if (typeof directive === "string" && typeof raw === "string" && raw.slice(1, -1) === directive && (directive.includes("\\") || value === directive)) {
+                this.write(`${this.#display ? escapeUnsafeSource(raw, false, true) : raw};`);
                 continue;
             }
             if (inPrologue && expression.type === "Literal" && typeof expression.value === "string") {
@@ -872,7 +928,7 @@ class Printer {
                 return this.template(node);
             case "TaggedTemplateExpression":
                 this.expression(node.tag, CALL, start | CHAIN_HOST | (flags & NO_CALL));
-                return this.template(node.quasi);
+                return this.template(node.quasi, true);
             case "ArrayExpression":
                 return this.list("[", "]", node.elements as readonly (Node | null)[], "array");
             case "ObjectExpression":
@@ -989,7 +1045,10 @@ class Printer {
     }
 
     literal(node: Extract<Node, { type: "Literal" }>): void {
-        if ("regex" in node && node.regex !== undefined) return this.write(`/${node.regex.pattern}/${node.regex.flags}`);
+        if ("regex" in node && node.regex !== undefined) {
+            const { pattern, flags } = node.regex;
+            return this.write(`/${this.#display ? escapeUnsafeSource(pattern, flags.includes("u") || flags.includes("v"), false) : pattern}/${flags}`);
+        }
         if ("bigint" in node && typeof node.bigint === "string") return this.write(`${node.bigint}n`);
         const value = node.value;
         if (typeof value === "string") return this.write(quoteString(value));
@@ -1001,11 +1060,22 @@ class Printer {
         return this.write(String(value));
     }
 
-    template(node: Extract<Node, { type: "TemplateLiteral" }>): void {
+    /** A tag sees the raw text, so a tagged template's stays as it is (with a warning when it holds unsafe characters). */
+    template(node: Extract<Node, { type: "TemplateLiteral" }>, tagged = false): void {
         this.write("`");
         for (let i = 0; i < node.quasis.length; i++) {
             const quasi = node.quasis[i] as TemplateElement;
-            this.writeMultiline(quasi.value.raw ?? templateRaw(quasi.value.cooked ?? ""));
+            const raw = quasi.value.raw;
+            if (raw === undefined || raw === null) this.writeMultiline(templateRaw(quasi.value.cooked ?? ""));
+            else if (!this.#display || !hasUnsafe(raw)) this.writeMultiline(raw);
+            else if (!tagged) this.writeMultiline(templateRaw(quasi.value.cooked ?? ""));
+            else {
+                if (!this.#warned.has(quasi)) {
+                    this.#warned.add(quasi);
+                    this.#warn?.("a tagged template's raw text holds control or format characters; printed as is (the tag can read it)");
+                }
+                this.writeMultiline(raw);
+            }
             const expression = node.expressions[i];
             if (expression === undefined) continue;
             this.write("${");
@@ -1016,16 +1086,23 @@ class Printer {
     }
 }
 
-/** Comments are not printed. */
-export const print = (program: Program): string => {
-    const printer = new Printer(true);
-    printer.program(program);
+/**
+ * Comments are not printed. Control, bidi and other format characters in text printed raw (untagged templates, regex
+ * bodies, directives, the hashbang) are written as escapes; `warn` hears of those a tagged template must keep.
+ */
+export const print = (program: Program, warn?: (message: string) => void): string => {
+    const printer = new Printer(true, true, warn);
+    try {
+        printer.program(program);
+    } catch (error) {
+        throw isStackOverflow(error) ? new NestingError() : error;
+    }
     return printer.output;
 };
 
 /** Exact, without layout work (for running in the sandbox). */
 export const printStatement = (statement: Statement): string => {
-    const printer = new Printer(false);
+    const printer = new Printer(false, false);
     printer.statements([statement], true);
     return printer.output;
 };

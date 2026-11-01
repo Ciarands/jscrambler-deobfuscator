@@ -2,6 +2,7 @@ import type { CallExpression, Expression, Node, SequenceExpression } from "../co
 import { memberPath, propertyKey } from "../core/ast.js";
 import { at, valueToNode } from "../core/build.js";
 import { constantEnv } from "../core/constants.js";
+import { pushAll } from "../core/list.js";
 import type { EvaluateEnv, Evaluation, Value } from "../core/evaluate.js";
 import { evaluate } from "../core/evaluate.js";
 import { replaceNodes, traverse } from "../core/traverse.js";
@@ -179,13 +180,13 @@ export const resolveCalls: Pass = {
                     const target = logged !== undefined && proof.settlingCalls.has(logged) ? targetOf(key) : undefined;
                     if (target !== undefined) resolution.settlingSites.set(target, site);
                     if (logged !== undefined && proof.lookups.has(logged)) {
-                        path.replace(valueToNode(recorded, call));
+                        path.replace(valueToNode(recorded, call, scopes));
                         counts.dropped++;
                         log.debug(`a pure lookup on its settled decoder: replaced by its result ${JSON.stringify(recorded)}`, call);
                         return;
                     }
                     // The original call stays first in the sequence: its side effect drives the decoder's stages.
-                    path.replace(at<SequenceExpression>({ type: "SequenceExpression", expressions: [call, valueToNode(recorded, call)] }, call));
+                    path.replace(at<SequenceExpression>({ type: "SequenceExpression", expressions: [call, valueToNode(recorded, call, scopes)] }, call));
                     counts.prelude++;
                     return;
                 }
@@ -202,7 +203,7 @@ export const resolveCalls: Pass = {
                 for (const arg of call.arguments) {
                     const value = argumentValue(arg, constants());
                     if (value?.ok === true) {
-                        if (arg.type === "SequenceExpression") prefix.push(...arg.expressions.slice(0, -1));
+                        if (arg.type === "SequenceExpression") pushAll(prefix, arg.expressions.slice(0, -1));
                         args.push(value.value);
                         continue;
                     }
@@ -256,7 +257,7 @@ export const resolveCalls: Pass = {
                 const result = results[slots[i] as number];
                 const { node, isLookup } = candidate;
                 if (result === undefined || !result.ok) {
-                    keep(result === undefined ? "no answer" : result.stale ? result.error : `call threw in the sandbox: ${result.error}`, node);
+                    keep(result === undefined ? "no answer" : result.stale === true || result.env === true ? result.error : `call threw in the sandbox: ${result.error}`, node);
                     continue;
                 }
                 if ("nonPrimitive" in result) {
@@ -319,7 +320,7 @@ export const resolveCalls: Pass = {
         const byTarget = new Map<string, number>();
         for (const { node, isLookup, key, prefix } of candidates) {
             if (!answers.has(node)) continue;
-            const value = valueToNode(answers.get(node), node) as Expression;
+            const value = valueToNode(answers.get(node), node, scopes) as Expression;
             replacements.set(node, prefix.length === 0 ? value : at<SequenceExpression>({ type: "SequenceExpression", expressions: [...prefix, value] }, node));
             if (isLookup) counts.lookups++;
             else counts.resolved++;

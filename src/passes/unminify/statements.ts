@@ -14,6 +14,7 @@ import type {
 import { isFunctionNode, isJump } from "../../core/ast.js";
 import { at } from "../../core/build.js";
 import { deadRemainder, isPlaceholder } from "../../core/hoisting.js";
+import { pushAll, spliceList } from "../../core/list.js";
 import { forEachChild, traverse } from "../../core/traverse.js";
 import type { Path } from "../../core/traverse.js";
 import type { UnminifyContext } from "./context.js";
@@ -307,7 +308,7 @@ const dropUnreachable = (list: Statement[], context: UnminifyContext): void => {
     const jump = list.findIndex(isJump);
     if (jump === -1 || jump === list.length - 1 || list.slice(jump + 1).every(isPlaceholder)) return;
     context.did("unreachable", list[jump + 1] as Statement);
-    list.push(...deadRemainder(list.splice(jump + 1), list[jump] as Statement));
+    pushAll(list, deadRemainder(list.splice(jump + 1), list[jump] as Statement));
 };
 
 /**
@@ -318,7 +319,7 @@ export const expandStatements = (list: Statement[], context: UnminifyContext, fu
     for (let i = 0; i < list.length; i++) {
         const statements = expandStatement(list[i] as Statement, context) ?? unlabel(list, i, context, functionBody);
         if (statements === undefined) continue;
-        list.splice(i, 1, ...statements);
+        spliceList(list, i, 1, statements);
         i--;
     }
     dropUnreachable(list, context);
@@ -337,7 +338,7 @@ export const unlabelStatements = (list: Statement[], context: UnminifyContext, f
     for (let i = 0; i < list.length; i++) {
         const statements = unlabel(list, i, context, functionBody);
         if (statements === undefined) continue;
-        list.splice(i, 1, ...statements);
+        spliceList(list, i, 1, statements);
         changed = true;
         for (const statement of statements) traverse(statement, { exit: (path) => mergeElseIf(path.node, context) });
         i--;
@@ -346,7 +347,7 @@ export const unlabelStatements = (list: Statement[], context: UnminifyContext, f
     for (let i = 0; i < list.length; i++) {
         const statements = rebuildLoop(list[i] as Statement, context);
         if (statements === undefined) continue;
-        list.splice(i, 1, ...statements);
+        spliceList(list, i, 1, statements);
         i += statements.length - 1;
     }
     const last = list.at(-1);

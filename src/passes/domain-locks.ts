@@ -1,6 +1,7 @@
 import type { CallExpression, Expression, Function as FunctionNode, MemberExpression, Node } from "../core/ast.js";
 import { isFunctionNode, memberPath } from "../core/ast.js";
 import { valueToNode } from "../core/build.js";
+import { pushAll } from "../core/list.js";
 import type { ScopeInfo, Variable } from "../core/scope.js";
 import { replaceNodes, traverse } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
@@ -117,7 +118,7 @@ export const domainLocks: Pass = {
         for (const gate of gates) {
             if (!gate.calls.every(({ path }) => verdicts.get(JSON.stringify(path)) === true)) continue;
             log.debug(`a domain-lock test: the licensed host makes it ${String(gate.value)}`, gate.test);
-            replacements.set(gate.test, valueToNode(gate.value, gate.test));
+            replacements.set(gate.test, valueToNode(gate.value, gate.test, scopes));
         }
         replaceNodes(program, replacements);
         log.info(`answered ${replacements.size} domain-lock test(s) of ${gates.length} candidate(s)`);
@@ -161,7 +162,7 @@ const reachesHost = (iife: FunctionNode, method: FunctionNode, scopes: ScopeInfo
             Identifier(path) {
                 const variable = scopes.variableOf(path.node);
                 if (isGlobalObject(path.node) || (variable !== undefined && holders.has(variable))) found = true;
-                if (variable !== undefined) work.push(...(functions.get(variable) ?? []));
+                if (variable !== undefined) pushAll(work, functions.get(variable) ?? []);
             },
         });
         if (found) return true;

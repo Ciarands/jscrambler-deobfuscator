@@ -3,7 +3,9 @@ import { isFunctionNode, memberPath, propertyKey } from "../../core/ast.js";
 import { sameReference } from "../../core/equal.js";
 import { evaluate } from "../../core/evaluate.js";
 import type { Value } from "../../core/evaluate.js";
+import { pushAll } from "../../core/list.js";
 import { printStatement } from "../../core/print.js";
+import { DEFAULT_LIMITS } from "../../core/sandbox.js";
 import type { ScopeInfo } from "../../core/scope.js";
 import { traverse } from "../../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../../pipeline/pass.js";
@@ -15,6 +17,7 @@ import { RUNTIME } from "./model.js";
 /** Runtime statements can be heavy (a decoder may XOR a >1 MB string). */
 const RUNTIME_STATEMENT_TIMEOUT_MS = 15_000;
 const OTHER_STATEMENT_TIMEOUT_MS = 500;
+/** For the statements and the alias probes after them; when it runs out, the rest is left unknown (partial output). */
 const TOTAL_BUDGET_MS = 60_000;
 
 const isPrimitive = (value: unknown): value is Value => value === null || value === undefined || typeof value === "string" || typeof value === "number" || typeof value === "boolean";
@@ -52,19 +55,24 @@ const storageAssignment = (statement: Statement): { object: string; key: string;
  * same as an existing property, getters included) or a global. New globals go with the setup call, so cleanup removes
  * it only while the program doesn't name them (`RuntimeModel.setupGlobals`). `unexpected` names the first other effect.
  */
-const setupEffects = (guest: Guest, change: OwnersChange): { unexpected: string | undefined; globals: string[] } => {
+const setupEffects = (guest: Guest, change: OwnersChange, timeoutMs: number): { unexpected: string | undefined; globals: string[] } => {
     const [changed] = change.changed;
     if (changed !== undefined) return { unexpected: `${pathName(guest.owners[changed[0]] ?? [])}.${changed[1]} changed`, globals: [] };
     const globals: string[] = [];
+    let why: string | undefined;
     const added = change.added.find(([index, name]) => {
         const owner = guest.owners[index];
         const was = change.namesBefore[index];
         if (owner === undefined || was === undefined) return true;
-        if (index !== 0) return guest.aliasOf(owner, name, [...was]) === undefined;
-        globals.push(name);
-        return false;
+        if (index === 0) {
+            globals.push(name);
+            return false;
+        }
+        const alias = guest.aliasOf(owner, name, was, timeoutMs);
+        if (alias !== undefined && "env" in alias) why = `reading it ${alias.env}`;
+        return alias === undefined || "env" in alias;
     });
-    return { unexpected: added === undefined ? undefined : `${pathName(guest.owners[added[0]] ?? [])}.${added[1]} added`, globals };
+    return { unexpected: added === undefined ? undefined : `${pathName(guest.owners[added[0]] ?? [])}.${added[1]} added${why === undefined ? "" : ` (${why})`}`, globals };
 };
 
 const storagePath = (node: Node, storage: string): PropertyPath | undefined => {
@@ -250,21 +258,25 @@ export const emulate: Pass = {
         const installedBy = new Map<string, Statement>();
         const appearedAfter = new Map<string, Statement>();
         let lastSnapshot = before;
-        const counts = { executed: 0, skipped: 0, failed: 0, mapped: 0 };
+        const counts = { executed: 0, skipped: 0, failed: 0, tainted: 0, disagreed: 0, mapped: 0 };
         const started = Date.now();
+        const budgetLeft = (): number => TOTAL_BUDGET_MS - (Date.now() - started);
+        /** A guest call's deadline within what is left of the budget. */
+        const within = (timeoutMs: number): number => Math.max(1, Math.min(timeoutMs, budgetLeft()));
         /** From here on the guest may no longer match a real run: results stop being recorded. */
         let diverged: Statement | undefined;
         let marked = false;
 
         for (const statement of body) {
             if (statement.type === "FunctionDeclaration") continue;
-            if (Date.now() - started > TOTAL_BUDGET_MS) {
+            if (budgetLeft() <= 0) {
                 log.warn(`emulation budget of ${TOTAL_BUDGET_MS}ms used up, stopping`, statement);
                 break;
             }
             // Runtime statements always run: what they need only exists once earlier ones ran, so free-name analysis
             // can't judge them. Others run only when every free name is a builtin or a root declaration.
             const isRuntime = isRuntimeStatement(statement, storage, declared);
+            const reachesRuntime = (): boolean => isRuntime || evaluatedRootNames(statement, scopes, rootScopes).some((name) => name === storage || declared.has(name));
             if (!isRuntime) {
                 const free = freeNames(statement, scopes, rootScopes);
                 available ??= new Set(guest.globals());
@@ -274,7 +286,7 @@ export const emulate: Pass = {
                     counts.skipped++;
                     log.debug(`skipped: needs ${unknown.slice(0, 5).join(", ")}`, statement);
                     // In a real run this statement could call into the runtime; from here on the guest may differ.
-                    if (diverged === undefined && evaluatedRootNames(statement, scopes, rootScopes).some((name) => name === storage || declared.has(name))) diverged = statement;
+                    if (diverged === undefined && reachesRuntime()) diverged = statement;
                     continue;
                 }
             }
@@ -284,32 +296,68 @@ export const emulate: Pass = {
             const tracked: boolean = bound && marked;
             const callablesBefore = bound && isCall ? new Set(guest.ownCallables()) : undefined;
             const source = printStatement(statement);
-            const result = guest.run(source, isRuntime ? RUNTIME_STATEMENT_TIMEOUT_MS : OTHER_STATEMENT_TIMEOUT_MS);
+            const result = guest.run(source, within(isRuntime ? RUNTIME_STATEMENT_TIMEOUT_MS : OTHER_STATEMENT_TIMEOUT_MS));
             marked = false;
+            const taken = guest.takeRun();
+            if (taken === undefined) {
+                // The calls it made are unknown: whatever they did to the runtime, no recorded call can be trusted after them.
+                log.debug("the guest didn't tell which runtime calls this statement made", statement);
+                diverged ??= statement;
+            }
+            const madeCalls = taken?.calls ?? [];
+            const env = taken?.env;
+            if (env !== undefined) {
+                // What it computed (and wrote) may differ in a real run: none of it is used, and its writes count as
+                // ones the guest doesn't reflect (not `executed`).
+                counts.tainted++;
+                log.debug(`its run ${env}, which a real run may answer differently: nothing it did in the guest is used`, statement);
+                if (diverged === undefined && reachesRuntime()) diverged = statement;
+            }
+            // The second lane (another Math.random seed, the host's globals present) saw it otherwise: what it did is
+            // unknown, used as little as a tainted run's. Both lanes go on, and what comes after is kept only where
+            // they agree, so nothing needs to stop here.
+            const disagreed = result.disagreed === true || taken?.disagreed === true;
+            if (disagreed) {
+                counts.disagreed++;
+                log.debug("under another Math.random seed with the host's globals present it ran otherwise: nothing it did in the guest is used", statement);
+            }
+            const unsure = env !== undefined || disagreed;
             if (!result.ok) {
                 counts.failed++;
                 const where = result.at === undefined ? "" : ` at \`${(source.split("\n")[result.at.line - 1] ?? "").slice(Math.max(0, result.at.column - 21), result.at.column + 40).trim()}\``;
                 log.debug(`failed: ${result.error}${where}`, statement);
                 // Calls (and, if it can reach the runtime, writes) made before failing moved state as no real run does.
-                const madeCalls = guest.takeCalls();
                 if (madeCalls.length > 0) {
                     log.debug(`it made ${madeCalls.length} runtime call(s) first: ${madeCalls.map((c) => `${c.key}(${c.args.map((a) => JSON.stringify(a)).join(", ")})`).join(" ")}`, statement);
-                    unmappedCalls.push(...madeCalls);
+                    pushAll(unmappedCalls, madeCalls);
                 }
-                if (diverged === undefined && (madeCalls.length > 0 || evaluatedRootNames(statement, scopes, rootScopes).some((name) => name === storage || declared.has(name)))) diverged = statement;
+                if (diverged === undefined && (madeCalls.length > 0 || reachesRuntime())) diverged = statement;
                 continue;
             }
-            counts.executed++;
-            executed.add(statement);
             available = undefined;
             if (!bound) bound = guest.bind(storage);
+            if (env === undefined) {
+                counts.executed++;
+                executed.add(statement);
+            }
 
             const change: OwnersChange | undefined = tracked ? guest.ownersSince() : undefined;
             marked = change !== undefined;
-            if (change !== undefined) {
+            // An effect on a host object (seen by the second lane's stubs) is outside what owners show.
+            if (taken?.hostEffect === true) log.debug("with the host's globals present it acts on them: neither pure nor a setup call", statement);
+            if (change !== undefined && env === undefined && taken?.hostEffect !== true) {
                 if (change.same) pure.add(statement);
                 const installs = !change.same || change.accessorsAfter > change.accessorsBefore;
-                const effects = isCall && installs ? setupEffects(guest, change) : undefined;
+                const effects = isCall && installs ? setupEffects(guest, change, within(DEFAULT_LIMITS.timeoutMs)) : undefined;
+                if (effects !== undefined) {
+                    // Probing the aliases runs the program's getters: calls they made aren't the statement's.
+                    const probed = guest.takeRun();
+                    if (probed === undefined || probed.calls.length > 0) {
+                        log.debug("probing its aliases ran runtime calls a real run doesn't make", statement);
+                        pushAll(unmappedCalls, probed?.calls ?? []);
+                        diverged ??= statement;
+                    }
+                }
                 if (effects?.unexpected !== undefined) log.debug(`not a setup call: ${effects.unexpected}`, statement);
                 if (effects !== undefined && effects.unexpected === undefined) {
                     setup.add(statement);
@@ -339,20 +387,25 @@ export const emulate: Pass = {
                     log.debug(`wrapper ${assignment.key} -> ${storage}.${found.target.join(".")}`, statement);
                 }
                 const { right } = assignment;
-                if (right.type === "CallExpression" && right.arguments.length === 0 && (right.callee.type === "FunctionExpression" || right.callee.type === "ArrowFunctionExpression")) {
+                if (
+                    env === undefined &&
+                    right.type === "CallExpression" &&
+                    right.arguments.length === 0 &&
+                    (right.callee.type === "FunctionExpression" || right.callee.type === "ArrowFunctionExpression")
+                ) {
                     const identities = guest.built([assignment.key]);
                     if (identities !== undefined) built.set(statement, identities);
                 }
             }
 
             // Sites match calls in completion order (post-order); sites in nested functions run later, in another state.
-            const logged = guest.takeCalls();
+            const logged = madeCalls;
             if (logged.length === 0) continue;
-            if (diverged !== undefined) {
-                unmappedCalls.push(...logged);
+            if (diverged !== undefined || unsure) {
+                pushAll(unmappedCalls, logged);
                 continue;
             }
-            preludeCalls.push(...logged);
+            pushAll(preludeCalls, logged);
             const sites: CallExpression[] = [];
             traverse(statement, {
                 enter(path) {
@@ -379,7 +432,7 @@ export const emulate: Pass = {
                 });
             if (!lineUp) {
                 log.debug(`${logged.length} wrapper call(s) ran but don't line up with the ${sites.length} call site(s); results not used`, statement);
-                unmappedCalls.push(...logged);
+                pushAll(unmappedCalls, logged);
                 continue;
             }
             for (const [i, site] of sites.entries()) {
@@ -394,6 +447,14 @@ export const emulate: Pass = {
         }
         if (diverged !== undefined) log.info("the emulated runtime may differ from a real run from here on; later call results weren't recorded", diverged);
 
+        // The probes below run the program's getters too: they share the budget, and stop where it runs out.
+        let outOfBudget = false;
+        const probeTimeout = (): number | undefined => {
+            if (budgetLeft() > 0) return within(DEFAULT_LIMITS.timeoutMs);
+            if (!outOfBudget) log.warn(`emulation budget of ${TOTAL_BUDGET_MS}ms used up: the remaining alias probes are skipped`);
+            outOfBudget = true;
+            return undefined;
+        };
         const after = guest.snapshot();
         const aliases: Alias[] = [];
         for (const [index, owner] of guest.owners.entries()) {
@@ -401,48 +462,56 @@ export const emulate: Pass = {
             const existed = new Set(was);
             for (const alias of after[index] ?? []) {
                 if (existed.has(alias)) continue;
-                const original = guest.aliasOf(owner, alias, was);
-                if (original === undefined) continue;
-                aliases.push({ owner, alias, original });
-                log.debug(`alias ${pathName(owner)}.${alias} = ${pathName(owner)}.${original}`, appearedAfter.get(`${index}:${alias}`));
+                const timeoutMs = probeTimeout();
+                if (timeoutMs === undefined) break;
+                const found = guest.aliasOf(owner, alias, was, timeoutMs);
+                if (found === undefined) continue;
+                if ("env" in found) {
+                    log.debug(`${pathName(owner)}.${alias}: reading it ${found.env}; not taken as an alias`, appearedAfter.get(`${index}:${alias}`));
+                    continue;
+                }
+                aliases.push({ owner, alias, original: found.original });
+                log.debug(`alias ${pathName(owner)}.${alias} = ${pathName(owner)}.${found.original}`, appearedAfter.get(`${index}:${alias}`));
             }
         }
 
         const callAliases = new Map<string, CallAlias>();
-        if (bound) {
-            for (const found of guest.callAliases()) {
-                if (found.style === undefined) {
-                    log.debug(
-                        `call alias ${storage}.${found.key}(...) hands out ${pathName(found.owner)}.${found.original}, but passes arguments on in neither known way; left`,
-                        installedBy.get(found.key)
-                    );
-                    continue;
-                }
-                callAliases.set(found.key, { key: found.key, owner: found.owner, original: found.original, style: found.style });
-                const shape = found.style === "method" ? `x.${found.original}(...)` : `${pathName(found.owner)}.${found.original}(...)`;
-                log.debug(`call alias ${storage}.${found.key}(...) = ${shape}`, installedBy.get(found.key));
+        const callAliasTimeout = bound ? probeTimeout() : undefined;
+        for (const found of callAliasTimeout === undefined ? [] : guest.callAliases(callAliasTimeout)) {
+            if ("env" in found) {
+                log.debug(`${storage}.${found.key}: probing its getter ${found.env}; not taken as a call alias`, installedBy.get(found.key));
+                continue;
             }
+            if (found.style === undefined) {
+                log.debug(
+                    `call alias ${storage}.${found.key}(...) hands out ${pathName(found.owner)}.${found.original}, but passes arguments on in neither known way; left`,
+                    installedBy.get(found.key)
+                );
+                continue;
+            }
+            callAliases.set(found.key, { key: found.key, owner: found.owner, original: found.original, style: found.style });
+            const shape = found.style === "method" ? `x.${found.original}(...)` : `${pathName(found.owner)}.${found.original}(...)`;
+            log.debug(`call alias ${storage}.${found.key}(...) = ${shape}`, installedBy.get(found.key));
         }
         // Globals the global object lacks (the random names code locks probe with `typeof`).
         const globalReads = new Map<string, string>();
-        if (bound) {
-            for (const { key, name } of guest.globalReads()) {
-                if (callAliases.has(key) || !setupKeys.has(key)) continue;
-                globalReads.set(key, name);
-                log.debug(`global read ${storage}.${key}() = globalThis.${name}`, installedBy.get(key));
-            }
+        const globalReadsTimeout = bound ? probeTimeout() : undefined;
+        for (const { key, name } of globalReadsTimeout === undefined ? [] : guest.globalReads(globalReadsTimeout)) {
+            if (callAliases.has(key) || !setupKeys.has(key)) continue;
+            globalReads.set(key, name);
+            log.debug(`global read ${storage}.${key}() = globalThis.${name}`, installedBy.get(key));
         }
         const hostAliases = new Map<string, string>();
-        if (setupGlobals.size > 0) {
-            for (const { alias, name } of guest.hostAliases([...setupGlobals])) {
-                hostAliases.set(alias, name);
-                log.debug(`host alias ${alias} = globalThis.${name}`);
-            }
+        const hostAliasesTimeout = setupGlobals.size > 0 ? probeTimeout() : undefined;
+        for (const { alias, name } of hostAliasesTimeout === undefined ? [] : guest.hostAliases([...setupGlobals], hostAliasesTimeout)) {
+            hostAliases.set(alias, name);
+            log.debug(`host alias ${alias} = globalThis.${name}`);
         }
-        const globalKeys = new Set(bound ? guest.globalKeys() : []);
+        const globalKeysTimeout = bound ? probeTimeout() : undefined;
+        const globalKeys = new Set(globalKeysTimeout === undefined ? [] : guest.globalKeys(globalKeysTimeout));
 
         log.info(
-            `ran ${counts.executed} statement(s), skipped ${counts.skipped}, failed ${counts.failed}; wrappers ${wrappers.size}, aliases ${aliases.length}, call aliases ${callAliases.size}, global keys [${[...globalKeys].join(", ")}], call results ${counts.mapped}`
+            `ran ${counts.executed} statement(s), skipped ${counts.skipped}, failed ${counts.failed}, read the environment ${counts.tainted}, ran otherwise under the second lane ${counts.disagreed}; wrappers ${wrappers.size}, aliases ${aliases.length}, call aliases ${callAliases.size}, global keys [${[...globalKeys].join(", ")}], call results ${counts.mapped}`
         );
         facts.set(RUNTIME, {
             storage,

@@ -66,7 +66,7 @@ export const storageComparisons: Pass = {
                 log.debug(`kept: ${answer?.reason ?? "no answer"}`, candidate.node);
                 continue;
             }
-            replacements.set(candidate.node, valueToNode(answer.value, candidate.node));
+            replacements.set(candidate.node, valueToNode(answer.value, candidate.node, scopes));
         }
         replaceNodes(program, replacements);
         log.info(`folded ${replacements.size} comparison(s) of runtime values; kept ${kept}`);
