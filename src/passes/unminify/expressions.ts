@@ -1,15 +1,18 @@
 import type { BinaryExpression, Expression, Node, ObjectExpression, Statement, TemplateElement, TemplateLiteral, UnaryExpression } from "../../core/ast.js";
 import { isFunctionNode, isIdentifierName } from "../../core/ast.js";
 import { at, valueToNode } from "../../core/build.js";
+import type { ScopeInfo } from "../../core/scope.js";
 import { forEachChild } from "../../core/traverse.js";
 import { templateRaw } from "../../core/print.js";
 import type { Path } from "../../core/traverse.js";
 import type { UnminifyContext } from "./context.js";
 
-/** `!argument`. */
-export const not = (argument: Expression, origin: Node): Expression => at<UnaryExpression>({ type: "UnaryExpression", operator: "!", prefix: true, argument }, origin);
+/** `!argument`; a boolean literal negates to the other one (the operands an inversion distributes over may be one). */
+export const not = (argument: Expression, origin: Node): Expression =>
+    argument.type === "Literal" && typeof argument.value === "boolean"
+        ? valueToNode(!argument.value, origin)
+        : at<UnaryExpression>({ type: "UnaryExpression", operator: "!", prefix: true, argument }, origin);
 
-/** A binary expression node, `#x in o` included. */
 type Binary = Extract<Node, { type: "BinaryExpression" }>;
 
 /** `!(a == b)` -> `a != b`. Only equality: `!(a < b)` isn't `a >= b` when either is NaN. */
@@ -37,10 +40,7 @@ const BITWISE: ReadonlySet<string> = new Set(["&", "|", "^", "<<", ">>", ">>>"])
 /** Names whose global is a constant value: reading them can't run code or throw. */
 const CONSTANT_GLOBALS: ReadonlySet<string> = new Set(["undefined", "NaN", "Infinity"]);
 
-/**
- * A value whose evaluation can't run code, throw, or depend on when it happens: a string, number, boolean or null
- * literal, `-number`, or the global `undefined`/`NaN`/`Infinity` (`-Infinity`).
- */
+/** Evaluating it can't run code, throw, or depend on when it happens. */
 const isConstantValue = (node: Node, context: UnminifyContext): boolean => {
     switch (node.type) {
         case "Literal":
@@ -100,7 +100,6 @@ const typeofUndefined = (node: Binary): Expression | undefined => {
     return at<BinaryExpression>({ type: "BinaryExpression", operator: isUndefined ? "===" : "!==", left: operand, right: valueToNode("undefined", node.right) }, node);
 };
 
-/** The number an operand is, as written: `5`, `-5`. */
 const numberOf = (operand: Node): number | undefined => {
     if (operand.type === "Literal" && typeof operand.value === "number") return operand.value;
     if (operand.type === "UnaryExpression" && operand.operator === "-" && operand.argument.type === "Literal" && typeof operand.argument.value === "number") return -operand.argument.value;
@@ -217,7 +216,6 @@ const capturingGroups = (pattern: string): number => {
 const readablePattern = (pattern: string, flags: string): string | undefined => {
     const unicode = flags.includes("u") || flags.includes("v");
     const setMode = flags.includes("v");
-    /** How the character `code` reads in the pattern, or undefined when it keeps its escape. */
     const spelling = (code: number, inClass: boolean): string | undefined => {
         const char = String.fromCharCode(code);
         if (isPlainPatternChar(code)) return char;
@@ -348,16 +346,36 @@ const canonicalPattern = (pattern: string, flags: string): string | undefined =>
  */
 export type OwnBindings = "all" | "except-this" | "none";
 
-/** Whether `node` mentions the name `name`, or uses bindings of the function it leaves (`own`) outside functions that bind their own. */
-export const uses = (node: Node | null | undefined, name: string, own: OwnBindings): boolean => {
+/**
+ * A builder's local: its name, and which identifiers of that name the analysis resolves to another binding (one
+ * declared inside the code that names it, in a nested function or block: it stays that binding wherever the code goes).
+ */
+export interface Holder {
+    readonly name: string;
+    readonly isOther: (identifier: Node) => boolean;
+}
+
+export const builderHolder = (id: Node & { name: string }, scopes: ScopeInfo): Holder => {
+    const variable = scopes.variableOf(id);
+    return {
+        name: id.name,
+        isOther: (identifier) => {
+            const other = variable === undefined ? undefined : scopes.variableOf(identifier);
+            return other !== undefined && other !== variable;
+        },
+    };
+};
+
+/** Whether `node` mentions the holder, or uses bindings of the function it leaves (`own`) outside functions that bind their own. */
+export const uses = (node: Node | null | undefined, holder: Holder, own: OwnBindings): boolean => {
     if (node === null || node === undefined) return false;
-    if (node.type === "Identifier") return node.name === name || (own !== "none" && node.name === "arguments");
+    if (node.type === "Identifier") return (node.name === holder.name && !holder.isOther(node)) || (own !== "none" && node.name === "arguments");
     if (node.type === "ThisExpression") return own === "all";
     if (node.type === "MetaProperty" || node.type === "Super") return own !== "none";
     const inner = isFunctionNode(node) && node.type !== "ArrowFunctionExpression" ? "none" : own;
     let found = false;
     forEachChild(node, (child) => {
-        found ||= uses(child, name, inner);
+        found ||= uses(child, holder, inner);
     });
     return found;
 };
@@ -378,23 +396,23 @@ const keyName = (property: Node): string | undefined => {
 export const isPlainLiteral = (node: Node): node is ObjectExpression =>
     node.type === "ObjectExpression" && node.properties.every((property) => property.type === "Property" && property.kind === "init" && keyName(property) !== "__proto__");
 
-/** A property an assignment adds to an object literal, and that literal. */
 export interface PlannedStore {
     readonly into: ObjectExpression;
     readonly property: Node;
 }
 
 /**
- * `name.k = v;`, `name["k"] = v;` or `name[1] = v;` as a statement, where `v` doesn't name `name` (nor uses the
- * bindings of the function it leaves, `own`): the property `k: v` for `literal`, which `name` holds. Also `name.j.k =
- * v;` when `j` is the last property of `literal` (with the properties `planned` before it) and holds a plain object
- * literal: `k: v` goes in that one, where `v` still runs after every other value (it ran last). Not `__proto__`,
- * which a literal reads as the prototype; not computed keys other than literals (an assignment converts its key after
- * the value).
+ * `name.k = v;`, `name["k"] = v;` or `name[1] = v;` as a statement, where `v` doesn't name the holder (nor uses the
+ * bindings of the function it leaves, `own`): the property `k: v` for `literal`, which the holder holds. Also
+ * `name.j.k = v;` when `j` is the last property of `literal` (with the properties `planned` before it) and holds a
+ * plain object literal: `k: v` goes in that one, where `v` still runs after every other value (it ran last). Not
+ * `__proto__`, which a literal reads as the prototype; not computed keys other than literals (an assignment converts
+ * its key after the value).
  */
-export const plannedStore = (statement: Statement, name: string, own: OwnBindings, literal: ObjectExpression, planned: readonly PlannedStore[]): PlannedStore | undefined => {
+export const plannedStore = (statement: Statement, holder: Holder, own: OwnBindings, literal: ObjectExpression, planned: readonly PlannedStore[]): PlannedStore | undefined => {
+    const { name } = holder;
     const e = statement.type === "ExpressionStatement" ? statement.expression : undefined;
-    if (e?.type !== "AssignmentExpression" || e.operator !== "=" || e.left.type !== "MemberExpression" || uses(e.right, name, own)) return undefined;
+    if (e?.type !== "AssignmentExpression" || e.operator !== "=" || e.left.type !== "MemberExpression" || uses(e.right, holder, own)) return undefined;
     const { object, property, computed } = e.left;
     const key = computed
         ? property.type === "Literal" && (typeof property.value === "string" || typeof property.value === "number")
@@ -408,9 +426,9 @@ export const plannedStore = (statement: Statement, name: string, own: OwnBinding
     const stored = at<Node>({ type: "Property", kind: "init", key: keyNode, value: e.right, computed: false, method: false, shorthand: false }, statement) as Node;
     if (object.type === "Identifier") return object.name === name ? { into: literal, property: stored } : undefined;
     if (object.type !== "MemberExpression" || object.object.type !== "Identifier" || object.object.name !== name) return undefined;
-    const holder = object.computed ? (object.property.type === "Literal" ? String(object.property.value) : undefined) : object.property.type === "Identifier" ? object.property.name : undefined;
+    const outer = object.computed ? (object.property.type === "Literal" ? String(object.property.value) : undefined) : object.property.type === "Identifier" ? object.property.name : undefined;
     const last = [...literal.properties, ...planned.filter((store) => store.into === literal).map((store) => store.property)].at(-1);
-    const into = last !== undefined && holder !== undefined && keyName(last) === holder && last.type === "Property" ? last.value : undefined;
+    const into = last !== undefined && outer !== undefined && keyName(last) === outer && last.type === "Property" ? last.value : undefined;
     return into !== undefined && isPlainLiteral(into) ? { into, property: stored } : undefined;
 };
 
@@ -446,6 +464,7 @@ const objectFromBuilder = (node: Node, context: UnminifyContext): ObjectExpressi
     const [declarator] = first.declarations;
     if (declarator?.id.type !== "Identifier") return undefined;
     const name = declarator.id.name;
+    const holder = builderHolder(declarator.id, context.scopes);
     let rest = body.slice(1);
     let literal = declarator.init;
     if (literal === null) {
@@ -455,12 +474,12 @@ const objectFromBuilder = (node: Node, context: UnminifyContext): ObjectExpressi
         literal = e.right;
         rest = rest.slice(1);
     }
-    if (!isPlainLiteral(literal) || uses(literal, name, own)) return undefined;
+    if (!isPlainLiteral(literal) || uses(literal, holder, own)) return undefined;
     const last = rest.at(-1);
     if (last?.type !== "ReturnStatement" || last.argument?.type !== "Identifier" || last.argument.name !== name) return undefined;
     const planned: PlannedStore[] = [];
     for (const statement of rest.slice(0, -1)) {
-        const store = plannedStore(statement, name, own, literal, planned);
+        const store = plannedStore(statement, holder, own, literal, planned);
         if (store === undefined) return undefined;
         planned.push(store);
     }
@@ -468,10 +487,7 @@ const objectFromBuilder = (node: Node, context: UnminifyContext): ObjectExpressi
     return literal;
 };
 
-/**
- * Rewrite the expression at `path` (one step; the caller repeats on the result). Returns the replacement, or
- * `undefined` when there is none: nothing applies, or object and class keys were changed in place.
- */
+/** One step; the caller repeats on the result. `undefined` also when object and class keys were changed in place. */
 export const rewriteExpression = (path: Path, context: UnminifyContext): Node | undefined => {
     const node = path.node;
     switch (node.type) {
@@ -503,10 +519,8 @@ export const rewriteExpression = (path: Path, context: UnminifyContext): Node | 
         }
         case "LogicalExpression": {
             if (node.operator === "??") return undefined;
-            // The operand that can't change the outcome: `false` for `||`, `true` for `&&`.
             const neutral = node.operator !== "||";
             const isNeutral = (side: Node): boolean => side.type === "Literal" && side.value === neutral;
-            // `false || a`, `true && a`: the value is `a`'s.
             if (isNeutral(node.left)) {
                 context.did("booleanTails", node);
                 return node.right;

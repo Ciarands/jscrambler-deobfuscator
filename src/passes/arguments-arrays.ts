@@ -18,13 +18,12 @@ import { forEachChild, traverse } from "../core/traverse.js";
 import type { PassLog } from "../core/log.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
 
-/** A use of slot k ≥ 1, `S[k]`, from scope `from`. */
 interface SlotUse {
     readonly member: MemberExpression;
     readonly from: Scope;
 }
 
-/** The first write of a slot, in source order, when it is a statement `S[k] = value;` in one of the array's blocks. */
+/** Only when the first write is a statement `S[k] = value;` in one of the array's blocks. */
 interface FirstWrite {
     readonly statement: ExpressionStatement;
     readonly value: Expression;
@@ -43,39 +42,29 @@ interface ArgumentsUse {
     readonly element: { readonly node: MemberExpression; readonly index: number; readonly write: boolean } | undefined;
 }
 
-/**
- * An array `[arguments, ...]` held by a `var` of the function `fn`: declared with it (`var S = [arguments, ...]`), or
- * declared bare (`var S;`) and written once by the statement `S = [arguments, ...];`. And what the walk found about
- * its uses.
- */
+/** `var S = [arguments, ...]`, or `var S;` written once by the statement `S = [arguments, ...];`. */
 interface Candidate {
     readonly variable: Variable;
     readonly scope: Scope;
     readonly fn: FunctionNode | ArrowFunctionExpression;
     readonly body: FunctionBody;
-    /** `S = [arguments, ...]`, or the bare `S` of the assignment form. */
     readonly declarator: VariableDeclarator;
     readonly literal: ArrayExpression;
-    /** In the assignment form, the identifier the statement `S = [arguments, ...];` writes. */
     readonly assigned: Node | undefined;
-    /** What creates the array: the declarator, or (once the walk found it) the statement `S = [arguments, ...];`. */
     site: Node;
     /** The function body and the blocks between it and the site: statements in them run at most once per call. */
     readonly blocks: Set<Node>;
-    /** The innermost of `blocks`, holding the site statement. */
     siteBlock: Node;
     /** The function's own `arguments` object in element 0, never reassigned; `undefined` otherwise. */
     readonly argumentsObject: Variable | undefined;
     readonly slots: Map<number, SlotInfo>;
     readonly argumentsUses: ArgumentsUse[];
-    /** `S[0]` itself is assigned or updated somewhere. */
     argumentsWritten: boolean;
-    /** The walk has passed the site (tree order: execution order within the function, see `siteRefusal`). */
+    /** The walk has passed the site (tree order is execution order within the function, see `siteRefusal`). */
     declared: boolean;
     refusal: { readonly reason: string; readonly node: Node } | undefined;
 }
 
-/** Marks a statement to drop. */
 const REMOVE: unique symbol = Symbol("remove");
 
 /**
@@ -103,17 +92,14 @@ const evaluatesInertly = (element: Node | null, scopes: ScopeInfo): boolean =>
     element.type === "ArrowFunctionExpression" ||
     (element.type === "Identifier" && scopes.variableOf(element) !== undefined);
 
-/** `[arguments, ...]`. */
 const isArgumentsArray = (node: Node | null | undefined): node is ArrayExpression => {
     if (node?.type !== "ArrayExpression") return false;
     const first = node.elements[0];
     return first?.type === "Identifier" && first.name === "arguments";
 };
 
-/** `node` is called with its object as `this`: `S[k](...)`, `` S[k]`...` ``. */
 const isCallee = (path: Path): boolean => (path.parent?.type === "CallExpression" && path.key === "callee") || (path.parent?.type === "TaggedTemplateExpression" && path.key === "tag");
 
-/** `path` is the object of a member expression with a constant index key: that member (path and node) and its index. */
 const indexedBy = (path: Path): { member: Path; node: MemberExpression; index: number } | undefined => {
     const member = path.parentPath;
     const node = member?.node;
@@ -128,16 +114,16 @@ interface Bindings {
     readonly removed: Map<Scope, Set<string>>;
 }
 
-/** Whether `scope` binds `name` once the conversions planned so far are done. */
 const binds = (scope: Scope, name: string, bindings: Bindings): boolean => (scope.set.has(name) && bindings.removed.get(scope)?.has(name) !== true) || bindings.added.get(scope)?.has(name) === true;
 
-/** Whether a scope from `from` up to (not including) the function scope binds `name` (see `binds`). */
-const shadowedBetween = (from: Scope, fnScope: Scope, name: string, bindings: Bindings): boolean => {
-    for (let scope: Scope | null = from; scope !== null && scope !== fnScope; scope = scope.upper) if (binds(scope, name, bindings)) return true;
+/** Whether a scope from `from` up to, not including, `fnScope` passes `test`. */
+const anyScopeBetween = (from: Scope, fnScope: Scope, test: (scope: Scope) => boolean): boolean => {
+    for (let scope: Scope | null = from; scope !== null && scope !== fnScope; scope = scope.upper) if (test(scope)) return true;
     return false;
 };
 
-/** Why the array's declaration doesn't allow the conversion (see `argumentsArrays`); `undefined` when it does. */
+const shadowedBetween = (from: Scope, fnScope: Scope, name: string, bindings: Bindings): boolean => anyScopeBetween(from, fnScope, (scope) => binds(scope, name, bindings));
+
 const declarationRefusal = (candidate: Candidate, declaration: VariableDeclaration, scopes: ScopeInfo): string | undefined => {
     const { variable, scope, literal } = candidate;
     if (variable.defs.length !== 1) return "the array's name is declared more than once";
@@ -204,7 +190,7 @@ const findCandidates = (scopes: ScopeInfo): Candidate[] => {
     return candidates;
 };
 
-/** Whether `node` holds a `break` to one of `labels` (labels don't reach into nested functions). */
+/** Labels don't reach into nested functions. */
 const breaksTo = (node: Node, labels: ReadonlySet<string>): boolean => {
     if (node.type === "BreakStatement") return node.label !== null && labels.has(node.label.name);
     if (isFunctionNode(node) || node.type === "ClassBody") return false;
@@ -248,7 +234,6 @@ const siteRefusal = (candidate: Candidate, statement: Path): string | undefined 
     return undefined;
 };
 
-/** Records the walk reaching the site, at `path`: the declarator's name, or the name the assignment writes. */
 const recordSite = (candidate: Candidate, path: Path): void => {
     candidate.declared = true;
     let statement: Path | null;
@@ -268,9 +253,8 @@ const recordSite = (candidate: Candidate, path: Path): void => {
 };
 
 /**
- * Records one use `S[...]` of a candidate (the identifier at `path`). Refuses the array when it is used as anything
- * but `S[index]` (passed, aliased, reassigned, resized through `length`), when a slot is called as a method of the
- * array (the callee would get the array as `this`), deleted (a `var` can't be), or used inside `with`.
+ * Refuses the array when used as anything but `S[index]`, when a slot is called as a method (it would get the array
+ * as `this`), deleted (a `var` can't be), or used inside `with`.
  */
 const recordUse = (candidate: Candidate, path: Path, scopes: ScopeInfo): void => {
     const reference = scopes.referenceOf(path.node);
@@ -352,12 +336,14 @@ const ignoresArguments = (fn: FunctionNode | ArrowFunctionExpression, scopes: Sc
  * A function's `arguments` references other than through arrays: `unsafe` ones may let code write the arguments
  * object or call through it (anything but a plain read `arguments[i]` / `arguments.length` or a hand-over to a
  * function literal's builtin `apply`, see `appliedTo`; a write `arguments[i] = x` breaks `arguments[i] === parameter
- * i` for unpassed arguments and in strict mode); `elementReads` read its elements (plain reads but `.length`), and
- * `applied` are the function literals it is handed to, which read them all (see `ignoresArguments`).
+ * i` for unpassed arguments and in strict mode); `elementReads` read its elements (plain reads but `.length`),
+ * `indexed` are those with a constant index, and `applied` are the function literals it is handed to, which read them
+ * all (see `ignoresArguments`).
  */
 interface ArgumentsReferences {
     readonly unsafe: Node[];
     readonly elementReads: Node[];
+    readonly indexed: { readonly member: MemberExpression; readonly index: number }[];
     readonly applied: (FunctionNode | ArrowFunctionExpression)[];
 }
 
@@ -366,11 +352,56 @@ const recordArgumentsUse = (references: ArgumentsReferences, path: Path): void =
     const read = member !== null && path.key === "object" && member.node.type === "MemberExpression" && !member.isWriteTarget() && !isCallee(member);
     if (read) {
         if (member.node.type !== "MemberExpression" || propertyKey(member.node) !== "length") references.elementReads.push(path.node);
+        const element = indexedBy(path);
+        if (element !== undefined) references.indexed.push({ member: element.node, index: element.index });
         return;
     }
     const applied = appliedTo(path);
     if (applied === undefined) references.unsafe.push(path.node);
     else references.applied.push(applied);
+};
+
+/**
+ * Whether the parameter list names `arguments` (outside nested non-arrow functions). eslint-scope never resolves such
+ * a use (`__isValidResolution`), so it is missing from the recorded uses: `b = (arguments[0] = x)` would go unseen.
+ */
+const parametersNameArguments = (fn: FunctionNode | ArrowFunctionExpression): boolean => {
+    const names = (node: Node): boolean => {
+        if (node.type === "Identifier") return node.name === "arguments";
+        if (node.type === "FunctionExpression" || node.type === "FunctionDeclaration") return false;
+        let found = false;
+        forEachChild(node, (child) => {
+            found ||= names(child);
+        });
+        return found;
+    };
+    return fn.params.some((param) => names(param as Node));
+};
+
+/**
+ * Direct reads `arguments[i]` of a function that reaches its arguments object only by such reads, `.length` and
+ * builtin `apply` hand-overs (no `unsafe` use, none in the parameter list: nothing writes or deletes an element, in
+ * either mapping mode) become parameter i: a plain name declared once and never written, so it holds the value
+ * passed, or undefined, for the whole call, as `arguments[i]` does. The use must see the parameter's name (no binding
+ * or `with` between). A function calling eval (or nesting a call) records no uses: eslint-scope leaves its references
+ * unresolved.
+ */
+const convertDirectReads = (variable: Variable, references: ArgumentsReferences, scopes: ScopeInfo, rewrite: Rewrite): number => {
+    const scope = variable.scope;
+    const fn = scope.block as unknown as FunctionNode;
+    if (references.unsafe.length > 0 || references.indexed.length === 0 || parametersNameArguments(fn)) return 0;
+    let converted = 0;
+    for (const { member, index } of references.indexed) {
+        const param = fn.params[index];
+        if (param?.type !== "Identifier") continue;
+        const parameter = scopes.variableOf(param);
+        if (parameter === undefined || parameter.defs.length !== 1 || parameter.references.some((r) => r.isWrite())) continue;
+        const reference = scopes.referenceOf(member.object);
+        if (reference === undefined || anyScopeBetween(reference.from, scope, (s) => s.type === "with") || shadowedBetween(reference.from, scope, param.name, rewrite)) continue;
+        rewrite.replacements.set(member, identifier(param.name, member));
+        converted++;
+    }
+    return converted;
 };
 
 /**
@@ -397,9 +428,9 @@ interface Counts {
     copies: number;
     argumentsReads: number;
     argumentsLocals: number;
+    directReads: number;
 }
 
-/** What the conversions replace, plus the names they add to and remove from scopes. */
 interface Rewrite extends Bindings {
     readonly replacements: Map<Node, Node | typeof REMOVE>;
     readonly declarators: Map<VariableDeclarator, VariableDeclarator[]>;
@@ -408,10 +439,6 @@ interface Rewrite extends Bindings {
 const declaratorOf = (name: string, init: Expression | null, position: Node): VariableDeclarator =>
     at<VariableDeclarator>({ type: "VariableDeclarator", id: identifier(name, position), init, definite: false }, position);
 
-/**
- * What the conversion of one candidate shares: where it adds names, the names reached from outside its function, and
- * the arrays by the `arguments` identifier in their element 0.
- */
 interface Conversion {
     readonly candidate: Candidate;
     readonly rewrite: Rewrite;
@@ -447,7 +474,6 @@ const convertSlots = (conversion: Conversion): VariableDeclarator[] => {
     const { candidate, rewrite } = conversion;
     const { literal, variable } = candidate;
     const initialized = literal.elements.length;
-    // Initialized slots (1 .. length-1, in the literal) and written or read ones, in index order.
     const indices = new Set<number>();
     for (let index = 1; index < initialized; index++) indices.add(index);
     for (const index of [...candidate.slots.keys()].toSorted((a, b) => a - b)) indices.add(index);
@@ -481,11 +507,13 @@ const convertSlots = (conversion: Conversion): VariableDeclarator[] => {
  * Why no `S[0][i]` can become parameter i; `undefined` when they may (each index is then judged by `parameterFor`).
  * The arguments object must be reached only as `S[0][i]` with a constant i: `S[0]` never written, called on, deleted
  * through or handed on, and the function's other `arguments` uses plain reads or builtin `apply` hand-overs
- * (`recordArgumentsUse`), so nothing but those uses writes `arguments[i]`.
+ * (`recordArgumentsUse`), none in the parameter list (`parametersNameArguments`), so nothing but those uses writes
+ * `arguments[i]`.
  */
 const parametersRefusal = (candidate: Candidate, references: ArgumentsReferences): string | undefined => {
     const own = candidate.literal.elements[0];
     if (candidate.argumentsUses.some((use) => use.element === undefined)) return "S[0] is used other than as S[0][i]";
+    if (parametersNameArguments(candidate.fn)) return "the parameter list uses arguments";
     return references.unsafe.some((node) => node !== own) ? "the function uses arguments other than by reading it" : undefined;
 };
 
@@ -517,12 +545,8 @@ const parameterFor = (candidate: Candidate, index: number, uses: readonly Argume
  * Whether `arguments` written at a use from `from` names the function's own arguments object: no function with its
  * own `arguments` (non-arrow: eslint-scope binds it there) or class field/static block (where it is an error) between.
  */
-const ownArgumentsVisible = (from: Scope, fnScope: Scope): boolean => {
-    for (let scope: Scope | null = from; scope !== null && scope !== fnScope; scope = scope.upper) {
-        if (scope.set.has("arguments") || scope.type === "class-field-initializer" || scope.type === "class-static-block") return false;
-    }
-    return true;
-};
+const ownArgumentsVisible = (from: Scope, fnScope: Scope): boolean =>
+    !anyScopeBetween(from, fnScope, (scope) => scope.set.has("arguments") || scope.type === "class-field-initializer" || scope.type === "class-static-block");
 
 /**
  * Converts the `S[0]` uses. `S[0][i]` becomes parameter i where exact (`parametersRefusal`, `parameterFor`); where
@@ -614,7 +638,6 @@ const convertArguments = (conversion: Conversion, references: ReadonlyMap<Variab
     return declarators;
 };
 
-/** Plans one candidate: its `S[0]` uses, then its other slots, then what replaces its site. */
 const convert = (conversion: Conversion, references: ReadonlyMap<Variable, ArgumentsReferences>, scopes: ScopeInfo, counts: Counts): void => {
     const { candidate, rewrite, log } = conversion;
     const declarators = convertArguments(conversion, references, scopes, counts);
@@ -649,7 +672,8 @@ const convert = (conversion: Conversion, references: ReadonlyMap<Variable, Argum
  * never reassigned, its uses become parameters, parameter copies or `arguments` where exact (`convertArguments`).
  * Parameters are never added (`length` would change). Names: `freshName`.
  *
- * Also folds the inline form `[arguments][0]` to `arguments` (`foldedArguments`).
+ * Also folds the inline form `[arguments][0]` to `arguments` (`foldedArguments`), and turns direct reads
+ * `arguments[i]` into parameters where exact (`convertDirectReads`).
  *
  * Runs between the simplify and cleanup groups: the passes before it (constants, code-locks, builders) read the slot
  * shapes, and cleanup then drops the locals whose reads constants already resolved.
@@ -680,9 +704,11 @@ export const argumentsArrays: Pass = {
                     hoisted.set(id, [...(hoisted.get(id) ?? []), candidate]);
                 }
             }
-            const args = candidate.argumentsObject;
-            if (args === undefined || references.has(args)) continue;
-            const entry: ArgumentsReferences = { unsafe: [], elementReads: [], applied: [] };
+        }
+        for (const fnScope of scopes.manager.scopes) {
+            const args = fnScope.type === "function" ? fnScope.set.get("arguments") : undefined;
+            if (args === undefined || args.defs.length > 0 || args.references.length === 0) continue;
+            const entry: ArgumentsReferences = { unsafe: [], elementReads: [], indexed: [], applied: [] };
             references.set(args, entry);
             for (const reference of args.references) argumentsSites.set(reference.identifier as unknown as Node, entry);
         }
@@ -725,7 +751,7 @@ export const argumentsArrays: Pass = {
             }
             return names;
         };
-        const counts: Counts = { folded, arrays: candidates.length, removed: 0, refused: 0, slots: 0, parameters: 0, copies: 0, argumentsReads: 0, argumentsLocals: 0 };
+        const counts: Counts = { folded, arrays: candidates.length, removed: 0, refused: 0, slots: 0, parameters: 0, copies: 0, argumentsReads: 0, argumentsLocals: 0, directReads: 0 };
         const rewrite: Rewrite = { replacements: new Map(), declarators: new Map(), added: new Map(), removed: new Map() };
         const owners = new Map(candidates.map((candidate) => [candidate.literal.elements[0] as Node, candidate]));
         for (const candidate of candidates) {
@@ -736,6 +762,7 @@ export const argumentsArrays: Pass = {
             }
             convert({ candidate, rewrite, outside: outside(candidate.scope), owners, log }, references, scopes, counts);
         }
+        for (const [variable, entry] of references) counts.directReads += convertDirectReads(variable, entry, scopes, rewrite);
 
         for (const candidate of candidates) {
             const declaration = candidate.variable.defs[0]?.parent as unknown as VariableDeclaration;
@@ -752,9 +779,9 @@ export const argumentsArrays: Pass = {
         });
 
         log.info(
-            `${counts.arrays} arguments array(s): ${counts.removed} removed, ${counts.refused} refused; ${counts.slots} slot(s) to locals, ${counts.parameters} S[0][i] to parameters, ${counts.copies} parameter copies, ${counts.argumentsReads} S[0] to arguments, ${counts.argumentsLocals} S[0] to locals; ${folded} [arguments][0] folded`
+            `${counts.arrays} arguments array(s): ${counts.removed} removed, ${counts.refused} refused; ${counts.slots} slot(s) to locals, ${counts.parameters} S[0][i] to parameters, ${counts.copies} parameter copies, ${counts.argumentsReads} S[0] to arguments, ${counts.argumentsLocals} S[0] to locals; ${folded} [arguments][0] folded, ${counts.directReads} arguments[i] to parameters`
         );
-        // Folds only replace expressions; converting arrays adds and removes declarations.
-        return { changed: counts.removed + folded, bindingsChanged: counts.removed > 0, stats: { ...counts } };
+        // Folds and direct reads only replace expressions; converting arrays adds and removes declarations.
+        return { changed: counts.removed + folded + counts.directReads, bindingsChanged: counts.removed > 0, stats: { ...counts } };
     },
 };

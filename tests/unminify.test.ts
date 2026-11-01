@@ -8,7 +8,6 @@ import { flatten, generate, mulberry32, runTrace } from "./fuzz/programs.js";
 
 const unminify = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["unminify"] })).code;
 
-/** Run a script; return what it recorded through `t(x)` and how it ended (its `result`, or the error it threw). */
 const run = (code: string): unknown[] => {
     const trace: unknown[] = [];
     const context: Record<string, unknown> = { t: (x: unknown) => (trace.push(x), x) };
@@ -21,7 +20,6 @@ const run = (code: string): unknown[] => {
     return trace;
 };
 
-/** Output of the pass, after checking that it behaves as the input does (and that the input is a valid script). */
 const sameBehaviour = async (input: string): Promise<string> => {
     const output = await unminify(input);
     const expected = run(input);
@@ -30,7 +28,6 @@ const sameBehaviour = async (input: string): Promise<string> => {
     return output;
 };
 
-/** How many nodes of the output match `test`. */
 const count = (code: string, test: (node: Node) => boolean): number => {
     let found = 0;
     traverse(parse(code), {
@@ -48,7 +45,6 @@ const isBareBody = (node: Node): boolean => {
     return bodies.some((body) => body !== null && body.type !== "BlockStatement");
 };
 
-/** A call of a function expression, directly or through `.apply`/`.call`. */
 const isFunctionCall = (node: Node): boolean => node.type === "CallExpression" && (node.callee.type === "MemberExpression" ? node.callee.object : node.callee).type.endsWith("FunctionExpression");
 
 const isNot = (node: Node): node is Extract<Node, { type: "UnaryExpression" }> => node.type === "UnaryExpression" && node.operator === "!";
@@ -156,6 +152,12 @@ describe("unminify", () => {
         expect(output).toContain("if (!t(3)) {\n  log.push(4);");
     });
 
+    it("negates a boolean literal an inversion distributes over to the other literal, then drops it where neutral", async () => {
+        const output = await sameBehaviour("var w = t(1), c = t(2), r = [];\nif (w === c && true) {} else { w = c; }\nr.push(!(t(3) && false), !(t(4) || true));\nresult = [w, r];\n");
+        expect(output).toContain("if (w !== c) {\n  w = c;");
+        expect(output).toContain("r.push(!t(3) || true, !t(4) && false);");
+    });
+
     it("truncates number operands of bitwise operators as the operators do", async () => {
         const output = await sameBehaviour(
             "var x = 12345; result = [x & 4294967297, x | 1.5, x ^ -4294967296, x << 33, x >> 4294967327, x >>> 32.5, 4294967295 >>> x, 4294967296 << x, 2147483648 | x, 8589934593 >> x];"
@@ -214,15 +216,34 @@ describe("unminify", () => {
                 "var n = (() => { var o = {}; o.box = t({}); o.box.v = 1; return o; })();", // a store into an object made elsewhere
                 "var q = (() => { var o = { set h(v) { t(v); } }; o.h = 2; return o; })();", // a setter an assignment runs
                 'var r = "outer";\nvar s = (() => { var r = { early: typeof r }; r.x = 1; return r; })();', // the object's name before it holds it
-                "result = [a, b, hh, c.self, mm, d.again === d, e.p, n, q, s];",
+                // A nested function's own binding of the name is another variable; a closure over the object isn't.
+                'var u = (() => { var o = { key: "k" }; o.value = function () { var o = t("inner"); return o; }; return o; })();',
+                "var w = (() => { var o = {}; o.get = function () { return o; }; return o; })();",
+                // Under a direct eval the analysis leaves the name unresolved: it may be the object.
+                'var x = (() => { var o = {}; o.get = function () { eval(""); return o; }; return o; })();',
+                "result = [a, b, hh, c.self, mm, d.again === d, e.p, n, q, s, u.value(), w.get() === w, x.get() === x];",
             ].join("\n")
         );
         expect(output).toContain('var a = { channel: t("live"), "x-y": 2, 3: t(3) };');
         expect(output).toContain("return { value: t(true) };");
         expect(output).toContain("return { k: t(1), me: this.name, inner: { deep: t(2) } };");
-        expect(count(output, isFunctionCall)).toBe(7);
+        expect(output).toContain('var u = {\n  key: "k",\n  value: function () {');
+        expect(count(output, isFunctionCall)).toBe(9);
         // At the top level reading `arguments` throws: that builder stays, so the script still throws there.
         expect(await sameBehaviour("var f = function () { var o = {}; o.v = 1; return o; }.apply(this, arguments);\nresult = f;")).toContain(".apply(this, arguments)");
+    });
+
+    it("keeps object-building IIFEs that would behave differently inline: named, given another this, extra arguments or a non-array, or using new.target", async () => {
+        await sameBehaviour(
+            [
+                "var named = function b() { var o = {}; o.kind = typeof b; return o; }();",
+                'var other = { name: "other" };\nfunction h() { return function () { var o = {}; o.me = this.name; return o; }.call(other); }\nvar holder = { name: "holder", h: h };\nvar hh = holder.h();',
+                "function c() { return function () { var o = {}; o.v = 1; return o; }.call(this, arguments, t(9)); }",
+                "function a() { var list = 5; try { return function () { var o = {}; o.v = 1; return o; }.apply(this, list); } catch (error) { return error.constructor.name; } }",
+                "function F() { this.o = function () { var o = {}; o.plain = new.target === undefined; return o; }.call(this); }",
+                "result = [named, hh, c(), a(), new F().o];",
+            ].join("\n")
+        );
     });
 
     it("writes escaped letters of regex patterns as letters and brackets as escapes, not a digit after a backreference or a control escape's letter", async () => {
@@ -251,11 +272,11 @@ describe("unminify", () => {
     it("writes escaped digits and syntax characters plainly or as identity escapes, unless they would join what comes before", async () => {
         const output = await sameBehaviour(
             [
-                "var r = [/\\u002e(srt|vtt)/, /\\x2f\\053\\x2d/, /[\\x29\\u0028\\x2d]/, /^(\\061|true)$/, /\\x4\\x41/, /a{\\x31}/, /[\\1\\x31]/, /\\x2e/u];",
-                'result = r.map(function (x) { return [x.test("a.vtt"), x.test("/+-"), x.test("-"), x.test("1"), x.test("x4A"), x.test("J"), x.test("a{1}"), x.test("a"), x.test("\\u0001"), x.test("\\t")]; });',
+                "var r = [/\\u002e(srt|vtt)/, /\\x2f\\053\\x2d/, /[\\x29\\u0028\\x2d]/, /^(\\061|true)$/, /\\x4\\x41/, /a{\\x31}/, /[\\1\\x31]/, /\\x2e/u, /[a\\x2dz]/, /\\u004\\x31/];",
+                'result = r.map(function (x) { return [x.test("a.vtt"), x.test("/+-"), x.test("-"), x.test("1"), x.test("x4A"), x.test("J"), x.test("a{1}"), x.test("a"), x.test("\\u0001"), x.test("\\t"), x.test("m"), x.test("u0041")]; });',
             ].join("\n")
         );
-        // Non-unicode `\x4` is the text `x4`, and `{` without a quantifier is a character; `\1` in a class is octal.
+        // Non-unicode `\x4` and `\u004` are text, and `{` without a quantifier is a character; `\1` in a class is octal.
         for (const pattern of ["/\\.(srt|vtt)/", "/\\/\\+-/", "/[\\)\\(\\-]/", "/^(1|true)$/", "/\\x4\\x41/", "/a{\\x31}/", "/[\\1\\x31]/", "/\\./u"]) expect(output).toContain(pattern);
     });
 
@@ -275,7 +296,6 @@ describe("unminify", () => {
                 'function f(x) { var o = {}; o.a = t(x); o["b-c"] = 2; o[3] = function () { return o.a; }; var later = function () { return o; }; return [o, later()]; }',
                 // A function declared anywhere exists from the start: `peek` could run while `p`'s values do.
                 "function g() { var p = {}; p.a = peek(); p.b = 2; function peek() { return Object.keys(p).length; } return p; }",
-                // An earlier closure sees the variable too.
                 "function h() { var q; var look = function () { return typeof q; }; q = {}; q.a = look(); return q; }",
                 "var o2 = {}; o2.self = typeof o2; o2.x = 1;",
                 // A literal to start from, and stores into the literal its last property holds (values keep their order).
@@ -291,6 +311,16 @@ describe("unminify", () => {
         expect(output).toContain("o2.self = typeof o2;");
         expect(output).toContain("var o = { n: t(1), inner: { deep: t(x) }, extra: { v: t(2) }, after: t(4) };");
         for (const kept of ["o.inner.deep = t(x);", "p.inner.deep = t(x);", "o.s = 3;"]) expect(output).toContain(kept);
+    });
+
+    it("doesn't merge assignments into a literal with a prototype or into a nested literal with a setter", async () => {
+        await sameBehaviour(
+            [
+                "function p() { var proto = { set x(v) { t(v); } }; var o = { __proto__: proto }; o.x = 1; return Object.keys(o); }",
+                "function q() { var o = {}; o.inner = { set deep(v) { t(v); } }; o.inner.deep = 2; return Object.keys(o.inner); }",
+                "result = [p(), q()];",
+            ].join("\n")
+        );
     });
 
     it("drops a neutral left operand anywhere, and a neutral right one where only truthiness counts", async () => {
@@ -318,7 +348,6 @@ describe("unminify", () => {
                 "var a = (function () { return (() => { var x = t(1); return [x, this === undefined, arguments.length]; })(); })();",
                 // The arrow's `y` is its own (undefined until set), not the parameter.
                 "var b = (function (y) { return (() => { var r = y; var y = 2; return r; })(); })(1);",
-                // Strict code would see no `this`.
                 'var c = (function () { return (() => { "use strict"; return this; })(); })();',
                 // The arrow's `arguments` is its own variable, not the function's arguments object.
                 "var d = (function () { return (() => { var r = typeof arguments; var arguments = 3; return r; })(); })();",
@@ -357,6 +386,17 @@ describe("unminify", () => {
         for (const label of ["early: {", "stop: {", "scoped: {"]) expect(output).toContain(label);
     });
 
+    it("keeps a let of a removed label's block in a block of its own", async () => {
+        await sameBehaviour(
+            [
+                "function chain(c) { var before = typeof y; scoped: { let y = t(1); if (c) { t(2); break scoped; } t(y); } return [before, typeof y]; }",
+                "function forwarded(c, out) { out.push(typeof y); scoped: { let y = t(1); for (var j = 0; j < 2; j++) { if (j === c) break scoped; } out.push(y); } }",
+                "var log = [];\nforwarded(0, log);\nforwarded(5, log);",
+                "result = [chain(0), chain(1), log];",
+            ].join("\n")
+        );
+    });
+
     it("returns instead of leaving a labeled block that ends a function, and keeps it elsewhere", async () => {
         const output = await sameBehaviour(
             [
@@ -380,7 +420,6 @@ describe("unminify", () => {
                 "result = [c(5), d(3), e(4)];",
             ].join("\n")
         );
-        // The inner function's own label stays (its break is in an inner loop).
         expect(output.match(/plain:/g)).toHaveLength(1);
         for (const label of ["nested:", "switched:"]) expect(output).toContain(label);
     });
@@ -400,11 +439,11 @@ describe("unminify", () => {
         );
         for (const label of ["inner:", "outer:", "skip:"]) expect(output).not.toContain(label);
         for (const label of ["sw:", "lp:"]) expect(output).toContain(label);
-        // The `break;` after the forwarded block followed a `continue;`: it went as unreachable.
-        expect(output).toContain("    i++;\n    continue;\n  }\n  return out;");
+        expect(output).toContain("while (!(i >= items.length)) {");
+        expect(output).toContain("    out.push(t(v));\n    i++;\n  }\n  return out;");
     });
 
-    it("assigns a value straight to the name a single-use local copies it to, not a local used again, a parameter or a global", async () => {
+    it("assigns a value straight to the name a single-use local copies it to, not a local used again, a parameter or a global, and merges the copy's stores", async () => {
         const output = await sameBehaviour(
             [
                 "function f(x) { var a; var b, c; a = {}; a.v = x; a.w = t(1); b = a; c = b; return c; }",
@@ -412,15 +451,42 @@ describe("unminify", () => {
                 "function k(a) { var b; a = t(2); b = a; return [b, arguments[0]]; }",
                 "function define(x) { globalThis.later = 0; return x; }",
                 'function u(x) { "use strict"; var a; a = define(x); later = a; return later; }',
+                "function n(x) { var a, o; a = {}; a.k = 1; o = a; o.v = t(x); o.w = t(7); return o; }",
                 "var top;\nvar out;\ntop = t(3);\nout = top;",
-                "result = [f(1), g(2), k(4), u(5), out];",
+                "result = [f(1), g(2), k(4), u(5), n(6), out];",
             ].join("\n")
         );
         expect(output).toContain("function f(x) {\n  var c;\n  c = {");
+        expect(output).toContain("o = { k: 1, v: t(x), w: t(7) };\n  return o;");
         for (const kept of ["b = a;\n  return [a, b];", "b = a;\n  return [b, arguments[0]];", "later = a;", "out = top;"]) expect(output).toContain(kept);
         // A direct eval may read the copy's source.
         const evaluated = await sameBehaviour('function e(x) { var a; var b; a = t(x); b = a; return [b, eval("a")]; }\nresult = e(6);');
         expect(evaluated).toContain("b = a;");
+    });
+
+    it("rebuilds while (true) shells as conditional loops and drops a continue ending a loop body or a return ending a function", async () => {
+        const output = await sameBehaviour(
+            [
+                "function find(list, wanted) { var i = 0, found = -1; while (true) { if (i < list.length) { if (t(list[i]) === wanted) { found = i; } else { i += 1; continue; } } return found; } }",
+                "function scan(items) { var it = items[Symbol.iterator](), step, hits = []; while (true) { if ((step = it.next()).done) { break; } if (step.value > 1) { hits.push(step.value); continue; } t(step.value); continue; } return hits; }",
+                // A plain break in the body would skip the jump after the if.
+                "function skip(n) { while (true) { if (n > 0) { if (t(n) === 2) { break; } n -= 1; continue; } return 'end'; } return 'broke'; }",
+                "function plain() { t('plain'); return; }",
+                "function last(list) { var i = 0, found = -1; while (true) { if (i < list.length) { if (t(list[i]) > 3) { i += 1; continue; } else { found = i; } } return found; } }",
+                "function count(n) { var c = 0; while (true) { if (n > c) { c += t(1); continue; } return c; } }",
+                // A labeled break leaves the outer loop, not this one.
+                "function lab(n) { var k; outer: for (k = 0; k < 2; k++) { while (true) { if (n-- < 0) break outer; t(n); } } return [k, n]; }",
+                "result = [find([3, 4, 5], 4), find([1], 9), scan([1, 2, 3]), skip(3), skip(1), plain(), last([5, 2]), count(2), lab(1)];",
+            ].join("\n")
+        );
+        expect(output).toContain("while (i < list.length) {\n    if (t(list[i]) === wanted) {\n      found = i;\n      break;\n    }\n    i += 1;\n  }\n  return found;");
+        expect(output).toContain("while (!(step = it.next()).done) {");
+        expect(output).toContain("t(step.value);\n  }");
+        expect(output).toContain("while (true) {\n    if (n > 0) {");
+        expect(output).toContain('function plain() {\n  t("plain");\n}');
+        expect(output).toContain("    if (!(t(list[i]) > 3)) {\n      found = i;\n      break;\n    }\n    i += 1;\n  }");
+        expect(output).toContain("while (n > c) {\n    c += t(1);\n  }\n  return c;");
+        expect(output).toContain("if (n-- < 0) {\n        break outer;");
     });
 
     it("keeps random control flow behaving the same", async () => {

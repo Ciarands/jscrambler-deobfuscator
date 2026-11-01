@@ -2,9 +2,8 @@ import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 
-// A miniature of jscrambler's runtime: its string decoder (stage calls shuffle the table until the first call that
-// matches no stage freezes it into a lookup), a wrapper, the stage calls driving the decoder inside an opaque predicate,
-// and code that only needs decoded strings.
+// Miniature runtime: a decoder whose stage calls shuffle the table until a non-stage call freezes it, a wrapper, and
+// stage calls inside an opaque predicate.
 const RUNTIME = `
 function G() {}
 G.D = (function () {
@@ -65,14 +64,17 @@ describe("cleanup", () => {
         const { code } = await deobfuscate(program);
         expect(run(code)).toBe(run(program));
         expect(code).not.toMatch(/\bG\b|Kept|Chained/);
-        const readBack = `${RUNTIME}globalThis.Kept = G;\nf(host);\nresult = [out, typeof globalThis.Kept];\n`;
-        const kept = await deobfuscate(readBack);
-        expect(run(kept.code)).toBe(run(readBack));
-        expect(kept.code).toContain("globalThis.Kept = G;");
+        for (const [store, name] of [
+            ["globalThis.Kept = G;", "Kept"],
+            ["(globalThis.Chained = G).x = function () { return 1; };", "Chained"],
+        ]) {
+            const readBack = `${RUNTIME}${store}\nf(host);\nresult = [out, typeof globalThis.${name}];\n`;
+            const kept = await deobfuscate(readBack);
+            expect(run(kept.code)).toBe(run(readBack));
+        }
     });
 });
 
-/** What a script leaves in `result`; `setTimeout` callbacks (code after the prelude) run once it has finished. */
 const observed = (source: string): string => {
     const timers: (() => void)[] = [];
     const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };
@@ -81,7 +83,6 @@ const observed = (source: string): string => {
     return JSON.stringify(context.result);
 };
 
-/** A storage function, and `f` (from `body`) called after the prelude with an object that has a `G` of its own. */
 const withAliases = (body: string, prelude = "") => `
 function G() {}
 G.k = "storage";
@@ -99,7 +100,6 @@ describe("cleanup: aliases of the storage object", () => {
             // A parameter the call passes the storage function in (the parameter itself stays); an alias initialised
             // from another one, the round after.
             `function f() { var s = G; var t = s; return (function (p) { return [p.k, t.k]; })(G); }`,
-            // One of several declarators.
             `function f() { var s = G, x = 1; return [s.k, x]; }`,
         ];
         for (const body of bodies) {
@@ -257,6 +257,71 @@ describe("cleanup: dead stores", () => {
         expect(code).not.toContain("copy");
     });
 
+    it("drops a var declared several times that nothing reads, with its stores, and keeps one read, one with an impure value or a for-in head", async () => {
+        const input =
+            'var log = [];\nfunction f(o) { var a = ""; var a = "x"; var b = ""; b = ""; var b = "y"; var d = 1; var d; var kept = 1; var kept = 2; var called = o.side(); var called = 3; var k = 0; for (var k in o) log.push(k); return kept; }\nresult = [f({ side: function () { log.push("side"); return 1; } }), log];\n';
+        const { code } = await deobfuscate(input, { passes: ["cleanup"] });
+        expect(observed(code)).toBe(observed(input));
+        expect(code).not.toMatch(/\b[abd]\b/);
+        for (const kept of ["var kept = 2;", "var called = o.side();", "var k = 0;", "for (var k in o)"]) expect(code).toContain(kept);
+    });
+
+    it("drops a local read only by the tests of ifs that store to it, unless such a test can convert, call or throw", async () => {
+        const input = [
+            "var log = [];",
+            'var hooked = { valueOf: function () { log.push("converted"); return 1; } };',
+            'function side() { log.push("side"); return 5; }',
+            "function f(n) {",
+            "  var last = 0, kept = 0, loose = 0, called = 0, negated = 0, bumped = 0;",
+            "  var position = n * 2;",
+            "  if (last === position) {} else { last = position; }",
+            "  if (!(last !== position) && true) last = 3;",
+            "  if (kept !== position) { kept = position; }",
+            "  if (loose == hooked) {} else { loose = 1; }",
+            "  if (called === side()) { called = 1; }",
+            "  if (-hooked === 1) { negated = 1; }",
+            "  bumped = hooked;",
+            "  if (n === 4) { bumped++; }",
+            "  return kept;",
+            "}",
+            "function g() { var early = 0; if (early === later) { early = 1; } let later = 2; }",
+            "try { g(); } catch (e) { log.push(e.name); }",
+            "result = [f(4), log];",
+        ].join("\n");
+        const { code } = await deobfuscate(input, { passes: ["cleanup"] });
+        expect(observed(code)).toBe(observed(input));
+        expect(code).not.toContain("last");
+        for (const kept of ["kept = position;", "loose == hooked", "called === side()", "-hooked === 1", "bumped++", "early === later"]) expect(code).toContain(kept);
+    });
+
+    it("drops a dead store of an object a builder function makes, not one whose builder calls, changes another object, sets through a prototype or can throw", async () => {
+        const input = [
+            "var log = [];",
+            "var outer = {};",
+            'var proto = { set k(v) { log.push("setter " + v); } };',
+            "function f() {",
+            "  var table, called, leaks, viaProto, argument, parameter, returned, kept;",
+            '  table = [(() => { var o; o = {}; o.link = "a"; o["name"] = 1; return o; })()];',
+            '  called = (() => { var o = {}; o.v = log.push("call"); return o; })();',
+            "  leaks = (() => { var o = {}; outer.v = 1; return o; })();",
+            "  viaProto = (() => { var o = { __proto__: proto }; o.k = 2; return o; })();",
+            '  argument = (() => { var o = {}; return o; })(log.push("argument"));',
+            '  parameter = ((p = log.push("default")) => { var o = {}; return o; })();',
+            '  returned = (() => { var o = {}; return log.push("return"); })();',
+            "  kept = (function () { var o = {}; o.a = 1; return o; })();",
+            "  return kept;",
+            "}",
+            "function cyclic() { var made; made = (() => { var o = {}; o.__proto__ = o; return o; })(); }",
+            "function cleared() { var made; made = (() => { var o = {}; o = null; o.k = 2; return o; })(); }",
+            "for (const g of [cyclic, cleared]) { try { g(); log.push(g.name + ' ran'); } catch (e) { log.push(e.name); } }",
+            "result = [f(), outer, log];",
+        ].join("\n");
+        const { code } = await deobfuscate(input, { passes: ["cleanup"] });
+        expect(observed(code)).toBe(observed(input));
+        expect(code).not.toContain("table");
+        for (const kept of ['log.push("call")', "outer.v = 1;", "o.k = 2;", '"argument"', '"default"', '"return"', "o.__proto__ = o;", "o = null;"]) expect(code).toContain(kept);
+    });
+
     it("drops a script global's dead table and declaration when only its name could reach it, not when the program spells it or uses the global object with an unknown key", async () => {
         const dead = 'var table;\ntable = ["a", "b"];\nfunction unusedHelper() { return 1; }\nresult = 2;\n';
         const { code } = await deobfuscate(dead, { passes: ["cleanup"] });
@@ -276,6 +341,13 @@ describe("cleanup: dead stores", () => {
         expect(observed(code)).toBe(observed(input));
         expect(code).toContain("var seen = 1;");
         expect(code).not.toContain("unseen");
+    });
+
+    it("keeps a for-in binding nothing reads and a block function sloppy code sees outside its block", async () => {
+        const input = "function f(o) { var n = 0; for (var k in o) n++; return n; }\nfunction g() { if (true) { function inner() {} } return typeof inner; }\nresult = [f({ a: 1, b: 2 }), g()];\n";
+        const { code } = await deobfuscate(input, { passes: ["cleanup"] });
+        expect(observed(code)).toBe(observed(input));
+        expect(observed(input)).toBe('[2,"function"]');
     });
 
     it("keeps what can throw: a BigInt update, a let in its dead zone, a read of a let before its declaration", async () => {

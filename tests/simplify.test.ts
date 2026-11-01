@@ -80,7 +80,6 @@ const REFERENCES = [
     // A tagged template's literal is the tag's argument, not a string; an invalid escape has no cooked value.
     "t(tag`a${1 + 1}b`);",
     "t(tag`\\unicode`);",
-    // Targets of assignment and delete keep their reference.
     "var o = { x: 1, p: 1 };",
     '(t("w"), o).x = 2;',
     "t(o.x);",
@@ -137,18 +136,16 @@ describe("simplify", () => {
         expect(run(code)).toBe(run(PROGRAM));
         expect(code).not.toContain(`t("dead")`);
         expect(code).not.toContain(`t("else")`);
-        // The opaque predicate is decided; its side effects stay, in order.
         expect(code).toContain(`t("effect");\n  t("effect2");\n  t("yes");`);
-        // Hoisted names of dropped code stay declared.
         expect(code).toContain("var hidden;");
         expect(code).toContain("var looped;");
         // A read before the initializer runs is not a constant use.
         expect(code).toContain("t(x);");
     });
 
-    it("decodes base64 literals the host's atob turns into printable text, not binary, invalid or shadowed ones", async () => {
+    it("decodes base64 literals the host's atob turns into printable text, not binary, invalid, shadowed or extra-argument ones, nor calls of other functions", async () => {
         const program =
-            'var out = [atob("bmF2aWdhdG9y"), atob("tNmJdQ=="), (function (atob) { return atob("eA=="); })(function (s) { return s + "!"; })];\ntry { out.push(atob("*")); } catch (e) { out.push(e.name); }\nresult = out;\n';
+            'var out = [atob("bmF2aWdhdG9y"), atob("tNmJdQ=="), (function (atob) { return atob("eA=="); })(function (s) { return s + "!"; })];\ntry { out.push(atob("*")); } catch (e) { out.push(e.name); }\nvar hits = 0;\nout.push(atob("eA==", hits++), hits, String("eA=="));\nresult = out;\n';
         const { code } = await deobfuscate(program, { passes: ["simplify"] });
         expect(run(code, { atob })).toBe(run(program, { atob }));
         expect(code).toContain('"navigator"');
@@ -158,10 +155,8 @@ describe("simplify", () => {
     it("propagates constants and arguments slots only where they are already set", async () => {
         const { code } = await deobfuscate(ORDERED, { passes: ["unflatten", "simplify", "normalize"] });
         expect(run(code)).toBe(run(ORDERED));
-        // Written once, at the top of the function: a constant from there on.
         expect(code).toContain(`t("x");`);
         expect(code).toContain("t(5);");
-        // A function declaration only called after the definition sees the constant too.
         expect(code).toContain("t(7);");
         // Read before it runs (execution order), inside a hoisted function called earlier, written twice or
         // conditionally: not.
@@ -174,7 +169,6 @@ describe("simplify", () => {
     it("keeps reference semantics: tags, writes, delete, eval, typeof, lexical scopes", async () => {
         const { code } = await deobfuscate(REFERENCES, { passes: ["simplify", "normalize"] });
         expect(run(code)).toBe(run(REFERENCES));
-        // Still folded inside the template's expressions.
         expect(code).toContain("tag`a${2}b`");
         expect(code).toContain("(0, eval)(");
         expect(code).toContain("let late, Gone;");

@@ -2,7 +2,6 @@ import type { Node } from "../../core/ast.js";
 import type { PassLog } from "../../core/log.js";
 import type { ScopeInfo } from "../../core/scope.js";
 
-/** The rewrites of the unminify pass, as counted in its stats. */
 export const TRANSFORMS = [
     "blockStatements",
     "splitDeclarations",
@@ -34,6 +33,7 @@ export const TRANSFORMS = [
     "emptyBranches",
     "unreachable",
     "copies",
+    "loops",
 ] as const;
 
 export type Transform = (typeof TRANSFORMS)[number];
@@ -70,7 +70,6 @@ export class UnminifyContext {
         return this.#hasEval;
     }
 
-    /** Count a rewrite of `node` and log it. */
     did(transform: Transform, node: Node): void {
         this.counts[transform]++;
         if (this.log.debugging) this.log.debug(transform, node);

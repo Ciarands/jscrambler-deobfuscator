@@ -2,8 +2,7 @@ import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 
-// A stateful decoder that isn't jscrambler's template: a stage call (made by the prelude) reshuffles its table, and
-// later calls read it. Nothing proves those calls free of effects.
+// A stateful decoder that isn't the standard template: nothing proves its later calls free of effects.
 const PROGRAM = `
 function G() {}
 G.D = (function () {
@@ -30,7 +29,6 @@ out.push(flag);
 result = out;
 `;
 
-/** What a script leaves in `result`; `setTimeout` callbacks (code after the prelude) run once it has finished. */
 const run = (code: string): string => {
     const timers: (() => void)[] = [];
     const context: Record<string, unknown> = { host: { k: 2 }, setTimeout: (callback: () => void) => timers.push(callback) };
@@ -39,8 +37,8 @@ const run = (code: string): string => {
     return JSON.stringify(context.result);
 };
 
-// jscrambler's string decoder: stage calls shuffle the table T; once its counter R is past every stage guard, it is a
-// lookup, and the first call matching no stage freezes it (G.D.m becomes the lookup L).
+// Standard decoder: stage calls shuffle T until counter R passes every guard; the first non-stage call freezes it
+// (G.D.m becomes the lookup L).
 const decoder = ({ lookup = "return T[y];", setup = "", stages = "R += 1;" } = {}) => `
 function G() {}
 var hits = 0;
@@ -93,6 +91,9 @@ describe("resolve-calls", () => {
         const code = await deobfuscated(program);
         expect(run(code)).toBe(run(program));
         expect(code).toMatch(/result = \["[a-f]"\.toUpperCase\(\), "[a-f]"\.concat\("[a-f]"\)\.length\]/);
+        // A method on a value looked up on the result: the lookup is the receiver.
+        const nested = `${decoder()}${prelude}var second = 0;\nsetTimeout(function () { result = [G.w(3).length.toString()]; });\n`;
+        expect(run(await deobfuscated(nested))).toBe(run(nested));
     });
 
     it("resolves direct calls of a settled decoder's target after the prelude", async () => {
@@ -195,7 +196,6 @@ result = [v];
 
     it("keeps prelude calls when the decoder doesn't follow the template", async () => {
         const shapes = [
-            // The lookup does more than read the table.
             { lookup: "hits++; return T[y];" },
             // The table leaks out of the decoder: code holding it can change it.
             { setup: "\n      G.leak = function () { return T; };" },
@@ -210,7 +210,6 @@ result = [v];
 
     it("keeps prelude calls that found another function or holder than the decoder's", async () => {
         const replacements = [
-            // Another function at G.D.m: its calls can do anything.
             'G.D.m = function (y) { hits++; return "z"; };\n',
             // Another holder for the stage function: the freeze writes the old holder, which the guest doesn't watch.
             "var old;\n(function () { old = G.D; G.D = { m: old.m }; })();\n",
@@ -240,5 +239,20 @@ result = [v];
         expect(run(code)).toBe(run(program));
         // `flag` and `first` are constants too once the prelude's calls are split off their declarations.
         expect(code).toMatch(/result = \[true, "c", "[a-f]", G\.w\(host\.k\)\]/);
+    });
+
+    it("resolves calls of a settled decoder whose arguments only become constant in the cleanup group", async () => {
+        // A counting loop on a pure hash over slots: decided once arguments-arrays made the slots locals.
+        const hashing = `G.U = (function () {
+  var h = function (s, n, seed) { var q = seed; for (var i = 0; i < n; i++) { q = Math.imul(q ^ s.charCodeAt(i), 16777619) | 0; } return q; };
+  return { h: h };
+})();
+`;
+        const until = Math.imul(77300 ^ "2".charCodeAt(0), 16777619) | 0;
+        const body = `var s = [arguments]; s[1] = ${until}; s[3] = 2; for (var d = 1; G.U.h(d.toString(), d.toString().length, 77300) !== s[1]; d++) { s[3] += 1; } result = [G.w(s[3]), G.w(host.k)];`;
+        const program = `${decoder()}${hashing}${prelude}setTimeout(function () { ${body} });\n`;
+        const { code } = await deobfuscate(program);
+        expect(run(code)).toBe(run(program));
+        expect(code).toMatch(/result = \["[a-f]", G\.w\(host\.k\)\]/);
     });
 });

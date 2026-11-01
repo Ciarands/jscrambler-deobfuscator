@@ -4,14 +4,12 @@ import { deobfuscate } from "../src/index.js";
 
 const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["arguments-arrays"] })).code;
 
-/** What a script leaves in `result`, with `undefined`, `NaN` and functions told apart from `null`. */
 const observed = (source: string): string => {
     const context: Record<string, unknown> = { result: undefined };
     runInNewContext(source, context);
     return JSON.stringify(context.result, (_, value: unknown) => (value === undefined || typeof value === "function" || Number.isNaN(value) ? String(value) : value));
 };
 
-/** What a script and its deobfuscation leave in `result`, and the deobfuscation. */
 const observe = async (code: string): Promise<[string, string, string]> => {
     const output = await run(code);
     return [observed(code), observed(output), output];
@@ -571,8 +569,63 @@ var g = function () { return () => [arguments][0].length; };
 result = [f(1), f(), g(1, 2)()];
 `);
         expect(after).toBe(before);
-        expect(output).toContain("return arguments[0];");
+        expect(output).toContain("return a;");
         expect(output).toContain("() => arguments.length");
+    });
+
+    it.each([
+        ["sloppy", ""],
+        ["strict", '"use strict";\n'],
+    ])("turns direct arguments[i] reads into parameters (%s mode)", async (_, mode) => {
+        const [before, after, output] = await observe(`${mode}
+function f(a, b) {
+  var inner = [1, 2].map(function (a) { return arguments[0] * 10; });
+  var arrow = () => arguments[1];
+  return [arguments[0], typeof arguments[1], arguments.length, inner, arrow()];
+}
+function g(a) {
+  return (function () { return arguments.length; }).apply(this, arguments) + "/" + arguments[0];
+}
+function h(a, b = function () { return arguments.length; }) {
+  return [arguments[0], b(a)];
+}
+result = [f(1, 2), f(3), f(), g(4, 5), g(), h(1), h(2, (c) => -c)];
+`);
+        expect(after).toBe(before);
+        expect(output).not.toMatch(/arguments\[/);
+        expect(output).toContain("return a * 10;");
+        expect(output).toContain("var arrow = () => b;");
+        expect(output).toContain("return [a, typeof b, arguments.length, inner, arrow()];");
+        expect(output).toContain("return [a, b(a)];");
+    });
+
+    it("keeps direct arguments[i] reads where the parameter can differ from the element", async () => {
+        const [before, after, output] = await observe(`"use strict";
+var mutate = (args) => { args[0] = "changed"; };
+function escapes(a) { mutate(arguments); return arguments[0]; }
+function writes(a) { arguments[0] = "changed"; return [a, arguments[0]]; }
+function writesParameter(a) { a = "changed"; return arguments[0]; }
+function evals(a) { eval("a = 'changed'"); return arguments[0]; }
+function nestedEval(a) { (() => eval("a = 'changed'"))(); return arguments[0]; }
+function redeclares(a) { function a() {} return typeof arguments[0]; }
+function writesInDefault(a, b = (arguments[0] = "changed")) { return arguments[0]; }
+function arrayWritesInDefault(a, b = (arguments[0] = "changed")) { var S = [arguments]; return S[0][0]; }
+function shadowed(a) { return (() => { var a = "inner"; return arguments[0]; })(); }
+result = [escapes(1), writes(1), writesParameter(1), evals(1), nestedEval(1), redeclares(1), writesInDefault(1), arrayWritesInDefault(1), shadowed(1)];
+`);
+        expect(after).toBe(before);
+        expect(output.match(/arguments\[0\]/g)).toHaveLength(12);
+        expect(output).not.toContain("[arguments]");
+    });
+
+    it("keeps direct arguments[i] reads in sloppy mode where an element is deleted or the name means a with object's property", async () => {
+        const [before, after, output] = await observe(`
+function deletes(a) { delete arguments[0]; return [a, arguments[0]]; }
+function within(a) { with ({ a: "property" }) { return arguments[0]; } }
+result = [deletes(1), within(1)];
+`);
+        expect(after).toBe(before);
+        expect(output.match(/arguments\[0\]/g)).toHaveLength(3);
     });
 
     it("leaves [arguments][0] written, deleted, called on or with other elements", async () => {
