@@ -2,7 +2,6 @@ import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 
-/** What a script leaves in `result`; `setTimeout` callbacks (code after the prelude) run once it has finished. */
 const observed = (source: string): string => {
     const timers: (() => void)[] = [];
     const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };
@@ -13,7 +12,7 @@ const observed = (source: string): string => {
 
 const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "code-locks"] })).code;
 
-// jscrambler's shape: a builder returns an object whose method runs its checks once and then answers from a cache.
+// A builder returns an object whose method runs its checks once, then answers from a cache.
 const lock = ({ extra = "", slowAnswer = 91, firstCall = "G.L.check();", setCache = "c[6] = 15;" } = {}) => `
 function G() {}
 var log = [];
@@ -40,7 +39,6 @@ describe("code-locks", () => {
         const program = `${lock()}setTimeout(function () { G.L.check(); log.push(G.L.check()); result = log; });\n`;
         const output = await run(program);
         expect(observed(output)).toBe(observed(program));
-        // The prelude's call stays: it runs the checks.
         expect(output).toContain("}();\nG.L.check();");
         expect(output).toContain("log.push(67);");
         expect(output.match(/G\.L\.check\(\)/g)).toHaveLength(1);
@@ -66,9 +64,7 @@ describe("code-locks", () => {
 
 const runWithCleanup = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "code-locks", "cleanup"] })).code;
 
-// A lock whose checks touch only objects they create: a probe of a function's own source text, a typeof test, and a
-// scoring loop that hangs when a check fails. `checks` adds statements to the slow path, `before` code before the
-// builder, `prelude` code after it.
+// A lock whose checks touch only objects they create; the failing path is a scoring loop that hangs.
 const localLock = ({ checks = "", before = "", prelude = "G.L.check();" } = {}) => `
 function G() {}
 var seen = false;
@@ -131,7 +127,7 @@ describe("code-locks full removal", () => {
     });
 
     it("removes the calls of a lock that a later computed read can't name: a probe of a few characters", async () => {
-        // jscrambler's decoder finds its string by shuffling a few characters into a key of G; "L" isn't one of them.
+        // The decoder finds its string by shuffling a few characters into a key of G; "L" isn't one of them.
         const probe =
             'var probe = function () { var r = function (e) { var w = []; var t = 0; while (t < e.length) { w[t] = String.fromCharCode(e[t] + 99); t++; } return G[w.sort(function () { return 0; }).join("")]; }, found = r([-2, -1]), r = found; return typeof r; };\n';
         const program = `${localLock()}${probe}setTimeout(function () { result = [G.L.check(), probe()]; });\n`;
@@ -141,8 +137,7 @@ describe("code-locks full removal", () => {
     });
 
     it("removes every call of a lock whose checks read a missing global through a setup-installed getter", async () => {
-        // jscrambler's setup installs getters on G whose functions read one global the page lacks; calling one is a
-        // read of that global, not a call into code outside the lock, so the prelude's call goes too.
+        // Setup getters on G return functions reading a global the page lacks: a read, not a call into outside code.
         const setup = '(function () { Object.defineProperty(G, "r", { get: function () { return function () { return globalThis.MissingName7; }; } }); })();';
         const program = `${localLock({ before: setup, checks: 'd[8] = typeof G.r() === "function";' })}setTimeout(function () { result = [G.L.check()]; });\n`;
         const output = await run(program);
@@ -153,11 +148,31 @@ describe("code-locks full removal", () => {
     it("keeps the prelude's call while the lock may be reached otherwise", async () => {
         const cases = [
             { later: 'var key = "L"; result = [G[key].check()];' }, // a computed key
+            // Computed keys through unary operators or a call the analysis can't follow, read once a call has answered from the cache.
+            { later: "var lk = G[String.fromCharCode(-(-76))]; result = [G.L.check(), lk.check()];" },
+            { later: "var lk = G[String.fromCharCode(76 + !1)]; result = [G.L.check(), lk.check()];" },
+            { later: "var lk = G[String.fromCharCode(~-77)]; result = [G.L.check(), lk.check()];" },
+            { later: 'var lk = G[String.fromCharCode(+"7" + 69)]; result = [G.L.check(), lk.check()];' },
+            // A parameter that may be any number once incremented.
+            { later: "var at = function (n) { n++; return G[String.fromCharCode(-n + 77)]; }; var lk = at(0); result = [G.L.check(), lk.check()];" },
+            { later: "var at = function (n) { n++; return G[String.fromCharCode(76 + !n)]; }; var lk = at(0); result = [G.L.check(), lk.check()];" },
+            // The key function reached other than by a direct call through its binding: the arguments object, a
+            // logical assignment's value, its own name handing it back to a later declarator that replaces the binding.
+            { later: "var at = function (r) { var r = function (e) { return G[String.fromCharCode(e)]; }; r(77); return arguments[0](76); }; var lk = at(0); result = [G.L.check(), lk.check()];" },
+            { later: "var r = function (e) { return G[String.fromCharCode(e)]; }; r(77); var lk = (r ||= 0)(76); result = [G.L.check(), lk.check()];" },
+            {
+                later: "var r = function self(e) { return e === 0 ? self : G[String.fromCharCode(e)]; }, s = r(0), r = s, u = function () { return r(76); }; var lk = u(); result = [G.L.check(), lk.check()];",
+            },
+            { later: "var r = function self(e) { return e === 0 ? self : G[String.fromCharCode(e)]; }, s = r(0), r = s; var lk = r(76); result = [G.L.check(), lk.check()];" },
+            // A later declarator that still holds the function: the reads in it hand the function on.
+            { later: "var r = function (e) { return G[String.fromCharCode(e)]; }, r = r.bind(null); var lk = r(76); result = [G.L.check(), lk.check()];" },
+            { later: "var r = function (e) { return G[String.fromCharCode(e)]; }, r = r; var lk = r(76); result = [G.L.check(), lk.check()];" },
+            // A recursive call through the function's own name passes the parameter a value too.
+            { later: "var at = function self(n) { return n ? G[String.fromCharCode(n)] : self(76); }; var lk = at(0); result = [G.L.check(), lk.check()];" },
+            { later: 'var lk = G[String("L")]; result = [G.L.check(), lk.check()];' },
             { later: "var lock = G.L; result = [lock.check()];" }, // the holder by another name
             { later: "result = [(function () { return this.L.check(); }).call(G)];" }, // G handed on
-            // A computed read in the prelude, after the first call: it answers the cached value.
             { prelude: 'G.L.check();\nvar key = "L";\nvar second = G[key].check();', later: "result = [second];" },
-            // G kept as a global the program names again.
             { prelude: "G.L.check();\nglobalThis.KeptG = G;", later: "result = [KeptG.L.check()];" },
         ];
         for (const { prelude, later: afterPrelude } of cases) {
@@ -177,7 +192,6 @@ describe("code-locks full removal", () => {
     });
 
     it("keeps the prelude's calls when one of them uses the value", async () => {
-        // After the first call the prelude's second one answers 67; without the first it would answer 91.
         const program = `${localLock({ prelude: "G.L.check();\nvar second = G.L.check();" })}setTimeout(function () { result = [second, G.L.check()]; });\n`;
         const output = await runWithCleanup(program);
         expect(observed(output)).toBe(observed(program));

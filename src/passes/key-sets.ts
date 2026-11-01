@@ -10,7 +10,6 @@ export interface KeySet {
     readonly chars: ReadonlySet<string> | undefined;
 }
 
-/** Whether `keys` admits `key`. */
 export const mayName = (keys: KeySet, key: string): boolean => keys.strings.has(key) || (keys.chars !== undefined && key.split("").every((char) => keys.chars?.has(char)));
 
 /** The elements an array may hold: those written to it (holes, and reads past its end, are `undefined` besides). */
@@ -33,7 +32,6 @@ interface Abstract {
 /** More values than this and an abstract value gives up: a key set that large selects nearly anything anyway. */
 const MAX_PRIMS = 1024;
 
-/** Characters of `String(n)` for any number `n`. */
 const NUMBER_CHARS: ReadonlySet<string> = new Set("0123456789.-+eInfinityNaN".split(""));
 
 const EMPTY: Abstract = { prims: new Set(), numbers: false, chars: undefined, arrays: new Set(), fromCharCode: false };
@@ -54,10 +52,8 @@ const onlyPrims = (a: Abstract): boolean => !a.numbers && a.chars === undefined 
 /** Only arrays (or `undefined`/`null`, whose members can't be read: reading one throws, giving no value). */
 const arraysOnly = (a: Abstract): boolean => a.arrays.size > 0 && !a.numbers && a.chars === undefined && !a.fromCharCode && [...a.prims].every((v) => v === undefined || v === null);
 
-/** Only numbers. */
 const numeric = (a: Abstract): boolean => a.chars === undefined && a.arrays.size === 0 && !a.fromCharCode && [...a.prims].every((v) => typeof v === "number");
 
-/** Unary operators on primitives (never BigInts here): what each gives. */
 const UNARY: Readonly<Record<string, ((v: Value) => Value) | undefined>> = {
     "-": (v) => -Number(v),
     "+": (v) => Number(v),
@@ -65,7 +61,6 @@ const UNARY: Readonly<Record<string, ((v: Value) => Value) | undefined>> = {
     "!": (v) => !v,
 };
 
-/** Operators whose result is a boolean whatever numbers they compare. */
 const COMPARISONS: Record<string, true> = { "==": true, "!=": true, "===": true, "!==": true, "<": true, "<=": true, ">": true, ">=": true };
 
 /** Characters `String(v)` (or, in a join, the element `v`: `undefined` and `null` add nothing) may have. */
@@ -78,18 +73,15 @@ const charsOf = (a: Abstract, inJoin: boolean): Set<string> | undefined => {
 };
 
 /**
- * The keys computed reads may select, from a flow-insensitive abstract evaluation of their key expressions over the
- * function they sit in (`parents` covers it, and the code that calls it). Built for jscrambler's decoder probe:
+ * The keys computed reads may select, from a flow-insensitive abstract evaluation over the function they sit in.
+ * Built for jscrambler's decoder probe:
  *
- *     var c = []; while (i < a.length) { c[i] = String.fromCharCode(a[i] + 21); i++; }   // a: [83, 28, ...]
  *     do { key = c.sort(function () { return 0.5 - random(); }).join(""); found = G[key]; } while (!found);
  *
- * A variable may hold what any of its writes assigns, and `undefined` (a `var` read before its initializer runs); a
- * parameter what any call passes, when its function is only ever called directly by name and doesn't use
- * `arguments`; a local array whatever any write to its elements puts there, when it is only ever read, written by
- * element, sorted or joined (it can't be reached any other way); `a[n]` with a number key one of those elements or
- * `undefined`. `String.fromCharCode`, `sort` (a permutation) and `join` are taken to be the builtins, which also have
- * no index properties on their prototypes: relies on model 7: builtins intact. Anything else is unknown (top).
+ * A variable holds any of its writes or `undefined`; a parameter what any call passes, when its function is only
+ * called directly by name and doesn't use `arguments`; a local array whatever its element writes put there, when it
+ * is only read, written by element, sorted or joined. Relies on model 7 (builtins intact, no index properties on
+ * their prototypes). Anything else is top.
  */
 export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((key: Expression) => KeySet | undefined) => {
     const withScope = scopes.manager.scopes.some((scope) => scope.type === "with");
@@ -101,7 +93,6 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
     const isGlobal = (node: Node, name: string): boolean =>
         node.type === "Identifier" && node.name === name && !withScope && (scopes.isGlobalReference(node) || (scopes.referenceOf(node) === undefined && !scopes.declaresName(name)));
 
-    /** `id`'s parent, when `parents` knows it (references outside the covered code are unknown). */
     const parentOf = (id: Node): Node | undefined => parents.get(id);
 
     /** A local array declared with a literal and used only in ways that leave its elements to the writes `V[k] = v`. */
@@ -138,7 +129,6 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
         return source;
     };
 
-    /** The array literal `node` passed straight to a parameter: what it may hold. */
     const literalSource = (node: Node): ArraySource | undefined => {
         if (sources.has(node)) return sources.get(node);
         const elements: Expression[] = [];
@@ -174,26 +164,29 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
         const index = fn.params.findIndex((param) => param === (def?.name as unknown as Node));
         if (index < 0 || fn.params.slice(0, index).some((param) => param.type !== "Identifier")) return undefined;
         if (fn.type !== "ArrowFunctionExpression" && (scopes.scopeOf(fn)?.set.get("arguments")?.references.length ?? 0) > 0) return undefined;
-        // The function's own binding: `function f(...)` or `var f = function (...)`. Writes of other values to it hand
-        // the function to nothing, and every read must be a direct call (whichever function the binding holds then,
-        // the arguments passed cover this one's calls), except reads in the same function after a later declarator of
-        // the same declaration replaced it (`var r = function (e) {...}, s = r(k), r = s;`): from there on, it holds
-        // what that declarator stored until the declaration runs again, which comes before them.
+        // Every read of the function's bindings (its holder, and its own name inside a named function expression)
+        // must be a direct call, except reads after a later declarator of the same declaration replaced the holder
+        // (`var r = function (e) {...}, s = r(k), r = s;`): with no other read, `s` can't be the function.
         const parent = parentOf(fn);
         const holder = fn.type === "FunctionDeclaration" ? fn.id : parent?.type === "VariableDeclarator" && parent.init === fn ? parent.id : undefined;
         const binding = holder?.type === "Identifier" ? scopes.staticVariableOf(holder) : undefined;
         if (binding === undefined || !binding.defs.every((d) => d.type === "Variable" || d.type === "FunctionName")) return undefined;
+        const ownName = fn.type === "FunctionExpression" && fn.id !== null ? scopes.variableOf(fn.id) : undefined;
         const replacedFrom = Math.min(
             Number.POSITIVE_INFINITY,
             ...binding.defs.filter((d) => parent !== undefined && d.parent === parentOf(parent) && (d.node as unknown as Node).start > parent.start).map((d) => (d.node as unknown as Node).end)
         );
         let result: Abstract | undefined = EMPTY;
         let hasArrays = false;
-        for (const reference of scopes.staticReferences(binding)) {
+        const reads = [
+            ...scopes.staticReferences(binding).map((reference) => ({ reference, ofHolder: true })),
+            ...(ownName === undefined ? [] : scopes.staticReferences(ownName).map((reference) => ({ reference, ofHolder: false }))),
+        ];
+        for (const { reference, ofHolder } of reads) {
             if (reference.isWrite() && !reference.isRead()) continue;
             const id = reference.identifier as unknown as Node;
             const call = parentOf(id);
-            if (id.start >= replacedFrom && reference.from.variableScope === binding.scope.variableScope) continue;
+            if (ofHolder && id.start >= replacedFrom && reference.from.variableScope === binding.scope.variableScope) continue;
             if (call?.type !== "CallExpression" || call.callee !== id) return undefined;
             const args = call.arguments;
             if (args.slice(0, index + 1).some((arg) => arg.type === "SpreadElement")) return undefined;
@@ -209,7 +202,6 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
         return union(result, writesOf(variable));
     };
 
-    /** What a variable's writes other than declarator initializers assign (a `++` gives a number). */
     const writesOf = (variable: Variable): Abstract | undefined => {
         let result: Abstract | undefined = EMPTY;
         for (const reference of scopes.staticReferences(variable)) {
@@ -244,7 +236,6 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
         return result;
     };
 
-    /** What `array[key]` may give, for arrays `object`: an element, or `undefined`, when the key is a number or an index. */
     const elementRead = (object: Abstract, key: Abstract | undefined): Abstract | undefined => {
         if (key === undefined || !arraysOnly(object) || key.chars !== undefined || key.arrays.size > 0 || key.fromCharCode) return undefined;
         // Keys other than strings name no property of an array but its elements (`"undefined"`, `"1.5"`, `"true"`).
@@ -261,7 +252,6 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
         if (callee.type === "MemberExpression" && (method === "sort" || method === "join")) {
             const object = abstract(callee.object);
             if (object === undefined || !arraysOnly(object)) return undefined;
-            // `sort` reorders the array and returns it.
             if (method === "sort") return node.arguments.length <= 1 && node.arguments.every((arg) => arg.type === "FunctionExpression" || arg.type === "ArrowFunctionExpression") ? object : undefined;
             if (node.arguments.length > 1) return undefined;
             const separator = node.arguments[0];
@@ -318,7 +308,6 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
                 const left = abstract(node.left);
                 const right = abstract(node.right);
                 if (left === undefined || right === undefined) return undefined;
-                // Arithmetic on numbers is a number, a comparison a boolean.
                 if (!onlyPrims(left) || !onlyPrims(right)) return numeric(left) && numeric(right) ? (COMPARISONS[node.operator] === true ? prims(true, false) : ANY_NUMBER) : undefined;
                 if (left.prims.size * right.prims.size > MAX_PRIMS) return undefined;
                 const results: Value[] = [];

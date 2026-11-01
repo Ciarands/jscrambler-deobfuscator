@@ -59,7 +59,6 @@ const fastPathOf = (iife: FunctionNode, method: string, scopes: ScopeInfo): Fast
     if (fn === undefined) return refused(`its builder gives it no plain function ${method}`, iife);
     if (fn.async || fn.generator) return refused(`${method} is async or a generator`, fn);
 
-    // Its first effective statement reads the cache and returns the answer.
     const statements = bodyOf(fn);
     let first = 0;
     while (
@@ -103,11 +102,7 @@ const fastPathOf = (iife: FunctionNode, method: string, scopes: ScopeInfo): Fast
     return { ok: true, answer, method: fn, cache, parents: builder.parents, constant: false };
 };
 
-/**
- * A no-argument call of a storage path `G.k.m` (or `G.w`): the reference to `G` it starts from, its statement when it
- * is one, whether its value is discarded (a statement, or not last in a sequence), and whether only its truthiness
- * is used.
- */
+/** A no-argument call of a storage path `G.k.m` (or `G.w`). */
 export interface CallSite {
     readonly call: Expression & { type: "CallExpression" };
     readonly site: Node;
@@ -116,7 +111,6 @@ export interface CallSite {
     readonly tested: boolean;
 }
 
-/** Whether only the truthiness of the value at `path` is used: a condition or `!` operand, possibly through `&&`/`||`. */
 const onlyTruthiness = (path: Path): boolean => {
     let operand = path;
     while (operand.parent?.type === "LogicalExpression" && operand.parent.operator !== "??" && operand.parentPath !== null) operand = operand.parentPath;
@@ -135,18 +129,15 @@ const onlyTruthiness = (path: Path): boolean => {
     }
 };
 
-/** A static reference `x.k`, the root statement it sits in, and the reference to `G` it starts from (when `x` is one). */
 interface KeyReference {
     readonly node: Node;
     readonly root: Node | undefined;
     readonly site: Node | undefined;
 }
 
-/** What the program does with the storage object, from one walk. */
 export interface Survey {
-    /** No-argument calls of static paths `G.k.m` and `G.w`, by path. */
     readonly calls: Map<string, { path: PropertyPath; sites: CallSite[] }>;
-    /** Where `G` (the reference `site`) is used as a value or read with a computed key: any key may be read there. */
+    /** Uses of `G` as a value or with a computed key: any key may be read there. */
     readonly dynamic: readonly { readonly node: Node; readonly site: Node }[];
 }
 
@@ -188,10 +179,7 @@ export const survey = (program: Node, matcher: StorageMatcher, scopes: ScopeInfo
     return { calls, dynamic };
 };
 
-/**
- * Every static member reference `x.k` with `k` one of `keys`, whatever `x` is (an alias the matcher can't follow, as
- * under a direct eval, or `this`, still names the key), by key.
- */
+/** Every static member reference `x.k` with `k` in `keys`, whatever `x` is (an unfollowable alias still names the key). */
 const keyReferences = (program: Node, runtime: RuntimeModel, matcher: StorageMatcher, keys: ReadonlySet<string>): Map<string, KeyReference[]> => {
     const references = new Map<string, KeyReference[]>();
     const roots = new Set<Node>(rootStatements(runtime.root));
@@ -219,7 +207,7 @@ const keyReferences = (program: Node, runtime: RuntimeModel, matcher: StorageMat
 /**
  * Why a reference to the holder key `path[0]` may reach the lock `path` other than through calls whose callee objects
  * (`G.k`) are `callees`: it is none of them, isn't in the builder's own statement or the definition of a wrapper of
- * the lock nothing uses, and may run once the builder has (before it, `G.k` isn't the lock yet).
+ * something under the holder that nothing uses, and may run once the builder has (before it, `G.k` isn't the lock yet).
  */
 export const strayReference = (
     path: PropertyPath,
@@ -230,7 +218,7 @@ export const strayReference = (
     matcher: StorageMatcher,
     effects: StorageEffects
 ): Node | undefined => {
-    const wrappers = [...runtime.wrappers.values()].filter((wrapper) => wrapper.target.length === path.length && wrapper.target.every((key, i) => key === path[i]));
+    const wrappers = [...runtime.wrappers.values()].filter((wrapper) => wrapper.target[0] === path[0]);
     const references = keyReferences(program, runtime, matcher, new Set([path[0] as string, ...wrappers.map((wrapper) => wrapper.key)]));
     const unused = new Set(wrappers.filter((wrapper) => (references.get(wrapper.key) ?? []).every((reference) => reference.root === wrapper.definition)).map((wrapper) => wrapper.definition));
     return references
@@ -238,10 +226,8 @@ export const strayReference = (
         ?.find(({ node, root, site }) => !callees.has(node) && root !== builder && (root === undefined || !unused.has(root)) && (site === undefined || !effects.runsBefore(site, builder)))?.node;
 };
 
-/** What a call of a lock becomes: removed (a statement), replaced by the cached answer, or kept. */
 type Disposition = "remove" | "answer" | "keep";
 
-/** A proven lock, its calls, and what full mode would do with each. */
 interface Lock {
     readonly path: PropertyPath;
     readonly sites: readonly CallSite[];
@@ -291,7 +277,6 @@ export const reachingDynamicUse = (dynamic: Survey["dynamic"], key: string, buil
     })?.node;
 };
 
-/** Why the whole lock can't go (its first call included), if anything stops it. */
 const fullModeRefusal = (lock: Lock, context: LockContext): { reason: string; node: Node } | undefined => {
     const { path, sites, full, staleness, fast, builder } = lock;
     const { program, runtime, matcher, effects, uses } = context;
@@ -308,7 +293,7 @@ const fullModeRefusal = (lock: Lock, context: LockContext): { reason: string; no
     return undefined;
 };
 
-/** Put in each call's replacement, then remove the call statements in `removals` (an empty statement where one must stay). */
+/** Removes call statements in `removals`, leaving an empty statement where one must stay. */
 export const rewriteCalls = (program: Node, replacements: ReadonlyMap<Node, Node>, removals: ReadonlySet<Node>): void => {
     replaceNodes(program, replacements);
     if (removals.size === 0) return;
@@ -325,29 +310,19 @@ export const rewriteCalls = (program: Node, replacements: ReadonlyMap<Node, Node
 const LOCK_PROBES = factKey<Map<string, ResolveResult | undefined>>("code-lock probes");
 
 /**
- * Code locks: jscrambler's environment checks (`G.k.m()`, usually through a wrapper the wrappers pass has inlined)
- * run once and then answer from a cache. The prelude makes the first call; every call after it takes the cached path:
- * no effect, the same answer.
+ * Code locks: jscrambler's environment checks (`G.k.m()`) run once, then answer from a cache.
  *
- * Proof per lock: its builder's code shows the cached path and that the cache, once set, stays set (`fastPathOf`);
- * one call in the guest, which ran the prelude, answers the cached value (so the cache is set); and each call site
- * reaches the lock the snapshot holds (nothing writes the path later, and a prelude call runs after the builder).
+ * Proof per lock: the builder's code shows the cached path and that the cache, once set, stays set (`fastPathOf`);
+ * one guest call after the prelude answers the cached value; and each call site reaches the lock the snapshot holds.
  *
- * Full mode (the whole lock goes): its first call, too, changes nothing but objects it creates and its cache
- * (`localityOf`), and the environment passes its checks (semantic model 5), so that call only sets the cache. Every
- * statement call goes, and a call whose value is discarded becomes the answer (as good as no call); a call whose
- * value is used becomes the answer only when it runs after the prelude (the prelude's calls may be the first one,
- * answering the checks' value). Nothing else can reach the lock: every static reference to its holder key (on any
- * object) is one of those calls, in the builder's own statement, in an unused wrapper's definition, or done before the
- * builder runs; and `G` is used as a value or read with a computed key only before the builder runs, in a condition,
- * or to keep it as a global the program never names again (other scripts don't read it: model 2). So no call made
- * later finds the cache unset, and cleanup removes the builder and the wrappers nothing reads. Otherwise partial mode:
- * only calls that run after the prelude go, the prelude's stay, so the checks run when the original's did.
+ * Full mode (the whole lock goes): the first call changes only objects it creates and its cache (`localityOf`), and
+ * the environment passes its checks (model 5). A used call becomes the answer only after the prelude. Every static
+ * reference to the holder key is one of those calls, in the builder, in an unused wrapper, or before the builder
+ * runs; and `G` escapes only before the builder, in a condition, or into a global nothing names (model 2). Otherwise
+ * partial mode: only post-prelude calls go, so the checks run when the original's did.
  *
- * Constant locks (self-defending checks): every return gives the answer, and the checks' other outcome is a trap
- * that never returns (`while (78) {}`), which the environment never meets (model 5). Every call answers, cached or
- * not, so only full mode applies, and any call may answer, the prelude's too. The guest isn't asked: there the checks
- * may well fall into the trap.
+ * Constant locks (self-defending): every return gives the answer and the other outcome is a trap the environment
+ * never meets (model 5), so only full mode applies and the guest isn't asked (it may fall into the trap).
  */
 export const codeLocks: Pass = {
     name: "code-locks",
