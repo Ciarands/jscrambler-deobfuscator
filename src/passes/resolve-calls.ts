@@ -2,7 +2,7 @@ import type { CallExpression, Expression, Node, SequenceExpression } from "../co
 import { memberPath, propertyKey } from "../core/ast.js";
 import { at, valueToNode } from "../core/build.js";
 import { constantEnv } from "../core/constants.js";
-import type { EvaluateEnv, Value } from "../core/evaluate.js";
+import type { EvaluateEnv, Evaluation, Value } from "../core/evaluate.js";
 import { evaluate } from "../core/evaluate.js";
 import { replaceNodes, traverse } from "../core/traverse.js";
 import type { Path } from "../core/traverse.js";
@@ -48,6 +48,12 @@ interface Resolution {
      * direct call of it that runs only after that call's root statement can't drive a stage. Found by the first run.
      */
     readonly settlingSites: Map<string, Node>;
+    /**
+     * How many runs walked the whole program. The first comes before wrappers, which puts new direct calls in place of
+     * the wrapper calls it inlines; the waiting sites a later walk finds are the program's own: no later pass makes
+     * decoder calls (they change arguments in place, or remove calls).
+     */
+    walks: number;
 }
 
 /** A value in a request's identity: strings quoted, numbers keeping `-0` apart, other primitives by type. */
@@ -58,6 +64,12 @@ const requestPart = (value: unknown): string =>
 const requestId = (request: ResolveRequest): string => `${request.path.map(requestPart).join(".")}(${request.args.map(requestPart).join(",")})${(request.lookup ?? []).map(requestPart).join(".")}`;
 
 const RESOLUTION = factKey<Resolution>("resolve-calls");
+
+/** What a call argument passes, when constant: `(e, 32)` passes 32 (once `e` ran). */
+const argumentValue = (arg: Node, env: EvaluateEnv): Evaluation | undefined => {
+    const last = arg.type === "SequenceExpression" ? arg.expressions.at(-1) : arg;
+    return last === undefined || last.type === "SpreadElement" ? undefined : evaluate(last, env);
+};
 
 /**
  * Resolve calls to the runtime's wrapper functions (`G.w(...)`, whose targets are mostly the string decoder).
@@ -89,15 +101,32 @@ export const resolveCalls: Pass = {
         }
         const { guest, callResults, wrappers } = runtime;
         const earlier = facts.get(RESOLUTION);
-        // Later runs only look for settled decoders' calls whose arguments were waiting to become constant.
+        // Later runs only look for settled decoders' calls whose arguments were waiting to become constant. Once a walk
+        // after wrappers found them (`walks`), until one of them has constant arguments, there is nothing to do.
         if (earlier !== undefined && earlier.waiting.size === 0) {
             log.info("no wrapper calls wait for constant arguments");
             return { changed: 0 };
         }
+        if (earlier !== undefined && earlier.walks >= 2) {
+            const env = constantEnv(scope(), log);
+            const ready = [...earlier.waiting].some((call) => call.type === "CallExpression" && call.arguments.every((arg) => argumentValue(arg, env)?.ok === true));
+            if (!ready) {
+                log.info(`none of the ${earlier.waiting.size} waiting call(s) has constant arguments yet`);
+                return { changed: 0 };
+            }
+        }
         const scopes = scope();
         const matcher = storageMatcher(program, runtime, scopes);
         const { isStorage } = matcher;
-        const resolution: Resolution = earlier ?? { decided: new WeakSet(), waiting: new Set(), logged: new WeakSet(), proof: decoderLookups(runtime, matcher, scopes, log), settlingSites: new Map() };
+        const resolution: Resolution = earlier ?? {
+            decided: new WeakSet(),
+            waiting: new Set(),
+            logged: new WeakSet(),
+            proof: decoderLookups(runtime, matcher, scopes, log),
+            settlingSites: new Map(),
+            walks: 0,
+        };
+        resolution.walks++;
         if (earlier === undefined) {
             facts.set(RESOLUTION, resolution);
             facts.set(DECODER_PROOF, resolution.proof);
@@ -116,19 +145,24 @@ export const resolveCalls: Pass = {
             counts.kept++;
             log.debug(`kept: ${reason}`, node);
         };
-        /** Constant-key member reads on top of a call (`call[41][49]`), up to where the value is used otherwise. */
-        const lookupOn = (path: Path): { outer: Path; keys: string[] } | string => {
+        /**
+         * Constant-key member reads on top of a call (`call[41][49]`), up to where the value is used otherwise. A
+         * method called on the result (`call.substring(0, 6)`) leaves its key out: the receiver is what gets resolved
+         * (a primitive string runs its method the same, literal or not; a function result isn't resolved at all).
+         */
+        const lookupOn = (path: Path): { outer: Path; keys: string[] } => {
             let outer: Path = path;
+            let receiver: Path = path;
             const keys: string[] = [];
             while (outer.parent?.type === "MemberExpression" && outer.key === "object" && outer.parentPath !== null && !outer.parentPath.isWriteTarget()) {
                 const member = outer.parent;
                 const key = member.computed ? evaluate(member.property, constants()) : { ok: true as const, value: propertyKey(member) };
                 if (!key.ok || key.value === undefined) break;
                 keys.push(String(key.value));
+                receiver = outer;
                 outer = outer.parentPath;
             }
-            if (outer.parent?.type === "CallExpression" && outer.key === "callee") return "the looked-up value is called as a method";
-            return { outer, keys };
+            return outer.parent?.type === "CallExpression" && outer.key === "callee" && keys.length > 0 ? { outer: receiver, keys: keys.slice(0, -1) } : { outer, keys };
         };
 
         const candidates: Candidate[] = [];
@@ -184,8 +218,7 @@ export const resolveCalls: Pass = {
                 const args: Value[] = [];
                 const prefix: Expression[] = [];
                 for (const arg of call.arguments) {
-                    const last = arg.type === "SequenceExpression" ? arg.expressions.at(-1) : arg;
-                    const value = last === undefined || last.type === "SpreadElement" ? undefined : evaluate(last, constants());
+                    const value = argumentValue(arg, constants());
                     if (value?.ok === true) {
                         if (arg.type === "SequenceExpression") prefix.push(...arg.expressions.slice(0, -1));
                         args.push(value.value);
@@ -204,7 +237,6 @@ export const resolveCalls: Pass = {
                     log.debug(`the prelude made ${unplaced.length} call(s) like this one at unknown sites, each a pure lookup on its settled decoder: resolved like a later call`, call);
 
                 const lookup = lookupOn(path);
-                if (typeof lookup === "string") return keep(lookup, call);
                 const isLookup = lookup.keys.length > 0;
                 candidates.push({ node: isLookup ? lookup.outer.node : call, request: { path: [key], args, ...(isLookup ? { lookup: lookup.keys } : {}) }, isLookup, site, key, prefix, direct });
             },

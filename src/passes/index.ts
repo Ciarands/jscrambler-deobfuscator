@@ -37,9 +37,10 @@ import { wrappers } from "./wrappers.js";
  * arguments-arrays then turns `var S = [arguments]` slot arrays into parameters and locals: the passes before it
  * (constants, code-locks, builders, calculators) read the slot shapes. It leads the cleanup group, so an array the
  * group's simplify frees (a predicate deciding between two of its definitions) is converted in the next round, and
- * cleanup drops the locals whose reads the passes before already resolved. calculators, code-locks and domain-locks
- * run again right after it: calculations it kept because an argument was a read through the arguments array (a
- * possible getter, read out of turn) now take plain parameters and locals, and lock calls their literal arguments.
+ * cleanup drops the locals whose reads the passes before already resolved. resolve-calls, calculators, code-locks and
+ * domain-locks run again right after it: decoder calls get the constants the group's simplify propagated into locals
+ * that were slots, calculations it kept because an argument was a read through the arguments array (a possible
+ * getter, read out of turn) now take plain parameters and locals, and lock calls their literal arguments.
  * hash-predicates comes next in both groups:
  * it decides tests on the runtime's pure hash from the locals assigned right before them, so simplify drops the dead
  * branches and loops in the same round; in the cleanup group it sees the predicates whose locals were slots until
@@ -61,6 +62,6 @@ export const PIPELINE: readonly PipelineStep[] = [
     calculators,
     storageComparisons,
     { group: "simplify", passes: [hashPredicates, simplify, normalize, unflatten, resolveCalls, pureCalls], maxRounds: 8 },
-    { group: "cleanup", passes: [argumentsArrays, codeLocks, domainLocks, calculators, hashPredicates, cleanup, simplify], maxRounds: 4 },
+    { group: "cleanup", passes: [argumentsArrays, resolveCalls, codeLocks, domainLocks, calculators, hashPredicates, cleanup, simplify], maxRounds: 4 },
     unminify,
 ];

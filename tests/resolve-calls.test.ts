@@ -88,6 +88,13 @@ describe("resolve-calls", () => {
         expect(code).toMatch(/result = \[\(G\.sel\(5\), "[a-f]"\), hits\]/);
     });
 
+    it("resolves the receiver of a method called on a decoded string", async () => {
+        const program = `${decoder()}${prelude}var second = 0;\nsetTimeout(function () { result = [G.w(3).toUpperCase(), G.w(3).concat(G.v(1)).length]; });\n`;
+        const code = await deobfuscated(program);
+        expect(run(code)).toBe(run(program));
+        expect(code).toMatch(/result = \["[a-f]"\.toUpperCase\(\), "[a-f]"\.concat\("[a-f]"\)\.length\]/);
+    });
+
     it("resolves direct calls of a settled decoder's target after the prelude", async () => {
         // What wrappers makes of wrapper calls: `G.D.m(3)`. Direct stage calls in the prelude stay (the simplify-group test at the end).
         const program = `${decoder()}${prelude}var second = 0;\nsetTimeout(function () { result = [first, G.D.m(3), G.D.m(host.k)]; });\n`;
