@@ -6,15 +6,7 @@ import type { PassLog } from "./log.js";
 import type { Reference, ScopeInfo, Variable } from "./scope.js";
 import { forEachChild } from "./traverse.js";
 
-/** Document order of one scope block, as the tree is now (after unflattening, that is execution order). */
-interface BlockOrder {
-    readonly index: Map<Node, number>;
-    /** For nodes inside a function declaration: the nearest one. Hoisted, so callable before what precedes it. */
-    readonly declaredIn: Map<Node, Node>;
-    /** The last index inside each nested statement list (block, `case` body, static block). */
-    readonly end: Map<Node, number>;
-}
-
+/** Nodes whose document order the analysis compares (definitions and reads). */
 const ORDERED: Record<string, true> = { Identifier: true, MemberExpression: true, VariableDeclarator: true, ExpressionStatement: true };
 
 /** A constant and the node after which (in document order) it holds. */
@@ -49,6 +41,12 @@ export interface ConstantEnv extends EvaluateEnv {
      * when the reference comes after that.
      */
     readonly functionAt: (identifier: Node) => FunctionLike | undefined;
+    /**
+     * Whether code can reach the binding only by its name: always for one inside a function; for a script global,
+     * when the program never spells the name as a property or string, has no `with` or direct `eval`, and uses the
+     * global object only with keys that evaluate to other names (other scripts don't touch it: semantic model 2).
+     */
+    readonly onlyByName: (variable: Variable) => boolean;
 }
 
 /** A constant array: what each element evaluates to, and the definition (in `block`) after which the array holds. */
@@ -85,31 +83,13 @@ interface SlotArray {
 /** Why a candidate isn't constant, at which node. */
 type Refusal = { readonly reason: string; readonly node: Node };
 
-/** What the whole program spells out, for script globals; collected in the one walk that builds the parents map. */
-interface ProgramFacts {
-    /** Parents of the nodes `parentOf` is asked about (see `PARENT_ASKED`). */
-    readonly parents: Map<Node, Node>;
+/** What the whole program spells out, for script globals; collected in one walk when a script global is first asked about. */
+interface ProgramNames {
     /** Every string literal, template text and static property name: a global so named may be reached as a property. */
     readonly spelled: Set<string>;
     /** Computed members on an expression that is the global object (`window[k]`, top-level `this[k]`). */
     readonly globalMembers: MemberExpression[];
 }
-
-/**
- * The node types whose parent is asked for: references (identifiers, never the name of `o.name`), the members they
- * are the object of, declarations (for their statement list), and the members' parents an answer depends on: an
- * assignment (`a[k] = v;` as a statement) and a property (a destructuring target). Other parents are never read, so
- * leaving them out of the map (most of the program) changes no answer.
- */
-const PARENT_ASKED: Record<string, true> = {
-    Identifier: true,
-    MemberExpression: true,
-    VariableDeclaration: true,
-    VariableDeclarator: true,
-    AssignmentExpression: true,
-    ExpressionStatement: true,
-    Property: true,
-};
 
 /** Unresolved names that hold the global object (or, for `top`/`parent`, may: in a top-level window). */
 const GLOBAL_OBJECT_NAMES: Record<string, true> = { globalThis: true, window: true, self: true, frames: true, top: true, parent: true };
@@ -235,7 +215,27 @@ const escapingUse = (member: Node, above: Node | undefined): string | undefined 
  * that doesn't evaluate, or evaluates to the name. Other scripts don't touch them (semantic model 2).
  */
 export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
-    const orders = new Map<Node, BlockOrder>();
+    const cached = envs.get(scopes);
+    if (cached !== undefined && cached.generation === scopes.generation) {
+        cached.logRef.log = log;
+        return cached.env;
+    }
+    const logRef: { log: PassLog | undefined } = { log };
+    const env = buildConstantEnv(scopes, logRef);
+    envs.set(scopes, { generation: scopes.generation, env, logRef });
+    return env;
+};
+
+/**
+ * One environment per scope analysis and generation: passes that run on a program nothing changed since share it,
+ * with what it worked out (the analysis is refreshed, starting a generation, whenever a pass changed the program).
+ * The log follows the pass asking.
+ */
+const envs = new WeakMap<ScopeInfo, { readonly generation: number; readonly env: ConstantEnv; readonly logRef: { log: PassLog | undefined } }>();
+
+const buildConstantEnv = (scopes: ScopeInfo, logRef: { readonly log: PassLog | undefined }): ConstantEnv => {
+    /** Each node's children in document order, by position: built per parent when an order question reaches it. */
+    const childPositions = new Map<Node, Map<Node, number>>();
     const constants = new Map<Variable, Constant | undefined>();
     const functionBindings = new Map<Variable, FunctionBinding | undefined>();
     const slotArrays = new Map<Variable, SlotArray | undefined>();
@@ -262,27 +262,49 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
         }
         return set.has(statement);
     };
-    const orderOf = (block: Node): BlockOrder => {
-        const cached = orders.get(block);
-        if (cached !== undefined) return cached;
-        const order: BlockOrder = { index: new Map(), declaredIn: new Map(), end: new Map() };
-        let next = 0;
-        /** The nearest function declaration around the nodes being visited (one callback, no closure per node). */
-        let declaration: Node | undefined;
-        const walk = (node: Node): void => {
-            if (ORDERED[node.type]) {
-                order.index.set(node, next++);
-                if (declaration !== undefined) order.declaredIn.set(node, declaration);
-            }
-            const outer = declaration;
-            if (node !== block && node.type === "FunctionDeclaration") declaration = node;
-            forEachChild(node, walk);
-            declaration = outer;
-            if (node.type === "BlockStatement" || node.type === "SwitchCase" || node.type === "StaticBlock") order.end.set(node, next - 1);
-        };
-        walk(block);
-        orders.set(block, order);
-        return order;
+    /** `node`'s ancestors from its parent up to the program (empty for nodes the analysis doesn't know). */
+    const ancestorsOf = (node: Node): Node[] => {
+        const chain: Node[] = [];
+        for (let above = scopes.parentOf(node); above !== undefined; above = scopes.parentOf(above)) chain.push(above);
+        return chain;
+    };
+    /** Whether `node` lies strictly inside `ancestor`. */
+    const isWithin = (ancestor: Node, node: Node): boolean => {
+        for (let above = scopes.parentOf(node); above !== undefined; above = scopes.parentOf(above)) if (above === ancestor) return true;
+        return false;
+    };
+    const positionOf = (parent: Node, child: Node): number => {
+        let positions = childPositions.get(parent);
+        if (positions === undefined) {
+            const found = new Map<Node, number>();
+            forEachChild(parent, (node) => void found.set(node, found.size));
+            positions = found;
+            childPositions.set(parent, positions);
+        }
+        return positions.get(child) ?? -1;
+    };
+    /**
+     * Whether `a` comes before `b` in document order (a depth-first walk in source order, the tree as it now is:
+     * after unflattening, that is execution order). An ancestor comes before what it contains.
+     */
+    const precedes = (a: Node, b: Node): boolean => {
+        if (a === b) return false;
+        const above = ancestorsOf(a);
+        const aChain = [a, ...above];
+        const index = new Map(aChain.map((node, i) => [node, i]));
+        let child = b;
+        for (let parent = scopes.parentOf(b); parent !== undefined; child = parent, parent = scopes.parentOf(parent)) {
+            if (parent === a) return true;
+            const at = index.get(parent);
+            if (at !== undefined) return at > 0 && positionOf(parent, aChain[at - 1] as Node) < positionOf(parent, child);
+        }
+        // `b` contains `a`, or they share no ancestor the analysis knows.
+        return false;
+    };
+    /** The nearest function declaration around `use` inside `block`: hoisted, so callable before what precedes it. */
+    const declarationAround = (block: Node, use: Node): Node | undefined => {
+        for (let above = scopes.parentOf(use); above !== undefined && above !== block; above = scopes.parentOf(above)) if (above.type === "FunctionDeclaration") return above;
+        return undefined;
     };
 
     /** Whether `node` is the global object: `this` where it is (`thisIsGlobal`), or an unresolved global name for it. */
@@ -291,33 +313,32 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
             ? thisIsGlobal
             : node.type === "Identifier" && GLOBAL_OBJECT_NAMES[node.name] === true && scopes.referenceOf(node) !== undefined && scopes.staticVariableOf(node) === undefined;
 
-    /** Parents and spelled names of the whole program, from one walk; built when the first candidate needs them. */
-    let programFacts: ProgramFacts | undefined;
-    const factsOf = (): ProgramFacts => {
-        if (programFacts !== undefined) return programFacts;
-        const facts: ProgramFacts = { parents: new Map(), spelled: new Set(), globalMembers: [] };
-        if (program === undefined) return (programFacts = facts);
-        // One callback for the whole walk (no closure per node): `parent` and `thisIsGlobal` describe the node whose
-        // children are being visited.
-        let parent: Node = program;
+    /** Spelled names and global-object members of the whole program, from one walk when first needed. */
+    let programNames: ProgramNames | undefined;
+    const namesOf = (): ProgramNames => {
+        if (programNames !== undefined) return programNames;
+        const names: ProgramNames = { spelled: new Set(), globalMembers: [] };
+        if (program === undefined) return (programNames = names);
+        // One callback for the whole walk (no closure per node): `thisIsGlobal` describes the node whose children are
+        // being visited (a script's top-level code, no function around it binding its own `this`).
         let thisIsGlobal = program.type === "Program" && program.sourceType === "script";
         const visit = (child: Node): void => {
-            const above = parent;
-            if (PARENT_ASKED[child.type] === true && !(above.type === "MemberExpression" && !above.computed && above.property === child)) facts.parents.set(child, above);
             const name = spelledName(child);
-            if (name !== undefined) facts.spelled.add(name);
-            if (child.type === "MemberExpression" && child.computed && isGlobalObject(child.object, thisIsGlobal)) facts.globalMembers.push(child);
+            if (name !== undefined) names.spelled.add(name);
+            if (child.type === "MemberExpression" && child.computed && isGlobalObject(child.object, thisIsGlobal)) names.globalMembers.push(child);
             const outerThis = thisIsGlobal;
-            parent = child;
             thisIsGlobal = outerThis && BINDS_THIS[child.type] !== true;
             forEachChild(child, visit);
-            parent = above;
             thisIsGlobal = outerThis;
         };
         forEachChild(program, visit);
-        return (programFacts = facts);
+        return (programNames = names);
     };
-    const parentOf = (node: Node): Node | undefined => factsOf().parents.get(node);
+    /** A node's parent; none for the name of `o.name`, which is no reference. */
+    const parentOf = (node: Node): Node | undefined => {
+        const above = scopes.parentOf(node);
+        return above?.type === "MemberExpression" && !above.computed && above.property === node ? undefined : above;
+    };
 
     /**
      * Verdicts of `runsAfter`, per definition: proven ones only (see there). A `false` is always final: assumptions
@@ -331,11 +352,11 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
     let reached: { readonly known: Map<Node, boolean>; readonly declaration: Node }[] = [];
 
     /**
-     * For a constant declared inside a nested statement list rather than directly in its body: the last index of that
-     * list. Control enters a statement list only at its start (no jump lands inside one), so a use after the
-     * declaration and still inside the list runs after it in the same pass through the list.
+     * For a constant declared inside a nested statement list rather than directly in its body: that list. Control
+     * enters a statement list only at its start (no jump lands inside one), so a use after the declaration and still
+     * inside the list runs after it in the same pass through the list.
      */
-    const limits = new Map<Node, number>();
+    const limits = new Map<Node, Node>();
 
     /**
      * `use` runs after `definition`: it comes later in `block`'s document order (within the definition's statement
@@ -345,13 +366,11 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
      * a declaration is in a nested list, whose `limits` its calls from outside don't meet.
      */
     const reachesAfter = (block: Node, definition: Node, use: Node): boolean => {
-        const order = orderOf(block);
-        const at = order.index.get(definition);
-        const position = order.index.get(use);
-        if (at === undefined || position === undefined) return false;
-        const declaration = order.declaredIn.get(use);
+        if (ORDERED[definition.type] !== true || ORDERED[use.type] !== true || !isWithin(block, definition) || !isWithin(block, use)) return false;
+        const declaration = declarationAround(block, use);
         if (declaration !== undefined) return runsAfter(block, definition, declaration);
-        return position > at && position <= (limits.get(definition) ?? Number.POSITIVE_INFINITY);
+        const limit = limits.get(definition);
+        return precedes(definition, use) && (limit === undefined || isWithin(limit, use));
     };
 
     /**
@@ -435,10 +454,10 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
         if (variable.scope.type !== "global") return [];
         const node = variable.identifiers[0] as unknown as Node;
         if (dynamic !== undefined) return [{ reason: "the program uses with or direct eval", node: dynamic.block as unknown as Node }];
-        const facts = factsOf();
-        if (facts.spelled.has(variable.name)) return [{ reason: `the program spells ${variable.name} as a property or a string`, node }];
+        const names = namesOf();
+        if (names.spelled.has(variable.name)) return [{ reason: `the program spells ${variable.name} as a property or a string`, node }];
         const refusals: Refusal[] = [];
-        for (const member of facts.globalMembers) {
+        for (const member of names.globalMembers) {
             const key = evaluate(member.property, env);
             if (key.ok) {
                 if (String(key.value) === variable.name) refusals.push({ reason: `the global object is used with the key ${variable.name}`, node: member });
@@ -467,7 +486,7 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
     const globalSafe = (variable: Variable): boolean | undefined =>
         memo(globalChecks, variable, () => {
             const [refusal] = globalRefusals(variable, false);
-            if (refusal !== undefined) log?.debug(`${variable.name} is not constant: ${refusal.reason}`, refusal.node);
+            if (refusal !== undefined) logRef.log?.debug(`${variable.name} is not constant: ${refusal.reason}`, refusal.node);
             return refusal === undefined;
         });
 
@@ -488,7 +507,7 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
      * statements in order and is only entered at its start, so a pass through it that reaches `after` ran each write
      * once, in order, from the first.
      */
-    const builtDefinition = (variable: Variable): Definition | undefined => {
+    const findDefinition = (variable: Variable): Definition | undefined => {
         const [def] = variable.defs;
         if (def === undefined || (variable.defs.length > 1 && !variable.defs.every((other) => other.type === "Variable" && (other.parent as { kind?: string } | null)?.kind === "var")))
             return undefined;
@@ -520,12 +539,20 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
         if (writes.length < 2) return undefined;
         const list = parentOf(only?.statement as Node);
         if (writes.some((write) => parentOf(write.statement) !== list)) return undefined;
-        const order = orderOf(variable.scope.block as unknown as Node).index;
-        writes.sort((a, b) => (order.get(a.definition) ?? 0) - (order.get(b.definition) ?? 0));
+        writes.sort((a, b) => (precedes(a.definition, b.definition) ? -1 : 1));
         const [first, ...steps] = writes;
         const last = steps.at(-1);
         if (first === undefined || first.operator !== "=" || last === undefined) return undefined;
         return { value: first.value, definition: first.definition, statement: first.statement, steps, after: last.definition };
+    };
+
+    const definitions = new Map<Variable, Definition | undefined>();
+    /** `findDefinition`, once per binding (constants and tables both ask). */
+    const builtDefinition = (variable: Variable): Definition | undefined => {
+        if (definitions.has(variable)) return definitions.get(variable);
+        const found = findDefinition(variable);
+        definitions.set(variable, found);
+        return found;
     };
 
     /** A binding's one value (see `builtDefinition`), when it is written once. */
@@ -541,10 +568,9 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
     const placed = (block: Node, statement: Node, definition: Node): boolean => {
         if (isTopLevel(block, statement)) return true;
         const list = parentOf(statement);
-        const end = list === undefined ? undefined : orderOf(block).end.get(list);
         const listed = list?.type === "SwitchCase" ? list.consequent : list?.type === "BlockStatement" || list?.type === "StaticBlock" ? list.body : [];
-        if (end === undefined || !(listed as readonly Node[]).includes(statement)) return false;
-        limits.set(definition, end);
+        if (list === undefined || !isWithin(block, list) || !(listed as readonly Node[]).includes(statement)) return false;
+        limits.set(definition, list);
         return true;
     };
 
@@ -566,7 +592,7 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
                 result = appended.ok ? binary("+", result.value, appended.value) : FAIL;
             }
             if (!result.ok || globalSafe(variable) !== true) return undefined;
-            if (built.steps.length > 0) log?.debug(`${variable.name} is written ${built.steps.length + 1} times in one statement list: constant after the last`, built.after);
+            if (built.steps.length > 0) logRef.log?.debug(`${variable.name} is written ${built.steps.length + 1} times in one statement list: constant after the last`, built.after);
             return { value: result.value, after: built.after };
         });
 
@@ -778,7 +804,7 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
      */
     const tableRefusals = (variable: Variable, id: Node, table: Table): Refusal[] => {
         if (hasWith) return [{ reason: "the program uses with", node: id }];
-        const all = log?.debugging === true;
+        const all = logRef.log?.debugging === true;
         const saved = validating;
         validating = { variable, table };
         try {
@@ -804,9 +830,9 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
             if (definition === undefined || elements === undefined || !elements.some((element) => element.ok)) return undefined;
             const table: Table = { elements, after: definition.after, block: variable.scope.block as unknown as Node };
             const refusals = tableRefusals(variable, definition.id, table);
-            for (const refusal of refusals) log?.debug(`array ${variable.name} is not constant: ${refusal.reason}`, refusal.node);
+            for (const refusal of refusals) logRef.log?.debug(`array ${variable.name} is not constant: ${refusal.reason}`, refusal.node);
             if (refusals.length > 0) return undefined;
-            log?.debug(`array ${variable.name} is constant (${elements.length} elements)`, definition.after);
+            logRef.log?.debug(`array ${variable.name} is constant (${elements.length} elements)`, definition.after);
             return table;
         });
 
@@ -884,7 +910,7 @@ export const constantEnv = (scopes: ScopeInfo, log?: PassLog): ConstantEnv => {
         return tableRead(node);
     };
 
-    const env: ConstantEnv = { ...globalsEnv(scopes), lookup, functionAt };
+    const env: ConstantEnv = { ...globalsEnv(scopes), lookup, functionAt, onlyByName: (variable) => globalSafe(variable) === true };
     return env;
 };
 
