@@ -44,3 +44,11 @@ coverage/
 
 # TypeScript cache
 *.tsbuildinfo
+
+# Analysis material, samples, tests and scripts (never in an image)
+.compare/
+.corpus/
+test/
+tests/
+**/*.test.ts
+scripts/
