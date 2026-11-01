@@ -268,35 +268,7 @@ export const controlFlowUnflattener = {
                 }
                 console.log(`   |-> Found ${caseMap.size} switch cases`);
 
-                function distributeMemberOverConditional(node) {
-                    const indices = [];
-                    let cur = node;
-                    while (
-                        t.isMemberExpression(cur) &&
-                        cur.computed &&
-                        t.isNumericLiteral(cur.property)
-                    ) {
-                        indices.unshift(cur.property);
-                        cur = cur.object;
-                    }
-                    if (!t.isConditionalExpression(cur)) return node;
-
-                    const applyIndices = (branch) =>
-                        indices.reduce((acc, idx) => t.memberExpression(acc, idx, true), branch);
-
-                    return t.conditionalExpression(
-                        cur.test,
-                        applyIndices(cur.consequent),
-                        applyIndices(cur.alternate)
-                    );
-                }
-
                 function getStateUpdateRhs(body) {
-                    const rhs = findStateUpdateRhs(body);
-                    return t.isMemberExpression(rhs) ? distributeMemberOverConditional(rhs) : rhs;
-                }
-
-                function findStateUpdateRhs(body) {
                     const lastStmt = body.length > 0 ? body[body.length - 1] : null;
                     if (!lastStmt) return null;
                     if (t.isExpressionStatement(lastStmt)) {
@@ -330,270 +302,366 @@ export const controlFlowUnflattener = {
                     return null;
                 }
 
-                function doesPathLeadTo(startId, targetId, visited, recursionStack) {
-                    if (startId === targetId) return true;
-                    if (visited.has(startId) || startId === terminalId) return false;
-                    if (recursionStack && recursionStack.has(startId)) return false;
-                    visited.add(startId);
-                    const body = caseMap.get(startId);
-                    if (!body) return false;
-                    const stateUpdateRhs = getStateUpdateRhs(body);
-                    if (!stateUpdateRhs) return false;
-                    const nextStateInfo = resolveAndGetStateId(stateUpdateRhs);
-                    if (nextStateInfo.id !== null) {
-                        return doesPathLeadTo(nextStateInfo.id, targetId, visited, recursionStack);
-                    } else if (t.isConditionalExpression(stateUpdateRhs)) {
-                        const consequentInfo = resolveAndGetStateId(stateUpdateRhs.consequent);
-                        const alternateInfo = resolveAndGetStateId(stateUpdateRhs.alternate);
-                        if (consequentInfo.id === null || alternateInfo.id === null) return false;
-                        const consequentPath = doesPathLeadTo(
-                            consequentInfo.id,
-                            targetId,
-                            new Set(visited),
-                            recursionStack
-                        );
-                        const alternatePath = doesPathLeadTo(
-                            alternateInfo.id,
-                            targetId,
-                            new Set(visited),
-                            recursionStack
-                        );
-                        return consequentPath || alternatePath;
+                const EXIT = Symbol('EXIT');
+
+                function splitOffStateUpdate(caseBody, stateUpdateRhs) {
+                    const lastStmt = caseBody[caseBody.length - 1];
+                    const withoutUpdate = caseBody.slice(0, -1);
+                    if (
+                        t.isExpressionStatement(lastStmt) &&
+                        t.isSequenceExpression(lastStmt.expression)
+                    ) {
+                        const expressions = lastStmt.expression.expressions.slice(0, -1);
+                        withoutUpdate.push(...expressions.map((e) => t.expressionStatement(e)));
+                    } else if (
+                        t.isVariableDeclaration(lastStmt) &&
+                        lastStmt.declarations.length > 1
+                    ) {
+                        const newDeclarators = lastStmt.declarations.slice(0, -1);
+                        withoutUpdate.push(t.variableDeclaration(lastStmt.kind, newDeclarators));
                     }
-                    return false;
+                    return withoutUpdate;
                 }
 
-                function getSuccessorIds(id, recursionStack) {
-                    if (id === terminalId) return [];
-                    if (recursionStack && recursionStack.has(id)) return [];
-                    const body = caseMap.get(id);
-                    if (!body) return [];
-                    const stateUpdateRhs = getStateUpdateRhs(body);
-                    if (!stateUpdateRhs) return [];
-                    const info = resolveAndGetStateId(stateUpdateRhs);
-                    if (info.id !== null) return [info.id];
-                    const result = [];
-                    if (t.isConditionalExpression(stateUpdateRhs)) {
-                        const consequent = resolveAndGetStateId(stateUpdateRhs.consequent);
-                        const alternate = resolveAndGetStateId(stateUpdateRhs.alternate);
-                        if (consequent.id !== null) result.push(consequent.id);
-                        if (alternate.id !== null) result.push(alternate.id);
-                    }
-                    return result;
-                }
-
-                function reachableInBfsOrder(start, recursionStack) {
-                    const order = [start];
-                    const seen = new Set(order);
-                    for (let i = 0; i < order.length; i++) {
-                        for (const next of getSuccessorIds(order[i], recursionStack)) {
-                            if (!seen.has(next)) {
-                                seen.add(next);
-                                order.push(next);
-                            }
-                        }
-                    }
-                    return order;
-                }
-
-                function endsInReturn(id) {
-                    const body = caseMap.get(id);
-                    return !!body && body.length > 0 && t.isReturnStatement(body[body.length - 1]);
-                }
-
-                // Every path from startId must hit candidateId before it can fall through
-                // past the if. Return cases leave the function, so they never fall through;
-                // the terminal state and back-edges (recursionStack) do.
-                function postDominates(candidateId, startId, recursionStack) {
-                    const seen = new Set();
-                    const stack = [startId];
-                    while (stack.length) {
-                        const id = stack.pop();
-                        if (id === candidateId || seen.has(id)) continue;
-                        seen.add(id);
-                        const successors = getSuccessorIds(id, recursionStack);
-                        if (successors.length === 0) {
-                            if (id === terminalId || recursionStack.has(id) || !endsInReturn(id)) {
-                                return false;
-                            }
+                function buildCfg() {
+                    const cfg = new Map();
+                    const asTarget = (id) => (id === terminalId ? EXIT : id);
+                    for (const [id, caseBody] of caseMap) {
+                        const lastStmt = caseBody.length > 0 ? caseBody[caseBody.length - 1] : null;
+                        if (t.isReturnStatement(lastStmt)) {
+                            cfg.set(id, { kind: 'return', body: caseBody });
                             continue;
                         }
-                        stack.push(...successors);
+                        const stateUpdateRhs = getStateUpdateRhs(caseBody);
+                        if (!stateUpdateRhs) {
+                            cfg.set(id, { kind: 'invalid', body: caseBody });
+                            continue;
+                        }
+                        const body = splitOffStateUpdate(caseBody, stateUpdateRhs);
+                        const nextInfo = resolveAndGetStateId(stateUpdateRhs);
+                        if (nextInfo.id !== null) {
+                            cfg.set(id, { kind: 'jump', body, nextId: asTarget(nextInfo.id) });
+                            continue;
+                        }
+                        if (t.isConditionalExpression(stateUpdateRhs)) {
+                            const trueInfo = resolveAndGetStateId(stateUpdateRhs.consequent);
+                            const falseInfo = resolveAndGetStateId(stateUpdateRhs.alternate);
+                            if (trueInfo.id === null || falseInfo.id === null) {
+                                cfg.set(id, { kind: 'invalid', body });
+                                continue;
+                            }
+                            cfg.set(id, {
+                                kind: 'branch',
+                                body,
+                                test: stateUpdateRhs.test,
+                                trueId: asTarget(trueInfo.id),
+                                falseId: asTarget(falseInfo.id),
+                            });
+                            continue;
+                        }
+
+                        cfg.set(id, { kind: 'invalid', body });
                     }
-                    return true;
+                    return cfg;
                 }
 
-                function findMergePoint(caseA, caseB, recursionStack) {
-                    if (caseA === caseB) return caseA;
-                    const reachableFromB = new Set(reachableInBfsOrder(caseB, recursionStack));
-                    for (const id of reachableInBfsOrder(caseA, recursionStack)) {
-                        if (
-                            reachableFromB.has(id) &&
-                            postDominates(id, caseA, recursionStack) &&
-                            postDominates(id, caseB, recursionStack)
-                        ) {
-                            return id;
+                function successorsOf(id, cfg) {
+                    const node = cfg.get(id);
+                    if (!node) return [];
+                    if (node.kind === 'return') return [EXIT];
+                    if (node.kind === 'jump') return [node.nextId];
+                    if (node.kind === 'branch') return [node.trueId, node.falseId];
+                    return [];
+                }
+
+                function buildGraphMaps(cfg) {
+                    const nodeIds = [...cfg.keys()];
+                    const succMap = new Map();
+                    const predMap = new Map();
+                    for (const id of [...nodeIds, EXIT]) {
+                        succMap.set(id, []);
+                        predMap.set(id, []);
+                    }
+                    for (const id of nodeIds) {
+                        const succs = successorsOf(id, cfg);
+                        succMap.set(id, succs);
+                        for (const s of succs) predMap.get(s).push(id);
+                    }
+                    return { succMap, predMap };
+                }
+
+                function computeDominators(entry, getSuccessors) {
+                    const order = [];
+                    const visited = new Set();
+                    (function dfs(id) {
+                        visited.add(id);
+                        for (const s of getSuccessors(id)) {
+                            if (!visited.has(s)) dfs(s);
+                        }
+                        order.push(id);
+                    })(entry);
+                    order.reverse();
+
+                    const index = new Map(order.map((id, i) => [id, i]));
+                    const preds = new Map(order.map((id) => [id, []]));
+                    for (const id of order) {
+                        for (const s of getSuccessors(id)) {
+                            if (preds.has(s)) preds.get(s).push(id);
                         }
                     }
-                    return null;
+
+                    const idom = new Map([[entry, entry]]);
+                    function intersect(a, b) {
+                        while (a !== b) {
+                            while (index.get(a) > index.get(b)) a = idom.get(a);
+                            while (index.get(b) > index.get(a)) b = idom.get(b);
+                        }
+                        return a;
+                    }
+
+                    let changed = true;
+                    while (changed) {
+                        changed = false;
+                        for (const id of order) {
+                            if (id === entry) continue;
+                            const ps = preds.get(id).filter((p) => idom.has(p));
+                            if (!ps.length) continue;
+                            let newIdom = ps[0];
+                            for (const p of ps.slice(1)) newIdom = intersect(newIdom, p);
+                            if (idom.get(id) !== newIdom) {
+                                idom.set(id, newIdom);
+                                changed = true;
+                            }
+                        }
+                    }
+                    return idom;
+                }
+
+                function dominates(a, b, idom) {
+                    if (!idom.has(b)) return false;
+                    let cur = b;
+                    while (true) {
+                        if (cur === a) return true;
+                        const next = idom.get(cur);
+                        if (next === cur) return false;
+                        cur = next;
+                    }
+                }
+
+                function computeLoops(nodeIds, succMap, predMap, fwdIdom) {
+                    const latchesByHeader = new Map();
+                    for (const u of nodeIds) {
+                        for (const v of succMap.get(u)) {
+                            if (v === EXIT) continue;
+                            if (dominates(v, u, fwdIdom)) {
+                                if (!latchesByHeader.has(v)) latchesByHeader.set(v, new Set());
+                                latchesByHeader.get(v).add(u);
+                            }
+                        }
+                    }
+                    const loopInfo = new Map();
+                    for (const [header, latches] of latchesByHeader) {
+                        const loopSet = new Set([header, ...latches]);
+                        const worklist = [...latches];
+                        while (worklist.length) {
+                            const n = worklist.pop();
+                            for (const p of predMap.get(n)) {
+                                if (!loopSet.has(p)) {
+                                    loopSet.add(p);
+                                    worklist.push(p);
+                                }
+                            }
+                        }
+                        loopInfo.set(header, { nodes: loopSet, latches: Array.from(latches) });
+                    }
+                    return loopInfo;
+                }
+
+                const cfg = buildCfg();
+                const { succMap, predMap } = buildGraphMaps(cfg);
+                const nodeIds = [...cfg.keys()];
+
+                let fwdIdom = new Map();
+                let ipdom = new Map();
+                let loopInfo = new Map();
+                if (cfg.has(initialId)) {
+                    fwdIdom = computeDominators(initialId, (id) => succMap.get(id) || []);
+                    ipdom = computeDominators(EXIT, (id) => predMap.get(id) || []);
+                    loopInfo = computeLoops(nodeIds, succMap, predMap, fwdIdom);
                 }
 
                 let success = true;
                 const hoistedVars = new Set();
                 const memo = new Map();
+                const inProgress = new Set();
 
-                function unflatten(currentId, recursionStack, stopId = null) {
-                    if (currentId === terminalId) return [];
-                    if (stopId !== null && currentId === stopId) return [];
-                    if (memo.has(currentId) && memo.get(currentId).has(stopId)) {
-                        return memo.get(currentId).get(stopId);
+                function structure(id, stopId) {
+                    if (id === EXIT || id === stopId) return [];
+                    if (memo.has(id) && memo.get(id).has(stopId)) {
+                        return memo.get(id).get(stopId);
                     }
-                    if (recursionStack.has(currentId)) {
-                        return [];
-                    }
-                    const caseBody = caseMap.get(currentId);
-                    if (!caseBody) {
-                        success = false;
-                        return null;
-                    }
-                    const newRecursionStack = new Set(recursionStack);
-                    newRecursionStack.add(currentId);
-                    const lastStmtInCase =
-                        caseBody.length > 0 ? caseBody[caseBody.length - 1] : null;
-
-                    if (t.isReturnStatement(lastStmtInCase)) {
-                        const result = processVarDeclarations(caseBody, hoistedVars);
-                        if (!memo.has(currentId)) memo.set(currentId, new Map());
-                        memo.get(currentId).set(stopId, result);
-                        return result;
-                    }
-                    let stateUpdateRhs = getStateUpdateRhs(caseBody);
-                    let bodyWithoutUpdate = caseBody;
-                    if (stateUpdateRhs) {
-                        const lastStmt = caseBody[caseBody.length - 1];
-                        bodyWithoutUpdate = caseBody.slice(0, -1);
-                        if (
-                            t.isExpressionStatement(lastStmt) &&
-                            t.isSequenceExpression(lastStmt.expression)
-                        ) {
-                            const expressions = lastStmt.expression.expressions.slice(0, -1);
-                            bodyWithoutUpdate.push(
-                                ...expressions.map((e) => t.expressionStatement(e))
-                            );
-                        } else if (
-                            t.isVariableDeclaration(lastStmt) &&
-                            lastStmt.declarations.length > 1
-                        ) {
-                            const newDeclarators = lastStmt.declarations.slice(0, -1);
-                            bodyWithoutUpdate.push(
-                                t.variableDeclaration(lastStmt.kind, newDeclarators)
-                            );
-                        }
-                    }
-                    const processedBody = processVarDeclarations(bodyWithoutUpdate, hoistedVars);
-                    let result;
-                    if (!stateUpdateRhs) {
+                    if (inProgress.has(id)) {
                         success = false;
                         return null;
                     }
 
-                    const nextStateInfo = resolveAndGetStateId(stateUpdateRhs);
-                    if (nextStateInfo.id !== null) {
-                        const nextBlock = unflatten(nextStateInfo.id, newRecursionStack, stopId);
-                        if (!success) return null;
-                        result = [...processedBody, ...nextBlock];
-                    } else if (t.isConditionalExpression(stateUpdateRhs)) {
-                        const { test, consequent, alternate } = stateUpdateRhs;
-                        const trueBranchInfo = resolveAndGetStateId(consequent);
-                        const falseBranchInfo = resolveAndGetStateId(alternate);
-                        if (trueBranchInfo.id === null || falseBranchInfo.id === null) {
-                            success = false;
-                            return null;
-                        }
-
-                        if (trueBranchInfo.id === currentId) {
-                            const loopBody = t.blockStatement(processedBody);
-                            const doWhileLoop = t.doWhileStatement(test, loopBody);
-                            const afterLoopBody = unflatten(falseBranchInfo.id, newRecursionStack, stopId);
-                            if (!success) return null;
-                            result = [doWhileLoop, ...afterLoopBody];
-                        } else if (falseBranchInfo.id === currentId) {
-                            const loopBody = t.blockStatement(processedBody);
-                            const negatedTest = t.unaryExpression('!', test, true);
-                            const doWhileLoop = t.doWhileStatement(negatedTest, loopBody);
-                            const afterLoopBody = unflatten(trueBranchInfo.id, newRecursionStack, stopId);
-                            if (!success) return null;
-                            result = [doWhileLoop, ...afterLoopBody];
-                        } else {
-                            const isWhileLoop = doesPathLeadTo(
-                                trueBranchInfo.id,
-                                currentId,
-                                new Set(),
-                                recursionStack
-                            );
-                            if (isWhileLoop) {
-                                const loopBodyNodes = unflatten(
-                                    trueBranchInfo.id,
-                                    newRecursionStack,
-                                    null
-                                );
-                                if (!success) return null;
-                                const afterLoopNodes = unflatten(
-                                    falseBranchInfo.id,
-                                    newRecursionStack,
-                                    stopId
-                                );
-                                if (!success) return null;
-                                const whileLoop = t.whileStatement(
-                                    test,
-                                    t.blockStatement(loopBodyNodes)
-                                );
-                                result = [...processedBody, whileLoop, ...afterLoopNodes];
-                            } else {
-                                const joinId = findMergePoint(
-                                    trueBranchInfo.id,
-                                    falseBranchInfo.id,
-                                    recursionStack
-                                );
-                                const branchStopId = joinId !== null ? joinId : stopId;
-                                const trueBranchBody = unflatten(
-                                    trueBranchInfo.id,
-                                    newRecursionStack,
-                                    branchStopId
-                                );
-                                const falseBranchBody = unflatten(
-                                    falseBranchInfo.id,
-                                    newRecursionStack,
-                                    branchStopId
-                                );
-                                if (!success) return null;
-                                const ifStatement = t.ifStatement(
-                                    test,
-                                    t.blockStatement(trueBranchBody),
-                                    falseBranchBody.length > 0
-                                        ? falseBranchBody.length === 1 && t.isIfStatement(falseBranchBody[0])
-                                            ? falseBranchBody[0]
-                                            : t.blockStatement(falseBranchBody)
-                                        : null
-                                );
-                                const tailNodes =
-                                    joinId !== null
-                                        ? unflatten(joinId, newRecursionStack, stopId)
-                                        : [];
-                                if (!success) return null;
-                                result = [...processedBody, ifStatement, ...tailNodes];
-                            }
-                        }
-                    } else {
+                    const node = cfg.get(id);
+                    if (!node || node.kind === 'invalid') {
                         success = false;
                         return null;
                     }
-                    if (!memo.has(currentId)) memo.set(currentId, new Map());
-                    memo.get(currentId).set(stopId, result);
+
+                    inProgress.add(id);
+                    const result = buildNode(id, node, stopId);
+                    inProgress.delete(id);
+                    if (!success) return null;
+                    if (!memo.has(id)) memo.set(id, new Map());
+                    memo.get(id).set(stopId, result);
                     return result;
                 }
 
-                const unflattenedBody = unflatten(initialId, new Set(), null);
+                function buildNode(id, node, stopId) {
+                    const body = processVarDeclarations(node.body, hoistedVars);
+
+                    if (node.kind === 'return') {
+                        return body;
+                    }
+
+                    const loopData = loopInfo.get(id);
+                    if (loopData) {
+                        const { nodes: loopSet, latches } = loopData;
+
+                        if (node.kind === 'branch') {
+                            const trueIn = loopSet.has(node.trueId);
+                            const falseIn = loopSet.has(node.falseId);
+                            let entryId, exitId, testExpr;
+                            if (trueIn && !falseIn) {
+                                entryId = node.trueId;
+                                exitId = node.falseId;
+                                testExpr = node.test;
+                            } else if (falseIn && !trueIn) {
+                                entryId = node.falseId;
+                                exitId = node.trueId;
+                                testExpr = t.unaryExpression('!', node.test, true);
+                            } else {
+                                success = false;
+                                return null;
+                            }
+
+                            if (entryId === id) {
+                                const doWhileLoop = t.doWhileStatement(testExpr, t.blockStatement(body));
+                                const rest = structure(exitId, stopId);
+                                if (!success) return null;
+                                return [doWhileLoop, ...rest];
+                            } else {
+                                let updateExpr = null;
+                                let latchId = null;
+                                if (latches.length === 1) {
+                                    latchId = latches[0];
+                                    const latchNode = cfg.get(latchId);
+                                    if (latchNode && latchNode.kind === 'jump' && latchNode.body.length === 1) {
+                                        const stmt = latchNode.body[0];
+                                        if (t.isExpressionStatement(stmt)) {
+                                            const expr = stmt.expression;
+                                            if (t.isUpdateExpression(expr) || t.isAssignmentExpression(expr)) {
+                                                updateExpr = expr;
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (updateExpr && latchId !== null) {
+                                    const loopBodyNodes = structure(entryId, latchId);
+                                    if (!success) return null;
+                                    const rest = structure(exitId, stopId);
+                                    if (!success) return null;
+                                    const forLoop = t.forStatement(null, testExpr, updateExpr, t.blockStatement(loopBodyNodes));
+                                    return [...body, forLoop, ...rest];
+                                } else {
+                                    const loopBodyNodes = structure(entryId, id);
+                                    if (!success) return null;
+                                    const rest = structure(exitId, stopId);
+                                    if (!success) return null;
+                                    const whileLoop = t.whileStatement(testExpr, t.blockStatement(loopBodyNodes));
+                                    return [...body, whileLoop, ...rest];
+                                }
+                            }
+                        } else if (node.kind === 'jump') {
+                            if (latches.length !== 1) {
+                                success = false;
+                                return null;
+                            }
+                            const latchId = latches[0];
+                            const latchNode = cfg.get(latchId);
+
+                            if (!latchNode || latchNode.kind !== 'branch') {
+                                success = false;
+                                return null;
+                            }
+
+                            let exitId, testExpr;
+                            if (latchNode.trueId === id) {
+                                exitId = latchNode.falseId;
+                                testExpr = latchNode.test;
+                            } else if (latchNode.falseId === id) {
+                                exitId = latchNode.trueId;
+                                testExpr = t.unaryExpression('!', latchNode.test, true);
+                            } else {
+                                success = false;
+                                return null;
+                            }
+
+                            const middleNodes = structure(node.nextId, latchId);
+                            if (!success) return null;
+
+                            const latchBody = processVarDeclarations(latchNode.body, hoistedVars);
+
+                            const doWhileBody = t.blockStatement([...body, ...middleNodes, ...latchBody]);
+                            const doWhileLoop = t.doWhileStatement(testExpr, doWhileBody);
+
+                            const rest = structure(exitId, stopId);
+                            if (!success) return null;
+
+                            return [doWhileLoop, ...rest];
+                        }
+                    }
+
+                    if (node.kind === 'jump') {
+                        if (node.nextId === EXIT && stopId !== null) {
+                            return [...body, t.breakStatement()];
+                        }
+                        const rest = structure(node.nextId, stopId);
+                        if (!success) return null;
+                        return [...body, ...rest];
+                    }
+
+                    let joinId = ipdom.has(id) ? ipdom.get(id) : null;
+                    if (joinId === EXIT || joinId === stopId) {
+                        joinId = null;
+                    }
+                    const branchStopId = joinId !== null ? joinId : stopId;
+                    const trueBranchBody = structure(node.trueId, branchStopId);
+                    const falseBranchBody = structure(node.falseId, branchStopId);
+                    if (!success) return null;
+
+                    let alternateNode = null;
+                    if (falseBranchBody.length === 1 && t.isIfStatement(falseBranchBody[0])) {
+                        alternateNode = falseBranchBody[0];
+                    } else if (falseBranchBody.length > 0) {
+                        alternateNode = t.blockStatement(falseBranchBody);
+                    }
+                    const ifStatement = t.ifStatement(
+                        node.test,
+                        t.blockStatement(trueBranchBody),
+                        alternateNode
+                    );
+                    const tailNodes = joinId !== null ? structure(joinId, stopId) : [];
+                    if (!success) return null;
+                    return [...body, ifStatement, ...tailNodes];
+                }
+
+                const unflattenedBody =
+                    cfg.has(initialId) ? structure(initialId, null) : null;
 
                 if (success && unflattenedBody) {
                     const newNodes = [];
