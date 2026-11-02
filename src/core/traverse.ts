@@ -1,5 +1,6 @@
 import { visitorKeys } from "oxc-parser";
 import type { Node } from "./ast.js";
+import { isFunctionNode } from "./ast.js";
 import { spliceList } from "./list.js";
 
 type Container = Record<string, unknown>;
@@ -175,6 +176,19 @@ const WALK_SLOTS = compileSlots<(node: Node, parentPath: Path, depth: number, li
 
 export const forEachChild = (node: Node, fn: (child: Node) => void): void => {
     EACH_CHILD[node.type]?.(node, fn);
+};
+
+/**
+ * Pre-order over `root` and its descendants, not entering functions: a function node (`root` too) isn't visited.
+ * `enter` returning `false` skips the node's children; `leave` runs after the children of each node entered.
+ */
+export const walkSkippingFunctions = (root: Node, enter: (node: Node) => boolean, leave?: (node: Node) => void): void => {
+    const walk = (node: Node): void => {
+        if (isFunctionNode(node) || !enter(node)) return;
+        EACH_CHILD[node.type]?.(node, walk);
+        leave?.(node);
+    };
+    walk(root);
 };
 
 /** The input nests deeper than the walk's stack allows: the file fails (closed) with this instead of a bare RangeError. */

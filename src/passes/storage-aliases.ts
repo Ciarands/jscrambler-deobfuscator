@@ -1,4 +1,4 @@
-import type { ArrowFunctionExpression, Function as FunctionNode, Node, Statement, VariableDeclaration, VariableDeclarator } from "../core/ast.js";
+import type { FunctionLike, Node, Statement, VariableDeclaration, VariableDeclarator } from "../core/ast.js";
 import { identifier } from "../core/build.js";
 import type { PassLog } from "../core/log.js";
 import type { Reference, ScopeInfo, Variable } from "../core/scope.js";
@@ -6,8 +6,6 @@ import { traverse } from "../core/traverse.js";
 import type { RuntimeModel } from "./emulate/model.js";
 import type { StorageMatcher } from "./emulate/storage.js";
 import { rootStatements } from "./emulate/storage.js";
-
-type FunctionLike = FunctionNode | ArrowFunctionExpression;
 
 const asFunction = (node: Node): FunctionLike | undefined => (node.type === "FunctionExpression" || node.type === "FunctionDeclaration" || node.type === "ArrowFunctionExpression" ? node : undefined);
 
@@ -68,12 +66,11 @@ const aliasOf = (variable: Variable, storage: Variable, scopes: ScopeInfo): Alia
     return { kind: "declared", fn, index, quietStart, declaration, declarator };
 };
 
-/** Whether `name`, written where `reference` is, names `binding`: the first scope out that declares it, no `with` on the way. */
-const namesBindingAt = (reference: Reference, name: string, binding: Variable): boolean => {
+/** Whether `name`, written where `reference` is, names `binding`: the first scope out that binds it, no `with` on the way. */
+const namesBindingAt = (reference: Reference, name: string, binding: Variable, scopes: ScopeInfo): boolean => {
     for (let scope = reference.from as Reference["from"] | null; scope !== null; scope = scope.upper) {
         if (scope.type === "with") return false;
-        const variable = scope.set.get(name);
-        if (variable !== undefined) return variable === binding;
+        if (scopes.bindsName(scope, name)) return scope.set.get(name) === binding;
     }
     return false;
 };
@@ -155,7 +152,7 @@ export const inlineStorageAliases = (runtime: RuntimeModel, matcher: StorageMatc
             const parent = path.parent;
             const reason =
                 tooEarly(alias, frames) ??
-                (namesBindingAt(read.reference, runtime.storage, storage) ? undefined : `${runtime.storage} names another binding here`) ??
+                (namesBindingAt(read.reference, runtime.storage, storage, scopes) ? undefined : `${runtime.storage} names another binding here`) ??
                 (parent?.type === "Property" && parent.shorthand ? "it is a shorthand property" : undefined);
             if (reason !== undefined) {
                 kept.set(reason, (kept.get(reason) ?? 0) + 1);

@@ -1,15 +1,16 @@
-import type { CallExpression, IdentifierReference, Node } from "../core/ast.js";
+import type { CallExpression, FunctionLike, IdentifierReference, Node } from "../core/ast.js";
 import { isFunctionNode } from "../core/ast.js";
 import { valueToNode } from "../core/build.js";
 import { GLOBALS } from "../core/builtins.js";
-import type { ConstantEnv, FunctionLike } from "../core/constants.js";
+import type { ConstantEnv } from "../core/constants.js";
 import { constantEnv } from "../core/constants.js";
 import type { Value } from "../core/evaluate.js";
 import { evaluate } from "../core/evaluate.js";
 import type { OuterBinding } from "../core/interpret.js";
 import { argumentsKey, Interpreter } from "../core/interpret.js";
 import type { PassLog } from "../core/log.js";
-import type { Scope, ScopeInfo, Variable } from "../core/scope.js";
+import type { ScopeInfo, Variable } from "../core/scope.js";
+import { scopeWithin } from "../core/scope.js";
 import { replaceNodes, traverse } from "../core/traverse.js";
 import { factKey } from "../pipeline/facts.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
@@ -23,7 +24,7 @@ const VALUE_NAMES: ReadonlySet<string> = new Set(["undefined", "NaN", "Infinity"
  * runs later (`yield`, `await`, classes), `try` (could catch a strict-mode error the sloppy program ignores), `with`,
  * tagged templates (strings object cached per site), `debugger`. The interpreter refuses more as it meets it.
  */
-const ALLOWED: ReadonlySet<string> = new Set([
+const CALL_PURITY_NODES: ReadonlySet<string> = new Set([
     "BlockStatement",
     "ExpressionStatement",
     "VariableDeclaration",
@@ -80,16 +81,11 @@ type Proof = { readonly ok: true } | { readonly ok: false; readonly reason: stri
 
 const PROVEN: Proof = { ok: true };
 
-const isWithin = (scope: Scope | null, fn: Node): boolean => {
-    for (let current = scope; current !== null; current = current.upper) if ((current.block as unknown as Node) === fn) return true;
-    return false;
-};
-
 /**
  * Proves functions pure: with primitive arguments, the result depends only on them and nothing outliving the call
  * changes, so the interpreter's answer is the program's.
  *
- * Rules: only `ALLOWED` node types; no async/generator (code runs after the call returns); no `**` (approximated);
+ * Rules: only `CALL_PURITY_NODES` types; no async/generator (code runs after the call returns); no `**` (approximated);
  * function declarations only directly in a function body (block ones bind differently in strict mode). Names are its
  * own, `constantEnv` constants (read only), functions pure themselves and fixed where named (`functionAt`), or
  * modelled globals (`GLOBALS`, read only); not `arguments` (sloppy `arguments` aliases parameters).
@@ -102,7 +98,7 @@ const isWithin = (scope: Scope | null, fn: Node): boolean => {
  * Mutual recursion is proven coinductively: a function whose proof is running is assumed pure; results under an
  * assumption are kept once it is proven, dropped otherwise.
  */
-class PurityProver {
+class CallPurityProver {
     readonly #scopes: ScopeInfo;
     readonly #env: ConstantEnv;
     readonly #log: PassLog;
@@ -164,7 +160,7 @@ class PurityProver {
     }
 
     #nodeImpurity(node: Node, parent: Node | null, grandparent: Node | null, key: string | null, root: FunctionLike): string | undefined {
-        if (!ALLOWED.has(node.type)) return `it uses ${node.type}`;
+        if (!CALL_PURITY_NODES.has(node.type)) return `it uses ${node.type}`;
         switch (node.type) {
             case "FunctionDeclaration":
             case "FunctionExpression":
@@ -190,7 +186,7 @@ class PurityProver {
         if (parent?.type === "LabeledStatement" || parent?.type === "BreakStatement" || parent?.type === "ContinueStatement") return undefined;
         const reference = this.#scopes.referenceOf(node);
         const variable = reference === undefined ? undefined : this.#scopes.staticVariableOf(node);
-        if (variable !== undefined && !(name === "arguments" && variable.defs.length === 0) && isWithin(variable.scope, root)) return undefined;
+        if (variable !== undefined && !(name === "arguments" && variable.defs.length === 0) && scopeWithin(variable.scope, root)) return undefined;
         const binding = this.outer(node);
         if (binding === OWN) return undefined;
         if (typeof binding === "string") return binding;
@@ -208,7 +204,7 @@ class PurityProver {
         if (reference === undefined) {
             if (scopes.variableOf(node) !== undefined) return OWN;
             // An identifier a pass made since the analysis (`undefined` for `void 0`).
-            if (VALUE_NAMES.has(name) && !scopes.declaresName(name)) return { global: name };
+            if (VALUE_NAMES.has(name) && scopes.namesGlobal(node)) return { global: name };
             return `it names ${name}, which the analysis doesn't know`;
         }
         const variable = scopes.staticVariableOf(node);
@@ -259,7 +255,7 @@ export const pureCalls: Pass = {
         }
         const { decided, logged } = state;
         const env = constantEnv(scopes, log);
-        const prover = new PurityProver(scopes, env, log);
+        const prover = new CallPurityProver(scopes, env, log);
         const counts = { resolved: 0, strings: 0, characters: 0, kept: 0 };
         const keep = (reason: string, node: Node, final: boolean): void => {
             if (final) {

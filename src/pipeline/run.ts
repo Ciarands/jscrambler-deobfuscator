@@ -69,7 +69,7 @@ export const runPipeline = async (program: Program, steps: readonly PipelineStep
         return scope;
     };
 
-    const runPass = async (pass: Pass, group?: { name: string; round: number }): Promise<PassReport> => {
+    const runPass = async (pass: Pass, group?: { name: string; round: number }): Promise<{ report: PassReport; settled: boolean }> => {
         const log = createPassLog(pass.name, options.logger, options.source);
         const start = performance.now();
         const result = await pass.run({
@@ -100,7 +100,7 @@ export const runPipeline = async (program: Program, steps: readonly PipelineStep
         options.logger.info(`[${pass.name}] ${report.changed} change(s) in ${report.durationMs.toFixed(0)}ms${where}${stats ? `: ${stats}` : ""}`);
         reports.push(report);
         options.afterPass?.(report, program);
-        return report;
+        return { report, settled: result.settled === true };
     };
 
     try {
@@ -109,8 +109,13 @@ export const runPipeline = async (program: Program, steps: readonly PipelineStep
                 await runPass(step);
                 continue;
             }
-            // A pass whose last run changed nothing, with nothing changed since, would change nothing again: passes
-            // are deterministic, and facts only change outside groups (emulate).
+            // A pass whose last run changed nothing (or that settled), with nothing changed since, would change nothing
+            // again: passes are deterministic in the tree and the facts they read, and no fact written inside a group
+            // changes another pass's input between its runs. Such facts are a pass's memo of its own work, read only by
+            // it (LOCK_PROBES, RESOLUTION, DECIDED, SPENT), or set once before its reader runs (DECODER_PROOF, on
+            // resolve-calls' first walk, which comes before cleanup's first run in any pipeline, as resolve-calls precedes
+            // cleanup in its group); `onReplace` updates come with a change. A fact one pass sets in a group for another to
+            // read would break this skip.
             let version = 0;
             const quietAt = new Map<Pass, number>();
             let round = 1;
@@ -118,13 +123,10 @@ export const runPipeline = async (program: Program, steps: readonly PipelineStep
                 let changed = 0;
                 for (const pass of step.passes) {
                     if (quietAt.get(pass) === version) continue;
-                    const report = await runPass(pass, { name: step.group, round });
-                    if (report.changed > 0) {
-                        version++;
-                        quietAt.delete(pass);
-                    } else {
-                        quietAt.set(pass, version);
-                    }
+                    const { report, settled } = await runPass(pass, { name: step.group, round });
+                    if (report.changed > 0) version++;
+                    if (report.changed === 0 || settled) quietAt.set(pass, version);
+                    else quietAt.delete(pass);
                     changed += report.changed;
                 }
                 if (changed === 0) break;

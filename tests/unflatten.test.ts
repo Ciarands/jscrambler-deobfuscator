@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 import { emit, flatten, generate, mulberry32, runTrace } from "./fuzz/programs.js";
+import { machinesLeft } from "./helpers.js";
 
 // Differential: random program -> reference flattening -> pipeline; traces must match and no machine may remain.
 
@@ -16,14 +17,13 @@ const check = async (seed: number) => {
     const program = generate(seed);
     const structured = emit(program);
     const flat = flatten(program, mulberry32(seed));
-    const { code, report } = await deobfuscate(`function f() {\n${flat}\n}`, { passes: ["unflatten"] });
+    const { code } = await deobfuscate(`function f() {\n${flat}\n}`, { passes: ["unflatten"] });
     const body = `${code}\nreturn f();`;
     const inputs = inputsFor(seed);
     const expected = inputs.map((bits) => runTrace(structured, bits));
     const flatTraces = inputs.map((bits) => runTrace(flat, bits));
     const got = inputs.map((bits) => runTrace(body, bits));
-    const stats = report.passes[0]?.stats ?? {};
-    return { seed, structured, flat, code, expected, flatTraces, got, left: stats["skipped"] ?? 0 };
+    return { seed, structured, flat, code, expected, flatTraces, got, left: machinesLeft(code) };
 };
 
 describe("unflatten (differential fuzz)", () => {

@@ -1,14 +1,8 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
-const observed = (source: string): string => {
-    const timers: (() => void)[] = [];
-    const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };
-    runInNewContext(source, context, { timeout: 2000 });
-    for (const callback of timers) callback();
-    return JSON.stringify(context.result);
-};
+const RUN: Run = { timers: true, timeout: 2000 };
 
 const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "hash-predicates", "simplify"] })).code;
 
@@ -61,7 +55,7 @@ describe("hash-predicates", () => {
         for (const call of ["G.U.h", "G.w"]) {
             const input = program({ body: predicates({ call }) });
             const output = await run(input);
-            expect(observed(output)).toBe(observed(input));
+            expect(observe(output, RUN)).toBe(observe(input, RUN));
             expect(output).not.toContain(`${call}(`);
             expect(output).not.toContain("decoy");
         }
@@ -73,7 +67,7 @@ describe("hash-predicates", () => {
         for (const [name, builder] of Object.entries({ global: "", local: shadow })) {
             const input = program({ body: lonePredicate, builder, hashSource: bound });
             const output = await run(input);
-            expect(observed(output), name).toBe(observed(input));
+            expect(observe(output, RUN), name).toBe(observe(input, RUN));
             expect(output.includes("G.U.h("), name).toBe(name === "local");
         }
     });
@@ -82,7 +76,7 @@ describe("hash-predicates", () => {
         expect([hash("1", 1, 77300), hash("2", 1, 77300)]).not.toContain(hash("3", 1, 77300));
         const input = program({ body: predicates({ untilDigit: 3, ifTrue: true }) });
         const output = await run(input);
-        expect(observed(output)).toBe(observed(input));
+        expect(observe(output, RUN)).toBe(observe(input, RUN));
         expect(output).not.toContain("G.U.h(");
         expect(output).toContain(`log.push("decoy");`);
     });
@@ -90,7 +84,7 @@ describe("hash-predicates", () => {
     it("unrolls a loop that runs once whatever its body does", async () => {
         const input = program({ body: predicates({ untilDigit: 2, loopBody: `log.push("body"); S += 2;` }) });
         const output = await run(input);
-        expect(observed(output)).toBe(observed(input));
+        expect(observe(output, RUN)).toBe(observe(input, RUN));
         expect(output).not.toContain("G.U.h(");
     });
 
@@ -110,7 +104,7 @@ describe("hash-predicates", () => {
         for (const [name, body] of [...Object.entries(unrolled), ...Object.entries(kept)]) {
             const input = program({ body });
             const output = await run(input);
-            expect(observed(output), name).toBe(observed(input));
+            expect(observe(output, RUN), name).toBe(observe(input, RUN));
             expect(output.includes("G.U.h("), name).toBe(name in kept);
         }
     });
@@ -126,7 +120,7 @@ describe("hash-predicates", () => {
         for (const [name, hashSource] of Object.entries(hashes)) {
             const input = program({ body: `${lonePredicate} log.push(G.calls());`, builder, hashSource, later: "G.salt(1);" });
             const output = await run(input);
-            expect(observed(output), name).toBe(observed(input));
+            expect(observe(output, RUN), name).toBe(observe(input, RUN));
             expect(output, name).toContain("G.U.h(");
         }
     });
@@ -134,14 +128,14 @@ describe("hash-predicates", () => {
     it("keeps predicates on a hash that runs past its step budget", async () => {
         const input = program({ body: lonePredicate, hashSource: hashCode("q", "for (var k = 0; k < 400000; k++) {}") });
         const output = await run(input);
-        expect(observed(output)).toBe(observed(input));
+        expect(observe(output, RUN)).toBe(observe(input, RUN));
         expect(output).toContain("G.U.h(");
     });
 
     it("keeps loops that run more than once doing more than counting", async () => {
         const input = program({ body: predicates({ untilDigit: 3, loopBody: `log.push("body"); S += 2;` }) });
         const output = await run(input);
-        expect(observed(output)).toBe(observed(input));
+        expect(observe(output, RUN)).toBe(observe(input, RUN));
         expect(output).toContain("G.U.h(d.toString()");
     });
 
@@ -150,7 +144,7 @@ describe("hash-predicates", () => {
         const body = `var set = function () { a = ${hash("2", 1, 77300)}; };\n  ${predicates({ between: " set();" })}`;
         const input = program({ body });
         const output = await run(input);
-        expect(observed(output)).toBe(observed(input));
+        expect(observe(output, RUN)).toBe(observe(input, RUN));
         expect(output).toContain("G.U.h(d.toString()");
     });
 
@@ -163,7 +157,7 @@ describe("hash-predicates", () => {
         })) {
             const input = program({ body: lonePredicate, ...options });
             const output = await run(input);
-            expect(observed(output), name).toBe(observed(input));
+            expect(observe(output, RUN), name).toBe(observe(input, RUN));
             expect(output, name).toContain("G.U.h(");
         }
     });

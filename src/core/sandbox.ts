@@ -35,6 +35,16 @@ const syncVariant = newVariant(baseVariant, { emscriptenModule: silent });
 const quickjs = (): Promise<QuickJSWASMModule> => (modulePromise ??= newQuickJSWASMModuleFromVariant(syncVariant));
 /** Emscripten aborts throw it; not declared in the project's type libs. */
 const WasmRuntimeError = (globalThis as unknown as { WebAssembly: { RuntimeError: abstract new (...args: never[]) => Error } }).WebAssembly.RuntimeError;
+/** An abort kills the WASM instance it happened in: every sandbox in that module is broken from then on, for one reason. */
+interface ModuleState {
+    aborted: string | undefined;
+}
+const moduleStates = new WeakMap<QuickJSWASMModule, ModuleState>();
+const moduleState = (module: QuickJSWASMModule): ModuleState => {
+    let state = moduleStates.get(module);
+    if (state === undefined) moduleStates.set(module, (state = { aborted: undefined }));
+    return state;
+};
 
 /** The default seed is what every sandbox used so far; another gives another (equally deterministic) sequence. */
 export const DEFAULT_SEED = 0x9e3779b9 | 0;
@@ -232,9 +242,10 @@ export class Sandbox {
     readonly #held = new Map<number, QuickJSHandle>();
     #deadline = 0;
     #interrupted = false;
-    #broken: string | undefined;
+    readonly #module: ModuleState;
 
     private constructor(module: QuickJSWASMModule, limits: SandboxLimits) {
+        this.#module = moduleState(module);
         this.#limits = limits;
         this.#runtime = module.newRuntime();
         this.#runtime.setMemoryLimit(limits.memoryBytes);
@@ -277,14 +288,15 @@ export class Sandbox {
     }
 
     get broken(): string | undefined {
-        return this.#broken;
+        return this.#module.aborted;
     }
 
-    /** An abort kills the WASM instance it happened in; drop it so the next sandbox loads a fresh one. */
+    /** Drops the dead module so the next `load` makes a fresh one. */
     #abort(error: unknown): RunResult {
-        this.#broken = safeMessage(error);
+        const reason = safeMessage(error);
+        this.#module.aborted = reason;
         modulePromise = undefined;
-        return { ok: false, error: `sandbox aborted: ${this.#broken}`, timedOut: false };
+        return { ok: false, error: `sandbox aborted: ${reason}`, timedOut: false };
     }
 
     #arm(timeoutMs: number): void {
@@ -315,15 +327,16 @@ export class Sandbox {
         return this.#evaluate(code, timeoutMs, true);
     }
 
-    execute(code: string, timeoutMs = this.#limits.timeoutMs): RunResult {
-        return this.#evaluate(code, timeoutMs, false);
+    /** `filename` names the code's functions (`Function.prototype.fileName`) and its frames in guest stacks. */
+    execute(code: string, timeoutMs = this.#limits.timeoutMs, filename = "sandbox.js"): RunResult {
+        return this.#evaluate(code, timeoutMs, false, filename);
     }
 
-    #evaluate(code: string, timeoutMs: number, copy: boolean): RunResult {
-        if (this.#broken !== undefined) return { ok: false, error: `sandbox aborted earlier: ${this.#broken}`, timedOut: false };
+    #evaluate(code: string, timeoutMs: number, copy: boolean, filename = "sandbox.js"): RunResult {
+        if (this.broken !== undefined) return { ok: false, error: `sandbox aborted earlier: ${this.broken}`, timedOut: false };
         try {
             this.#arm(timeoutMs);
-            const result = this.#context.evalCode(code, "sandbox.js", { type: "global" });
+            const result = this.#context.evalCode(code, filename, { type: "global" });
             if (result.error !== undefined) return this.#failure(result.error);
             if (copy) return this.#copy(result.value);
             result.value.dispose();
@@ -338,7 +351,7 @@ export class Sandbox {
      * `filename` names its frames in guest stacks (`RunResult.at` looks for the program's).
      */
     hold(code: string, timeoutMs = this.#limits.timeoutMs, filename = "sandbox.js"): { readonly ok: true; readonly held: Held } | (RunResult & { readonly ok: false }) {
-        if (this.#broken !== undefined) return { ok: false, error: `sandbox aborted earlier: ${this.#broken}`, timedOut: false };
+        if (this.broken !== undefined) return { ok: false, error: `sandbox aborted earlier: ${this.broken}`, timedOut: false };
         try {
             this.#arm(timeoutMs);
             const result = this.#context.evalCode(code, filename, { type: "global" });
@@ -353,7 +366,7 @@ export class Sandbox {
 
     /** Call a guest function by property path from `base` (or the global object); payload and result cross as tagged JSON. */
     invoke(path: readonly string[], payload: unknown, timeoutMs = this.#limits.timeoutMs, base?: Held): RunResult {
-        if (this.#broken !== undefined) return { ok: false, error: `sandbox aborted earlier: ${this.#broken}`, timedOut: false };
+        if (this.broken !== undefined) return { ok: false, error: `sandbox aborted earlier: ${this.broken}`, timedOut: false };
         const context = this.#context;
         try {
             this.#arm(timeoutMs);
@@ -417,7 +430,7 @@ export class Sandbox {
         } finally {
             if (handle.alive) handle.dispose();
         }
-        const frame = /sandbox\.js:(\d+):(\d+)/.exec(stack);
+        const frame = /(?:sandbox|program-\d+)\.js:(\d+):(\d+)/.exec(stack);
         const at = frame === null ? undefined : { line: Number(frame[1]), column: Number(frame[2]) };
         return { ok: false, error: message, timedOut, ...(at === undefined ? {} : { at }) };
     }
@@ -429,7 +442,7 @@ export class Sandbox {
 
     /** Free the sandbox. Never throws: a runtime QuickJS can't free cleanly only costs the WASM instance. */
     dispose(): void {
-        if (this.#broken !== undefined) return;
+        if (this.broken !== undefined) return;
         try {
             for (const { fn, owner } of this.#functions.values()) {
                 fn.dispose();

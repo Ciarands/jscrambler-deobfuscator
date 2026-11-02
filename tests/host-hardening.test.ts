@@ -1,7 +1,6 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createContext, runInContext } from "node:vm";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { EXIT_FAILED, EXIT_OK, EXIT_USAGE, runCli } from "../src/cli/main.js";
 import { isBindingName } from "../src/core/ast.js";
@@ -13,18 +12,13 @@ import { NestingError, traverse } from "../src/core/traverse.js";
 import type { Node } from "../src/core/ast.js";
 import { createLogger, sanitizeLine } from "../src/logger.js";
 import { deobfuscate } from "../src/index.js";
+import { observe } from "./helpers.js";
 
 // oxlint-disable-next-line no-control-regex -- the characters the output must not hold
 const UNSAFE = /[\0-\x08\x0b-\x1f\x7f-\x9f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/u;
 
 /** The AST without positions and source text: what the program means (a directive's value is its literal's). */
 const shape = (code: string): string => JSON.stringify(parse(code), (key, value) => (["start", "end", "range", "raw", "pattern", "directive"].includes(key) ? undefined : value));
-
-const run = (source: string): unknown => {
-    const context = createContext({});
-    runInContext(source, context);
-    return context.result;
-};
 
 describe("printer: control and format characters", () => {
     const cases = [
@@ -40,7 +34,7 @@ describe("printer: control and format characters", () => {
         it(`escapes ${name} and prints the same program`, () => {
             const output = print(parse(source));
             expect(output).not.toMatch(UNSAFE);
-            expect(run(output)).toEqual(run(source));
+            expect(observe(output)).toBe(observe(source));
             expect(shape(output)).toBe(shape(source));
             expect(print(parse(output))).toBe(output);
         });
@@ -51,7 +45,7 @@ describe("printer: control and format characters", () => {
         const output = print(parse(source));
         expect(output).toContain("\\x1B");
         expect(output).toContain("\\u202E");
-        expect(run(output)).toEqual(run(source));
+        expect(observe(output)).toBe(observe(source));
     });
 
     it("escapes the hashbang", () => {
@@ -66,7 +60,7 @@ describe("printer: control and format characters", () => {
         const output = print(parse(source), (message) => warnings.push(message));
         expect(output).toContain("\u202e");
         expect(warnings).toHaveLength(1);
-        expect(run(output)).toBe(run(source));
+        expect(observe(output)).toBe(observe(source));
     });
 
     it("prints a replaced directive's literal, not the stale directive", () => {
@@ -154,7 +148,7 @@ result = f(5, 6);
 `;
         const output = (await deobfuscate(code)).code;
         expect(output).not.toContain("d(1)");
-        expect(run(output)).toEqual(run(code));
+        expect(observe(output)).toBe(observe(code));
     });
 });
 

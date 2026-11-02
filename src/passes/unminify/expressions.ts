@@ -1,5 +1,17 @@
-import type { BinaryExpression, Expression, Node, ObjectExpression, Statement, TemplateElement, TemplateLiteral, UnaryExpression } from "../../core/ast.js";
-import { isFunctionNode, isIdentifierName } from "../../core/ast.js";
+import type {
+    AccessorProperty,
+    BinaryExpression,
+    Expression,
+    MethodDefinition,
+    Node,
+    ObjectExpression,
+    PropertyDefinition,
+    Statement,
+    TemplateElement,
+    TemplateLiteral,
+    UnaryExpression,
+} from "../../core/ast.js";
+import { isFunctionNode, isIdentifierName, keyName } from "../../core/ast.js";
 import { at, valueToNode } from "../../core/build.js";
 import type { ScopeInfo } from "../../core/scope.js";
 import { forEachChild } from "../../core/traverse.js";
@@ -381,12 +393,7 @@ export const uses = (node: Node | null | undefined, holder: Holder, own: OwnBind
 };
 
 /** A property's key as the property name it defines (`a`, `"a"` and `a` alike; `1` and `"1"` alike), when static. */
-const keyName = (property: Node): string | undefined => {
-    if (property.type !== "Property" || property.computed) return undefined;
-    const key = property.key;
-    if (key.type === "Identifier") return key.name;
-    return key.type === "Literal" && (typeof key.value === "string" || typeof key.value === "number") ? String(key.value) : undefined;
-};
+const definedName = (property: Node): string | undefined => (property.type !== "Property" || property.computed ? undefined : keyName(property.key));
 
 /**
  * An object literal whose properties assignments may add to as the literal would have them: plain properties only (no
@@ -394,7 +401,7 @@ const keyName = (property: Node): string | undefined => {
  * an assignment could meet).
  */
 export const isPlainLiteral = (node: Node): node is ObjectExpression =>
-    node.type === "ObjectExpression" && node.properties.every((property) => property.type === "Property" && property.kind === "init" && keyName(property) !== "__proto__");
+    node.type === "ObjectExpression" && node.properties.every((property) => property.type === "Property" && property.kind === "init" && definedName(property) !== "__proto__");
 
 export interface PlannedStore {
     readonly into: ObjectExpression;
@@ -428,7 +435,7 @@ export const plannedStore = (statement: Statement, holder: Holder, own: OwnBindi
     if (object.type !== "MemberExpression" || object.object.type !== "Identifier" || object.object.name !== name) return undefined;
     const outer = object.computed ? (object.property.type === "Literal" ? String(object.property.value) : undefined) : object.property.type === "Identifier" ? object.property.name : undefined;
     const last = [...literal.properties, ...planned.filter((store) => store.into === literal).map((store) => store.property)].at(-1);
-    const into = last !== undefined && outer !== undefined && keyName(last) === outer && last.type === "Property" ? last.value : undefined;
+    const into = last !== undefined && outer !== undefined && definedName(last) === outer && last.type === "Property" ? last.value : undefined;
     return into !== undefined && isPlainLiteral(into) ? { into, property: stored } : undefined;
 };
 
@@ -487,142 +494,176 @@ const objectFromBuilder = (node: Node, context: UnminifyContext): ObjectExpressi
     return literal;
 };
 
+type NodeOf<T extends Node["type"]> = Extract<Node, { type: T }>;
+
+const readableRegex = (node: NodeOf<"Literal">, context: UnminifyContext): Node | undefined => {
+    if (!("regex" in node) || node.regex === undefined || node.regex === null) return undefined;
+    const { flags } = node.regex;
+    const unescaped = readablePattern(node.regex.pattern, flags);
+    const canonical = canonicalPattern(unescaped ?? node.regex.pattern, flags);
+    const pattern = canonical ?? unescaped;
+    if (pattern === undefined) return undefined;
+    if (unescaped !== undefined) context.did("regexEscapes", node);
+    if (canonical !== undefined) context.did("regexClasses", node);
+    return { ...node, regex: { pattern, flags }, raw: `/${pattern}/${flags}` } as Node;
+};
+
+/**
+ * `(1, f)(x)` -> `f(x)`: both call `f` with no `this`, unless a `with` could answer `f` (then `f()` passes its
+ * object) or `f` is `eval` (the direct call reads the caller's scope, the indirect one not).
+ */
+const directCall = (node: NodeOf<"CallExpression">, context: UnminifyContext): Expression | undefined => {
+    const callee = node.callee;
+    if (callee.type !== "SequenceExpression" || !callee.expressions.slice(0, -1).every((e) => e.type === "Literal")) return undefined;
+    const target = callee.expressions.at(-1);
+    if (target?.type !== "Identifier" || target.name === "eval" || context.hasWith) return undefined;
+    context.did("directCalls", node);
+    return at<Expression>({ ...node, callee: target }, node);
+};
+
+const booleanTail = (path: Path, node: NodeOf<"LogicalExpression">, context: UnminifyContext): Node | undefined => {
+    if (node.operator === "??") return undefined;
+    const neutral = node.operator !== "||";
+    const isNeutral = (side: Node): boolean => side.type === "Literal" && side.value === neutral;
+    if (isNeutral(node.left)) {
+        context.did("booleanTails", node);
+        return node.right;
+    }
+    // `a || false`, `a && true`: only truthiness can tell them from `a`.
+    if (isNeutral(node.right) && isTestedForTruth(path)) {
+        context.did("booleanTails", node);
+        return node.left;
+    }
+    return undefined;
+};
+
+const invertNegation = (path: Path, node: NodeOf<"UnaryExpression">, context: UnminifyContext): Node | undefined => {
+    if (node.operator !== "!") return undefined;
+    const argument = node.argument;
+    if (argument.type === "UnaryExpression" && argument.operator === "!") {
+        if (isTestedForTruth(path)) {
+            context.did("removeDoubleNot", node);
+            return argument.argument;
+        }
+        context.refused("keeps !!: its boolean value is used", node);
+    }
+    if (argument.type === "BinaryExpression") {
+        const negated = NEGATED_EQUALITY[argument.operator];
+        if (negated === undefined) {
+            context.refused("keeps the negation: only equality inverts exactly (NaN)", node);
+            return undefined;
+        }
+        context.did("invertBooleanLogic", node);
+        return at<BinaryExpression>({ ...argument, operator: negated }, node);
+    }
+    if (argument.type === "LogicalExpression" && argument.operator !== "??") {
+        context.did("invertBooleanLogic", node);
+        return at<Expression>(
+            { type: "LogicalExpression", operator: argument.operator === "&&" ? "||" : "&&", left: not(argument.left, argument.left), right: not(argument.right, argument.right) },
+            node
+        );
+    }
+    if (argument.type === "LogicalExpression") context.refused("keeps !(a ?? b): no `??` form of its negation", node);
+    return undefined;
+};
+
+const rewriteBinary = (node: Binary, context: UnminifyContext): Expression | undefined => {
+    const typeofCheck = typeofUndefined(node);
+    if (typeofCheck !== undefined) {
+        context.did("typeofUndefined", node);
+        return typeofCheck;
+    }
+    const swapped = SWAPPED[node.operator];
+    if (swapped !== undefined && node.left.type !== "PrivateIdentifier" && isConstantValue(node.left, context) && !isConstantValue(node.right, context)) {
+        context.did("yoda", node);
+        return at<BinaryExpression>({ ...node, operator: swapped, left: node.right, right: node.left }, node);
+    }
+    if (swapped !== undefined && node.left.type === "Identifier" && CONSTANT_GLOBALS.has(node.left.name) && !context.isGlobal(node.left)) {
+        context.refused(`keeps the order: \`${node.left.name}\` here may not be the global`, node);
+    }
+    const truncated = truncateNumbers(node);
+    if (truncated !== undefined) context.did("truncateNumbers", node);
+    return truncated;
+};
+
+const templateStrings = (path: Path, node: TemplateLiteral, context: UnminifyContext): TemplateLiteral | undefined => {
+    if (path.parent?.type === "TaggedTemplateExpression") {
+        if (node.expressions.some((expression) => expression.type === "Literal")) context.refused("keeps a tagged template's values: the tag sees them apart", node);
+        return undefined;
+    }
+    const inlined = inlineTemplateStrings(node);
+    if (inlined !== undefined) context.did("templateStrings", node);
+    return inlined;
+};
+
+const dotAccess = (node: NodeOf<"MemberExpression">, context: UnminifyContext): Expression | undefined => {
+    const property = node.property;
+    if (!node.computed || property.type !== "Literal" || typeof property.value !== "string" || !isIdentifierName(property.value)) return undefined;
+    context.did("computedKeys", node);
+    return at<Expression>({ ...node, computed: false, property: at<Expression>({ type: "Identifier", name: property.value }, property) }, node);
+};
+
+type Keyed = NodeOf<"Property"> | MethodDefinition | PropertyDefinition | AccessorProperty;
+
+/** `"a": x` -> `a: x`, in place. */
+const identifierKey = (node: Keyed, context: UnminifyContext): void => {
+    const key = node.key;
+    if (key.type !== "Literal" || typeof key.value !== "string" || !isIdentifierName(key.value)) return;
+    // `__proto__: x` sets the prototype where `"__proto__": x` does too but `["__proto__"]: x` doesn't; a class
+    // `constructor` key decides what the constructor is; `static prototype` is an early error.
+    if (key.value === "__proto__" || (node.type !== "Property" && (key.value === "constructor" || (node.static && key.value === "prototype")))) {
+        context.refused(`keeps the key "${key.value}" as written`, node);
+        return;
+    }
+    context.did("computedKeys", node);
+    node.key = at<Expression>({ type: "Identifier", name: key.value }, key);
+    node.computed = false;
+};
+
+/** `{ a: a }` -> `{ a }`, in place. Not `__proto__`: `{ __proto__: __proto__ }` sets the prototype, `{ __proto__ }` doesn't. */
+const shorthand = (node: Keyed, context: UnminifyContext): void => {
+    if (node.type !== "Property" || node.computed || node.method || node.kind !== "init" || node.shorthand) return;
+    const value = node.value as Node;
+    if (node.key.type !== "Identifier" || value.type !== "Identifier" || value.name !== node.key.name) return;
+    if (value.name === "__proto__") {
+        context.refused("keeps `__proto__: __proto__`: the shorthand doesn't set the prototype", node);
+        return;
+    }
+    context.did("shorthand", node);
+    node.shorthand = true;
+};
+
 /** One step; the caller repeats on the result. `undefined` also when object and class keys were changed in place. */
 export const rewriteExpression = (path: Path, context: UnminifyContext): Node | undefined => {
     const node = path.node;
     switch (node.type) {
-        case "Literal": {
-            if (!("regex" in node) || node.regex === undefined || node.regex === null) return undefined;
-            const { flags } = node.regex;
-            const unescaped = readablePattern(node.regex.pattern, flags);
-            const canonical = canonicalPattern(unescaped ?? node.regex.pattern, flags);
-            const pattern = canonical ?? unescaped;
-            if (pattern === undefined) return undefined;
-            if (unescaped !== undefined) context.did("regexEscapes", node);
-            if (canonical !== undefined) context.did("regexClasses", node);
-            return { ...node, regex: { pattern, flags }, raw: `/${pattern}/${flags}` } as Node;
-        }
+        case "Literal":
+            return readableRegex(node, context);
         case "CallExpression": {
-            // `(1, f)(x)` -> `f(x)`: both call `f` with no `this`, unless a `with` could answer `f` (then `f()`
-            // passes its object) or `f` is `eval` (the direct call reads the caller's scope, the indirect one not).
-            const callee = node.callee;
-            if (callee.type === "SequenceExpression" && callee.expressions.slice(0, -1).every((e) => e.type === "Literal")) {
-                const target = callee.expressions.at(-1);
-                if (target?.type === "Identifier" && target.name !== "eval" && !context.hasWith) {
-                    context.did("directCalls", node);
-                    return at<Expression>({ ...node, callee: target }, node);
-                }
-            }
+            const call = directCall(node, context);
+            if (call !== undefined) return call;
             const object = objectFromBuilder(node, context);
             if (object !== undefined) context.did("objectLiterals", node);
             return object;
         }
-        case "LogicalExpression": {
-            if (node.operator === "??") return undefined;
-            const neutral = node.operator !== "||";
-            const isNeutral = (side: Node): boolean => side.type === "Literal" && side.value === neutral;
-            if (isNeutral(node.left)) {
-                context.did("booleanTails", node);
-                return node.right;
-            }
-            // `a || false`, `a && true`: only truthiness can tell them from `a`.
-            if (isNeutral(node.right) && isTestedForTruth(path)) {
-                context.did("booleanTails", node);
-                return node.left;
-            }
-            return undefined;
-        }
-        case "UnaryExpression": {
-            if (node.operator !== "!") return undefined;
-            const argument = node.argument;
-            if (argument.type === "UnaryExpression" && argument.operator === "!") {
-                if (isTestedForTruth(path)) {
-                    context.did("removeDoubleNot", node);
-                    return argument.argument;
-                }
-                context.refused("keeps !!: its boolean value is used", node);
-            }
-            if (argument.type === "BinaryExpression") {
-                const negated = NEGATED_EQUALITY[argument.operator];
-                if (negated === undefined) {
-                    context.refused("keeps the negation: only equality inverts exactly (NaN)", node);
-                    return undefined;
-                }
-                context.did("invertBooleanLogic", node);
-                return at<BinaryExpression>({ ...argument, operator: negated }, node);
-            }
-            if (argument.type === "LogicalExpression" && argument.operator !== "??") {
-                context.did("invertBooleanLogic", node);
-                return at<Expression>(
-                    { type: "LogicalExpression", operator: argument.operator === "&&" ? "||" : "&&", left: not(argument.left, argument.left), right: not(argument.right, argument.right) },
-                    node
-                );
-            }
-            if (argument.type === "LogicalExpression") context.refused("keeps !(a ?? b): no `??` form of its negation", node);
-            return undefined;
-        }
-        case "BinaryExpression": {
-            const typeofCheck = typeofUndefined(node);
-            if (typeofCheck !== undefined) {
-                context.did("typeofUndefined", node);
-                return typeofCheck;
-            }
-            const swapped = SWAPPED[node.operator];
-            if (swapped !== undefined && node.left.type !== "PrivateIdentifier" && isConstantValue(node.left, context) && !isConstantValue(node.right, context)) {
-                context.did("yoda", node);
-                return at<BinaryExpression>({ ...node, operator: swapped, left: node.right, right: node.left }, node);
-            }
-            if (swapped !== undefined && node.left.type === "Identifier" && CONSTANT_GLOBALS.has(node.left.name) && !context.isGlobal(node.left)) {
-                context.refused(`keeps the order: \`${node.left.name}\` here may not be the global`, node);
-            }
-            const truncated = truncateNumbers(node);
-            if (truncated !== undefined) context.did("truncateNumbers", node);
-            return truncated;
-        }
-        case "TemplateLiteral": {
-            if (path.parent?.type === "TaggedTemplateExpression") {
-                if (node.expressions.some((expression) => expression.type === "Literal")) context.refused("keeps a tagged template's values: the tag sees them apart", node);
-                return undefined;
-            }
-            const inlined = inlineTemplateStrings(node);
-            if (inlined !== undefined) context.did("templateStrings", node);
-            return inlined;
-        }
-        case "MemberExpression": {
-            const property = node.property;
-            if (!node.computed || property.type !== "Literal" || typeof property.value !== "string" || !isIdentifierName(property.value)) return undefined;
-            context.did("computedKeys", node);
-            return at<Expression>({ ...node, computed: false, property: at<Expression>({ type: "Identifier", name: property.value }, property) }, node);
-        }
+        case "LogicalExpression":
+            return booleanTail(path, node, context);
+        case "UnaryExpression":
+            return invertNegation(path, node, context);
+        case "BinaryExpression":
+            return rewriteBinary(node, context);
+        case "TemplateLiteral":
+            return templateStrings(path, node, context);
+        case "MemberExpression":
+            return dotAccess(node, context);
         case "Property":
         case "MethodDefinition":
         case "PropertyDefinition":
-        case "AccessorProperty": {
-            const key = node.key;
-            if (key.type === "Literal" && typeof key.value === "string" && isIdentifierName(key.value)) {
-                // `__proto__: x` sets the prototype where `"__proto__": x` does too but `["__proto__"]: x` doesn't;
-                // a class `constructor` key decides what the constructor is; `static prototype` is an early error.
-                if (key.value === "__proto__" || (node.type !== "Property" && (key.value === "constructor" || (node.static && key.value === "prototype")))) {
-                    context.refused(`keeps the key "${key.value}" as written`, node);
-                    return undefined;
-                }
-                context.did("computedKeys", node);
-                node.key = at<Expression>({ type: "Identifier", name: key.value }, key);
-                node.computed = false;
-            }
-            // `{ a: a }` -> `{ a }`. Not `__proto__`: `{ __proto__: __proto__ }` sets the prototype, `{ __proto__ }` doesn't.
-            if (node.type !== "Property" || node.computed || node.method || node.kind !== "init" || node.shorthand) return undefined;
-            const value = node.value as Node;
-            if (node.key.type === "Identifier" && value.type === "Identifier" && value.name === node.key.name) {
-                if (value.name === "__proto__") {
-                    context.refused("keeps `__proto__: __proto__`: the shorthand doesn't set the prototype", node);
-                    return undefined;
-                }
-                context.did("shorthand", node);
-                node.shorthand = true;
-            }
+        case "AccessorProperty":
+            // A refused key stays a string literal, which no shorthand has.
+            identifierKey(node, context);
+            shorthand(node, context);
             return undefined;
-        }
         default:
             return undefined;
     }

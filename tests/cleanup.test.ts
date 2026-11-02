@@ -1,6 +1,6 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
 // Miniature runtime: a decoder whose stage calls shuffle the table until a non-stage call freezes it, a wrapper, and
 // stage calls inside an opaque predicate.
@@ -33,17 +33,13 @@ function f(host) {
 }
 `;
 
-const run = (code: string): string => {
-    const context: Record<string, unknown> = { host: { side: () => 1 } };
-    runInNewContext(code, context);
-    return JSON.stringify(context.result);
-};
+const RUN: Run = { globals: () => ({ host: { side: () => 1 } }), timers: true };
 
 describe("cleanup", () => {
     it("removes the runtime once nothing uses it, and unused locals with pure initializers", async () => {
         const program = `${RUNTIME}f(host);\nresult = out;\n`;
         const { code } = await deobfuscate(program);
-        expect(run(code)).toBe(run(program));
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
         expect(code).not.toMatch(/\bG\b/);
         expect(code).not.toContain("unused");
         expect(code).toContain("var kept = host.side();");
@@ -53,7 +49,7 @@ describe("cleanup", () => {
     it("keeps the runtime when the storage object escapes", async () => {
         const program = `${RUNTIME}f(host);\nhost.exported = G;\nresult = out;\n`;
         const { code } = await deobfuscate(program);
-        expect(run(code)).toBe(run(program));
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
         expect(code).toContain("function G() {}");
         expect(code).toContain("G.D = ");
     });
@@ -62,7 +58,7 @@ describe("cleanup", () => {
         // Also a definition made through the store: `(globalThis.P = G).k = v`.
         const program = `${RUNTIME}globalThis.Kept = G;\n(globalThis.Chained = G).x = function () { return G.D; };\nf(host);\nresult = out;\n`;
         const { code } = await deobfuscate(program);
-        expect(run(code)).toBe(run(program));
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
         expect(code).not.toMatch(/\bG\b|Kept|Chained/);
         for (const [store, name] of [
             ["globalThis.Kept = G;", "Kept"],
@@ -70,18 +66,10 @@ describe("cleanup", () => {
         ]) {
             const readBack = `${RUNTIME}${store}\nf(host);\nresult = [out, typeof globalThis.${name}];\n`;
             const kept = await deobfuscate(readBack);
-            expect(run(kept.code)).toBe(run(readBack));
+            expect(observe(kept.code, RUN)).toBe(observe(readBack, RUN));
         }
     });
 });
-
-const observed = (source: string): string => {
-    const timers: (() => void)[] = [];
-    const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };
-    runInNewContext(source, context);
-    for (const callback of timers) callback();
-    return JSON.stringify(context.result);
-};
 
 const withAliases = (body: string, prelude = "") => `
 function G() {}
@@ -105,7 +93,7 @@ describe("cleanup: aliases of the storage object", () => {
         for (const body of bodies) {
             const program = withAliases(body);
             const { code } = await deobfuscate(program, { passes: ["emulate", "cleanup"] });
-            expect(observed(code)).toBe(observed(program));
+            expect(observe(code, RUN)).toBe(observe(program, RUN));
             expect(code).not.toMatch(/\b[st]\b|\bp\.k\b/);
         }
     });
@@ -119,13 +107,15 @@ describe("cleanup: aliases of the storage object", () => {
             calledBeforeDeclaration: "function f() { var r = inner(); var s = G; function inner() { return typeof s; } return [r, inner()]; }",
             calledFromEarlierDeclarator: "function f() { var r = inner(), s = G; function inner() { return typeof s; } return r; }",
             shadowed: `function f() { var s = G; return (function (G) { return s.k; })({ k: "other" }); }`,
+            // A sloppy block function binds `G` throughout the inner function (Annex B).
+            annexB: "function f() { var s = G; return (function () { var k = s.k; { function G() {} } return k; })(); }",
             insideWith: "function f(o) { var s = G; with (o) { return s.k; } }",
             shorthand: "function f() { var s = G; return Object.keys({ s }); }",
         };
         for (const [name, body] of Object.entries(cases)) {
             const program = withAliases(body);
             const { code } = await deobfuscate(program, { passes: ["emulate", "cleanup"] });
-            expect(observed(code), name).toBe(observed(program));
+            expect(observe(code, RUN), name).toBe(observe(program, RUN));
             expect(code, name).toMatch(/\b[st] = /);
         }
     });
@@ -133,7 +123,7 @@ describe("cleanup: aliases of the storage object", () => {
     it("keeps every alias when the storage function is reassigned", async () => {
         const program = withAliases(`function f() { var s = G; G = { k: "other" }; return s.k; }`);
         const { code } = await deobfuscate(program, { passes: ["emulate", "cleanup"] });
-        expect(observed(code)).toBe(observed(program));
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
         expect(code).toContain("return s.k;");
     });
 });
@@ -157,7 +147,7 @@ describe("cleanup: statement facts across rewrites", () => {
     it("removes a definition whose statement was seen pure and replaced by one equivalent statement", async () => {
         const input = withBranch("G.k = (put(), delete String.x, 1);");
         const code = await rewrite(input);
-        expect(observed(code)).toBe(observed(input));
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
         expect(code).not.toContain("G.k");
     });
 
@@ -165,7 +155,7 @@ describe("cleanup: statement facts across rewrites", () => {
         // Together the parts change nothing outside G; alone, the first one does, and the second depends on it.
         const input = withBranch("G.k = put(); G.v = take();");
         const code = await rewrite(input);
-        expect(observed(code)).toBe(observed(input));
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
         expect(code).toContain("G.k = put();");
     });
 });
@@ -197,7 +187,7 @@ describe("cleanup: stage calls", () => {
         for (const method of ["n += x;", "T.push(x); n = T.length;"]) {
             const program = withStage({ method });
             const { code } = await deobfuscate(program, { passes: ["emulate", "cleanup"] });
-            expect(observed(code), method).toBe(observed(program));
+            expect(observe(code, RUN), method).toBe(observe(program, RUN));
             expect(code, method).not.toMatch(/G\.k|G\.w/);
         }
     });
@@ -223,7 +213,7 @@ describe("cleanup: stage calls", () => {
         for (const [name, options] of Object.entries(cases)) {
             const program = withStage(options);
             const { code } = await deobfuscate(program, { passes: ["emulate", "cleanup"] });
-            expect(observed(code), name).toBe(observed(program));
+            expect(observe(code, RUN), name).toBe(observe(program, RUN));
             expect(code, name).toContain("G.w(4);");
         }
     });
@@ -245,7 +235,7 @@ describe("cleanup: the setup call", () => {
     it("removes it once no code names an alias or a global it added", async () => {
         const input = withSetup('result = "a,b".q1(",");');
         const { code } = await deobfuscate(input);
-        expect(observed(code)).toBe(observed(input));
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
         expect(code).not.toContain("Hx");
     });
 
@@ -257,7 +247,7 @@ describe("cleanup: the setup call", () => {
         for (const read of reads) {
             const input = withSetup(read);
             const { code } = await deobfuscate(input);
-            expect(observed(code)).toBe(observed(input));
+            expect(observe(code, RUN)).toBe(observe(input, RUN));
             expect(code).toContain("globalThis.Hx = ");
         }
     });
@@ -266,7 +256,7 @@ describe("cleanup: the setup call", () => {
         for (const setup of ['String.prototype.trim = function () { return "changed"; };', "delete String.prototype.trim;"]) {
             const input = withSetup('result = ["a,b".q1(","), typeof " x ".trim];', setup);
             const { code } = await deobfuscate(input);
-            expect(observed(code)).toBe(observed(input));
+            expect(observe(code, RUN)).toBe(observe(input, RUN));
             expect(code).toContain("String.prototype.trim");
         }
     });
@@ -274,7 +264,7 @@ describe("cleanup: the setup call", () => {
     it("keeps a runtime definition that changes any builtin, not only the common ones", async () => {
         const input = 'function G() {}\nG.k = (function () { Map.prototype.tag = function () { return "tagged"; }; return {}; })();\nsetTimeout(function () { result = [new Map().tag()]; });\n';
         const { code } = await deobfuscate(input);
-        expect(observed(code)).toBe(observed(input));
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
         expect(code).toContain("Map.prototype.tag");
     });
 });
@@ -283,7 +273,7 @@ describe("cleanup: code in literal evals", () => {
     it('keeps the runtime that the code of eval("...") still reads, and only that', async () => {
         const input = 'function G() {}\nG.k = 41;\nG.unused = 1;\nsetTimeout(function () { result = [eval("G.k + 1")]; });\n';
         const { code } = await deobfuscate(input);
-        expect(observed(code)).toBe(observed(input));
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
         expect(code).toContain("G.k = 41;");
         expect(code).not.toContain("G.unused");
     });
@@ -291,7 +281,7 @@ describe("cleanup: code in literal evals", () => {
     it("reads the code of eval even when more arguments follow it", async () => {
         const input = 'function G() {}\nG.k = 41;\nvar hits = 0;\nsetTimeout(function () { result = [eval("G.k + 1", hits++), hits]; });\n';
         const { code } = await deobfuscate(input);
-        expect(observed(code)).toBe(observed(input));
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
         expect(code).toContain("G.k = 41;");
     });
 });
@@ -301,18 +291,27 @@ describe("cleanup: dead stores", () => {
         const input =
             "function f(n) { var state = 576049076; var step = 0; var seen = 0; var minus = -5; state = 2; minus = -1007262805; step += 2; step++; seen += n; var kept = 1; kept += 2; var box = {}; box = 3; box++; return [n, kept]; }\nresult = f(4);\n";
         const { code } = await deobfuscate(input, { passes: ["cleanup"] });
-        expect(observed(code)).toBe(observed(input));
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
         for (const name of ["state", "step", "minus"]) expect(code).not.toContain(name);
         // `seen += n` adds a non-literal, `kept` is read, `box` held an object.
         for (const name of ["seen += n", "kept += 2", "box++"]) expect(code).toContain(name);
+    });
+
+    it("counts a guarded store's branch stores with the `if` they go with", async () => {
+        const input = "function f(n) { var last = 0; if (last === n) { last = 1; } else { last = 2; } return n; }\nresult = f(3);\n";
+        const { code, report } = await deobfuscate(input, { passes: ["cleanup"] });
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
+        expect(code).not.toContain("last");
+        // The `if` and the declarator.
+        expect(report.passes.map((pass) => [pass.changed, pass.stats?.["locals"]])).toEqual([[2, 2]]);
     });
 
     it("drops locals only given the values of other bindings, unless they are updated or read from a let", async () => {
         const input =
             'var log = [];\nvar table = [1, 2];\nvar hooked = { valueOf: function () { log.push("converted"); return 1; } };\nfunction f(n) { var copy; copy = table; copy = n; copy = f; var bumped; bumped = hooked; bumped += 1; var added; added = 1; added += hooked; return n; }\nfunction g() { var late; late = later; let later = 2; }\ntry { g(); } catch (e) { log.push(e.name); }\nresult = [f(4), log];\n';
         const { code } = await deobfuscate(input, { passes: ["cleanup"] });
-        expect(observed(code)).toBe(observed(input));
-        expect(observed(input)).toBe('[4,["ReferenceError","converted","converted"]]');
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
+        expect(observe(input, RUN)).toBe('[4,["ReferenceError","converted","converted"]]');
         expect(code).not.toContain("copy");
     });
 
@@ -320,7 +319,7 @@ describe("cleanup: dead stores", () => {
         const input =
             'var log = [];\nfunction f(o) { var a = ""; var a = "x"; var b = ""; b = ""; var b = "y"; var d = 1; var d; var kept = 1; var kept = 2; var called = o.side(); var called = 3; var k = 0; for (var k in o) log.push(k); return kept; }\nresult = [f({ side: function () { log.push("side"); return 1; } }), log];\n';
         const { code } = await deobfuscate(input, { passes: ["cleanup"] });
-        expect(observed(code)).toBe(observed(input));
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
         expect(code).not.toMatch(/\b[abd]\b/);
         for (const kept of ["var kept = 2;", "var called = o.side();", "var k = 0;", "for (var k in o)"]) expect(code).toContain(kept);
     });
@@ -348,7 +347,7 @@ describe("cleanup: dead stores", () => {
             "result = [f(4), log];",
         ].join("\n");
         const { code } = await deobfuscate(input, { passes: ["cleanup"] });
-        expect(observed(code)).toBe(observed(input));
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
         expect(code).not.toContain("last");
         for (const kept of ["kept = position;", "loose == hooked", "called === side()", "-hooked === 1", "bumped++", "early === later"]) expect(code).toContain(kept);
     });
@@ -376,7 +375,7 @@ describe("cleanup: dead stores", () => {
             "result = [f(), outer, log];",
         ].join("\n");
         const { code } = await deobfuscate(input, { passes: ["cleanup"] });
-        expect(observed(code)).toBe(observed(input));
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
         expect(code).not.toContain("table");
         for (const kept of ['log.push("call")', "outer.v = 1;", "o.k = 2;", '"argument"', '"default"', '"return"', "o.__proto__ = o;", "o = null;"]) expect(code).toContain(kept);
     });
@@ -384,7 +383,7 @@ describe("cleanup: dead stores", () => {
     it("drops a script global's dead table and declaration when only its name could reach it, not when the program spells it or may read the global object with an unknown key", async () => {
         const dead = 'var table;\ntable = ["a", "b"];\nfunction unusedHelper() { return 1; }\nresult = 2;\n';
         const { code } = await deobfuscate(dead, { passes: ["cleanup"] });
-        expect(run(code)).toBe(run(dead));
+        expect(observe(code, RUN)).toBe(observe(dead, RUN));
         expect(code).toBe("result = 2;\n");
         const reaches = [
             'result = "table";',
@@ -398,7 +397,7 @@ describe("cleanup: dead stores", () => {
         for (const reach of reaches) {
             const program = `var table;\ntable = ["a", "b"];\n${reach}\n`;
             const kept = await deobfuscate(program, { passes: ["cleanup"] });
-            expect(run(kept.code)).toBe(run(program));
+            expect(observe(kept.code, RUN)).toBe(observe(program, RUN));
             expect(kept.code).toContain('table = ["a", "b"];');
         }
     });
@@ -406,14 +405,14 @@ describe("cleanup: dead stores", () => {
     it("drops a script global's dead table once the code handing the global object on is itself removed", async () => {
         const program = 'var table;\ntable = ["a", "b"];\nfunction unusedHelper() { return window; }\nresult = 2;\n';
         const { code } = await deobfuscate(program, { passes: ["cleanup"] });
-        expect(run(code)).toBe(run(program));
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
         expect(code).toBe("result = 2;\n");
     });
 
     it("keeps unused locals a direct eval can see, and removes those it can't", async () => {
         const input = 'function f() { var seen = 1; return (function () { return eval("seen"); })(); }\nfunction g() { var unseen = 2; return 3; }\nresult = [f(), g()];\n';
         const { code } = await deobfuscate(input, { passes: ["cleanup"] });
-        expect(observed(code)).toBe(observed(input));
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
         expect(code).toContain("var seen = 1;");
         expect(code).not.toContain("unseen");
     });
@@ -421,8 +420,8 @@ describe("cleanup: dead stores", () => {
     it("keeps a for-in binding nothing reads and a block function sloppy code sees outside its block", async () => {
         const input = "function f(o) { var n = 0; for (var k in o) n++; return n; }\nfunction g() { if (true) { function inner() {} } return typeof inner; }\nresult = [f({ a: 1, b: 2 }), g()];\n";
         const { code } = await deobfuscate(input, { passes: ["cleanup"] });
-        expect(observed(code)).toBe(observed(input));
-        expect(observed(input)).toBe('[2,"function"]');
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
+        expect(observe(input, RUN)).toBe('[2,"function"]');
     });
 
     it("keeps what can throw: a BigInt update, a let in its dead zone, a read of a let before its declaration", async () => {
@@ -434,7 +433,16 @@ describe("cleanup: dead stores", () => {
         ];
         for (const input of programs) {
             const { code } = await deobfuscate(input, { passes: ["cleanup"] });
-            expect(observed(code)).toBe(observed(input));
+            expect(observe(code, RUN)).toBe(observe(input, RUN));
         }
+    });
+
+    it("merges a var whose literal value another literal replaces right away, not one any other value replaces", async () => {
+        const input =
+            'function read() { return g; } var a = ""; var a = "keyCode"; var b = ""; b = "href"; var e = "", e = "done", f = 1, f; var g = "old", g = read(); var h = 0; h = 0; result = [a, b, e, f, g, h];';
+        const { code } = await deobfuscate(input, { passes: ["cleanup"] });
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
+        // `read()` sees the first value of `g`.
+        expect(code).toContain('var a = "keyCode";\nvar b = "href";\nvar e = "done", f = 1, f;\nvar g = "old", g = read();\nvar h = 0;\nresult');
     });
 });

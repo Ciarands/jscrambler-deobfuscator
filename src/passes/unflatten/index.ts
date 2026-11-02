@@ -10,7 +10,7 @@ import type { Pass, PassContext, PassResult } from "../../pipeline/pass.js";
 import { storageAnalysis } from "../emulate/effects.js";
 import type { RuntimeModel } from "../emulate/model.js";
 import { RUNTIME } from "../emulate/model.js";
-import { annexBName, caseDeclarations, perIterationCapture } from "./declarations.js";
+import { caseDeclarations, perIterationCapture } from "./declarations.js";
 import type { Machine, Refusal, RefusalCode, StateKey } from "./match.js";
 import { matchMachine, refuse } from "./match.js";
 import { reachableOrder, structure } from "./structure.js";
@@ -67,7 +67,10 @@ const outsideUse = (scopes: ScopeInfo, machine: Machine, inside: ReadonlySet<Nod
     const state = machine.state;
     const root = state.type === "MemberExpression" ? state.object : state;
     if (root.type !== "Identifier" || (state.type !== "Identifier" && state.type !== "MemberExpression")) return "unknown";
-    const references = scopes.variableOf(root)?.references ?? scopes.globalReferences(root.name);
+    // `variableOf` resolves through `with`, `staticVariableOf` past direct eval.
+    const variable = scopes.variableOf(root) ?? scopes.staticVariableOf(root);
+    const references = variable === undefined ? scopes.globalReferences(root.name) : scopes.references(variable);
+    if (references === undefined) return "unknown";
     for (const reference of references) {
         const identifier = reference.identifier as unknown as Node;
         if (inside.has(identifier)) continue;
@@ -174,7 +177,7 @@ export const unflatten: Pass = {
                     const { hoisted, vars } = declared.declarations;
                     for (const name of tidied.dropped.vars) vars.add(name);
                     for (const declaration of tidied.dropped.functions) {
-                        const name = annexBName(scopes, declaration);
+                        const name = scopes.annexBName(declaration);
                         if (name !== undefined) vars.add(name);
                     }
                     const block = (body: Statement[]): Statement => at<BlockStatement>({ type: "BlockStatement", body }, loop);

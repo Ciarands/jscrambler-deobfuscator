@@ -18,3 +18,6 @@ export const spliceList = <T>(list: T[], start: number, deleteCount: number, ite
 export const pushAll = <T>(list: T[], items: Iterable<T>): void => {
     for (const item of items) list.push(item);
 };
+
+/** Same length, and `===` item by item. */
+export const sameItems = <T>(a: readonly T[], b: readonly T[]): boolean => a.length === b.length && a.every((item, i) => item === b[i]);

@@ -1,12 +1,10 @@
-import { createContext, runInContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
-const observed = (source: string): string => {
-    const context = createContext({});
-    runInContext("var hostCalls = []; function host(x) { hostCalls.push(x); return x; }", context);
-    runInContext(source, context);
-    return JSON.stringify([context.result, context.hostCalls]);
+const RUN: Run = {
+    prelude: "var hostCalls = []; function host(x) { hostCalls.push(x); return x; }",
+    report: (global) => [global["result"], global["hostCalls"]],
 };
 
 const resolved = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["pure-calls"] })).code;
@@ -28,7 +26,7 @@ describe("pure-calls", () => {
 result = G();
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).not.toContain("f9(");
         expect(output).toContain(`"ABCDEDEDA"`);
         expect(output).toContain(`" /?"`);
@@ -47,7 +45,7 @@ function hex(s) {
 result = [hex("ab"), hex("\\u0000z"), pad(255)];
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`result = ['6467{"n":2}', '057f{"n":2}', "ff"];`);
     });
 
@@ -57,7 +55,7 @@ function next(x) { count++; return x + count; }
 result = [next(1), next(1), count];
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("next(1)");
     });
 
@@ -67,7 +65,7 @@ function seen() { return typeof globalThis.hostCalls; }
 result = [shout("a"), seen()];
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`result = [shout("a"), seen()];`);
     });
 
@@ -77,7 +75,7 @@ var value = noisy(1);
 result = value >= 1 && value < 2;
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("noisy(1)");
     });
 
@@ -87,7 +85,7 @@ function size() { return size.toString().length; }
 result = [mark("a"), "b".marked, size() > 0];
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`mark("a")`);
         expect(output).toContain("size() > 0");
     });
@@ -97,7 +95,7 @@ result = [mark("a"), "b".marked, size() > 0];
 result = [twice(host("a")), twice("b")];
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`twice(host("a"))`);
         expect(output).toContain(`"bb"`);
     });
@@ -109,7 +107,7 @@ var f = function (s) { return s + "!"; };
 result = [early, f("b")];
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`f("a")`);
         expect(output).toContain(`"b!"`);
     });
@@ -121,7 +119,7 @@ try { first(undefined); } catch (error) { caught = error.name; }
 result = [caught, first("xy")];
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("first(undefined)");
         expect(output).toContain(`"x"`);
     });
@@ -133,7 +131,7 @@ function guarded(s) { try { String.prototype.seen = s; } catch (error) { return 
 result = [self(), alias("a"), block(), guarded("g"), "x".seen];
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`result = [self(), alias("a"), block(), guarded("g"), "x".seen];`);
     });
 
@@ -143,7 +141,7 @@ function count(s) { counter.n = (counter.n || 0) + 1; return s + counter.n; }
 result = [count("a"), count("a")];
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`count("a")`);
     });
 
@@ -154,7 +152,7 @@ function frozen() { return Object.isFrozen(Array.prototype); }
 result = [outside(), frozen()];
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("result = [outside(), frozen()];");
     });
 
@@ -167,7 +165,7 @@ result = (function () {
 })();
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("return 1e999 + Infinity;");
         expect(output).toContain("return 1e999;");
     });
@@ -182,7 +180,7 @@ function sine(x) { return Math.sin(x); }
 result = [root(2), order("cab"), later("x"), third(0.1), compare("a", "b"), sine(1), third(9)];
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         for (const kept of [`root(2)`, `order("cab")`, `later("x")`, `third(0.1)`, `compare("a", "b")`, `sine(1)`]) expect(output).toContain(kept);
         expect(output).toContain(`"100"`);
     });
@@ -193,7 +191,7 @@ result = [spin(0)];
 if (result[0] !== 0) spin(1);
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("result = [0];");
         expect(output).toContain("spin(1);");
     });
@@ -214,7 +212,7 @@ globalThis["g"] = function () { return "replaced"; };
 result = [f(true), f(false), g("c")];
 `;
         const output = await resolved(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`inner("a")`);
         expect(output).toContain(`again("b")`);
         expect(output).toContain(`g("c")`);
@@ -226,7 +224,7 @@ function tag(s) { return s + "/" + u; }
 result = tag("a");
 `;
         const { code: output } = await deobfuscate(program, { passes: ["simplify", "pure-calls"] });
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`result = "a/undefined";`);
     });
 });

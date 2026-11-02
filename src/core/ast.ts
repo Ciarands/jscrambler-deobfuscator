@@ -1,6 +1,8 @@
-import type { MemberExpression, Node } from "oxc-parser";
+import type { ArrowFunctionExpression, Function as FunctionNode, MemberExpression, Node } from "oxc-parser";
 
 export type * from "oxc-parser";
+
+export type FunctionLike = FunctionNode | ArrowFunctionExpression;
 
 export const isFunctionNode = (node: Node | null | undefined): boolean => node?.type === "FunctionExpression" || node?.type === "FunctionDeclaration" || node?.type === "ArrowFunctionExpression";
 
@@ -30,6 +32,13 @@ export const propertyKey = (node: MemberExpression): string | undefined => {
     if (property.type !== "Literal") return undefined;
     if (typeof property.value === "string") return property.value;
     if (typeof property.value === "number") return String(property.value);
+    return undefined;
+};
+
+/** A non-computed property key's name: `a` and `"a"` give `"a"`, `1` gives `"1"`. */
+export const keyName = (key: Node): string | undefined => {
+    if (key.type === "Identifier") return key.name;
+    if (key.type === "Literal" && (typeof key.value === "string" || typeof key.value === "number")) return String(key.value);
     return undefined;
 };
 

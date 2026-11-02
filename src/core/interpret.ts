@@ -1,4 +1,4 @@
-import type { ArrowFunctionExpression, Function as FunctionNode, IdentifierReference, MemberExpression, Node, VariableDeclaration } from "./ast.js";
+import type { Function as FunctionNode, FunctionLike, IdentifierReference, MemberExpression, Node, VariableDeclaration } from "./ast.js";
 import type { JsValue, Run } from "./builtins.js";
 import {
     ArrayObject,
@@ -32,8 +32,6 @@ import {
 import type { Value } from "./evaluate.js";
 import { binary, unary } from "./evaluate.js";
 import { bindingNames, hoistedDeclarations } from "./hoisting.js";
-
-type FunctionLike = FunctionNode | ArrowFunctionExpression;
 
 /** What a name the interpreted code doesn't declare stands for. */
 export type OuterBinding = { readonly value: Value } | { readonly function: FunctionLike } | { readonly global: string };
@@ -389,12 +387,15 @@ export class Interpreter {
                         this.#finish(element.argument, reference, new ArrayObject(rest), env, mode);
                         continue;
                     }
-                    const [target, fallback] = element.type === "AssignmentPattern" ? [element.left as Node, element.right] : [element as Node, null];
-                    const reference = this.#early(target, env, mode);
-                    const next = iterator.next();
-                    let item = next.done === true ? undefined : next.value;
-                    if (item === undefined && fallback !== null) item = this.#eval(fallback, env);
-                    this.#finish(target, reference, item, env, mode);
+                    this.#bindElement(
+                        element,
+                        () => {
+                            const next = iterator.next();
+                            return next.done === true ? undefined : next.value;
+                        },
+                        env,
+                        mode
+                    );
                 }
                 return;
             }
@@ -411,17 +412,22 @@ export class Interpreter {
                     }
                     const key = property.computed ? toStr(this.#eval(property.key, env), this.#run) : staticKey(property.key);
                     used.add(key);
-                    const [target, fallback] = property.value.type === "AssignmentPattern" ? [property.value.left as Node, property.value.right] : [property.value as Node, null];
-                    const reference = this.#early(target, env, mode);
-                    let item = getMember(value, key, this.#run);
-                    if (item === undefined && fallback !== null) item = this.#eval(fallback, env);
-                    this.#finish(target, reference, item, env, mode);
+                    this.#bindElement(property.value, () => getMember(value, key, this.#run), env, mode);
                 }
                 return;
             }
             default:
                 refuse(`it binds a ${pattern.type}`);
         }
+    }
+
+    /** A pattern element, `target = fallback` or `target`: its reference before `read` (spec order), then its value, defaulted. */
+    #bindElement(element: Node, read: () => JsValue, env: Env, mode: "init" | "assign"): void {
+        const [target, fallback] = element.type === "AssignmentPattern" ? [element.left as Node, element.right] : [element, null];
+        const reference = this.#early(target, env, mode);
+        let item = read();
+        if (item === undefined && fallback !== null) item = this.#eval(fallback, env);
+        this.#finish(target, reference, item, env, mode);
     }
 
     /** A destructuring assignment's simple target is evaluated before its value is read (spec order). */
@@ -675,7 +681,8 @@ export class Interpreter {
     #call(node: Node & { type: "CallExpression" }, env: Env): JsValue {
         const callee = unparenthesized(node.callee);
         let fn: JsValue;
-        let self: JsValue;
+        // A plain call's `this` is `undefined`.
+        let self: JsValue = undefined;
         if (callee.type === "MemberExpression") {
             self = this.#eval(callee.object, env);
             if (callee.optional && (self === null || self === undefined)) throw SHORT_CIRCUIT;

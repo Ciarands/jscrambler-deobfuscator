@@ -1,14 +1,8 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
-const observed = (source: string): string => {
-    const timers: (() => void)[] = [];
-    const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };
-    runInNewContext(source, context);
-    for (const callback of timers) callback();
-    return JSON.stringify(context.result);
-};
+const RUN: Run = { timers: true };
 
 const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "code-locks"] })).code;
 
@@ -38,7 +32,7 @@ describe("code-locks", () => {
     it("removes calls after the prelude's first one and answers used ones from the cache", async () => {
         const program = `${lock()}setTimeout(function () { G.L.check(); log.push(G.L.check()); result = log; });\n`;
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("}();\nG.L.check();");
         expect(output).toContain("log.push(67);");
         expect(output.match(/G\.L\.check\(\)/g)).toHaveLength(1);
@@ -47,7 +41,7 @@ describe("code-locks", () => {
     it("keeps calls of a lock whose cache can be cleared", async () => {
         const program = `${lock({ extra: "\n  c[3].reset = function () { c[6] = undefined; };" })}setTimeout(function () { G.L.reset(); result = [G.L.check(), log]; });\n`;
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("result = [G.L.check(), log];");
     });
 
@@ -56,7 +50,7 @@ describe("code-locks", () => {
         for (const shape of [{ firstCall: "" }, { firstCall: "", slowAnswer: 67 }, { setCache: "" }]) {
             const program = `${lock(shape)}${later}`;
             const output = await run(program);
-            expect(observed(output)).toBe(observed(program));
+            expect(observe(output, RUN)).toBe(observe(program, RUN));
             expect(output).toContain("G.L.check();\n  result = [G.L.check(), log];");
         }
     });
@@ -111,7 +105,7 @@ describe("code-locks full removal", () => {
             prelude: "G.L.check();\n(G.L.check(), 0);\nglobalThis.KeptG = G;",
         })}setTimeout(function () { G.L.check(); if (G) { result = [G.L.check(), seen]; } });\n`;
         const output = await runWithCleanup(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).not.toContain("check");
         expect(output).not.toContain("G.L");
     });
@@ -122,7 +116,7 @@ describe("code-locks full removal", () => {
             prelude: "G.L.check();\nglobalThis.KeptG = G;",
         })}setTimeout(function () { result = [G.L.check(), early]; });\n`;
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).not.toContain("G.L.check()");
     });
 
@@ -132,7 +126,7 @@ describe("code-locks full removal", () => {
             'var probe = function () { var r = function (e) { var w = []; var t = 0; while (t < e.length) { w[t] = String.fromCharCode(e[t] + 99); t++; } return G[w.sort(function () { return 0; }).join("")]; }, found = r([-2, -1]), r = found; return typeof r; };\n';
         const program = `${localLock()}${probe}setTimeout(function () { result = [G.L.check(), probe()]; });\n`;
         const output = await runWithCleanup(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).not.toContain("G.L.check()");
     });
 
@@ -141,7 +135,7 @@ describe("code-locks full removal", () => {
         const setup = '(function () { Object.defineProperty(G, "r", { get: function () { return function () { return globalThis.MissingName7; }; } }); })();';
         const program = `${localLock({ before: setup, checks: 'd[8] = typeof G.r() === "function";' })}setTimeout(function () { result = [G.L.check()]; });\n`;
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).not.toContain("G.L.check()");
     });
 
@@ -178,7 +172,7 @@ describe("code-locks full removal", () => {
         for (const { prelude, later: afterPrelude } of cases) {
             const program = `${localLock(prelude === undefined ? {} : { prelude })}setTimeout(function () { ${afterPrelude} });\n`;
             const output = await runWithCleanup(program);
-            expect(observed(output)).toBe(observed(program));
+            expect(observe(output, RUN)).toBe(observe(program, RUN));
             expect(output).toContain("}();\nG.L.check();");
         }
     });
@@ -187,14 +181,14 @@ describe("code-locks full removal", () => {
         const wrapper = 'G.W = function () { return typeof G.L.check === "function" ? G.L.check.apply(G.L, arguments) : G.L.check; };\n';
         const program = `${localLock()}${wrapper}setTimeout(function () { G.L.check(); result = [G.W(), G.L.check()]; });\n`;
         const output = await runWithCleanup(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("}();\nG.L.check();");
     });
 
     it("keeps the prelude's calls when one of them uses the value", async () => {
         const program = `${localLock({ prelude: "G.L.check();\nvar second = G.L.check();" })}setTimeout(function () { result = [second, G.L.check()]; });\n`;
         const output = await runWithCleanup(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("}();\nG.L.check();");
     });
 
@@ -209,7 +203,7 @@ describe("code-locks full removal", () => {
         for (const checks of effects) {
             const program = `${localLock({ checks })}setTimeout(function () { result = [G.L.check(), seen, [].push.marked === true, G.marked === true]; });\n`;
             const output = await run(program);
-            expect(observed(output)).toBe(observed(program));
+            expect(observe(output, RUN)).toBe(observe(program, RUN));
             expect(output).toContain("}();\nG.L.check();");
         }
     });
@@ -241,7 +235,7 @@ describe("code-locks: constant locks", () => {
     it("answers every call, the prelude's included, when the checks touch only their own objects", async () => {
         const program = constantLock();
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).not.toContain("G.L.check()");
         expect(output).toContain("var first = 48;");
     });
@@ -249,7 +243,7 @@ describe("code-locks: constant locks", () => {
     it("keeps every call when the checks change something outside their own objects", async () => {
         const program = constantLock("\n    seen = true;");
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("var first = G.L.check();");
     });
 });

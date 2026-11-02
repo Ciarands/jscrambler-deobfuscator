@@ -1,9 +1,9 @@
 import type { Node, Statement } from "../../core/ast.js";
-import { isFunctionNode } from "../../core/ast.js";
+import { isFunctionNode, memberPath } from "../../core/ast.js";
 import type { Reference, ScopeInfo, Variable } from "../../core/scope.js";
 import { traverse } from "../../core/traverse.js";
-import type { Path } from "../../core/traverse.js";
 import type { RuntimeModel } from "./model.js";
+import type { PropertyPath } from "./guest.js";
 
 export interface StorageMatcher {
     /** `node` is `G` itself, or another name that only ever holds `G`. */
@@ -20,25 +20,15 @@ export const rootStatements = (root: Node): Statement[] => {
     return [];
 };
 
-/** Whether the use of `G` at `path` is only tested; operators only read (semantic model 4). */
-export const onlyTested = (path: Path): boolean => {
-    let operand = path;
-    while (operand.parent?.type === "LogicalExpression" && operand.parentPath !== null) operand = operand.parentPath;
-    const parent = operand.parent;
-    switch (parent?.type) {
-        case "IfStatement":
-        case "ConditionalExpression":
-        case "WhileStatement":
-        case "DoWhileStatement":
-        case "ForStatement":
-            return operand.key === "test";
-        case "UnaryExpression":
-            return parent.operator === "!" || parent.operator === "typeof" || parent.operator === "void";
-        case "BinaryExpression":
-            return parent.operator === "===" || parent.operator === "!==" || parent.operator === "==" || parent.operator === "!=";
-        default:
-            return false;
+/** The storage paths root statements assign (`G.k.l = ...`): every path `definitionOf` can find a definition of. */
+export const assignedPaths = (runtime: RuntimeModel, isStorage: (node: Node) => boolean): PropertyPath[] => {
+    const paths = new Map<string, PropertyPath>();
+    for (const statement of rootStatements(runtime.root)) {
+        if (statement.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression") continue;
+        const target = memberPath(statement.expression.left);
+        if (target !== undefined && isStorage(target.root)) paths.set(JSON.stringify(target.keys), target.keys);
     }
+    return [...paths.values()];
 };
 
 /** Not counting nested non-arrow functions. */

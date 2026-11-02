@@ -1,6 +1,6 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
 const PROGRAM = `
 function G() {}
@@ -16,23 +16,7 @@ function run(n) {
 result = run(host.n);
 `;
 
-const run = (code: string): string => {
-    const context: Record<string, unknown> = { host: { n: 5 } };
-    runInNewContext(code, context);
-    return JSON.stringify(context.result);
-};
-
-const observed = (source: string): string => {
-    const timers: (() => void)[] = [];
-    const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback), host: { k: () => 7 } };
-    try {
-        runInNewContext(source, context);
-        for (const callback of timers) callback();
-    } catch (error) {
-        return error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-    }
-    return JSON.stringify(context.result);
-};
+const RUN: Run = { globals: () => ({ host: { n: 5, k: () => 7 } }), timers: true };
 
 const inline = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "wrappers"] })).code;
 
@@ -44,7 +28,7 @@ describe("wrappers", () => {
         // Function target, called through a local holding G: rooted on that local.
         // Value target: inlined only without arguments. A foreign `this` blocks inlining.
         expect(code).toContain("return [s.H.add(n), G.H.limit, G.v(n), G.o(n)];");
-        expect(run(code)).toBe(run(PROGRAM));
+        expect(observe(code, RUN)).toBe(observe(PROGRAM, RUN));
     });
 
     it("inlines calls whose arguments run code when nothing but G's paths reaches the target", async () => {
@@ -60,7 +44,7 @@ setTimeout(function () { var n = host.k(); result = G.f(n.toString(), host.k());
 `;
         const output = await inline(program);
         expect(output).toContain("result = G.H.add(n.toString(), host.k());");
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
     });
 
     it("keeps calls whose arguments may change the target first", async () => {
@@ -95,7 +79,7 @@ setTimeout(function () { result = G.f(G.f(1)); });
         };
         for (const program of Object.values(cases)) {
             const output = await inline(program);
-            expect(observed(output)).toBe(observed(program));
+            expect(observe(output, RUN)).toBe(observe(program, RUN));
             expect(output).toContain("result = G.f(");
         }
     });
@@ -109,7 +93,7 @@ ${WRAPPER}
 setTimeout(function () { G.H.add = 5; result = G.f(1); });
 `;
         const output = await inline(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("result = G.f(1);");
     });
 
@@ -123,7 +107,7 @@ setTimeout(function () {
 });
 `;
         const output = await inline(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("p.f(1)");
     });
 });

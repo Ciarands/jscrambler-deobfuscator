@@ -1,5 +1,5 @@
 import type { Expression, Function as FunctionNode, Node, Statement, VariableDeclarator } from "../../core/ast.js";
-import { propertyKey } from "../../core/ast.js";
+import { keyName, propertyKey } from "../../core/ast.js";
 import { evaluate } from "../../core/evaluate.js";
 import type { PassLog } from "../../core/log.js";
 import type { ScopeInfo, Variable } from "../../core/scope.js";
@@ -49,6 +49,15 @@ interface Bindings {
     state: Variable | undefined;
     lookup: Variable | undefined;
     table: Variable | undefined;
+}
+
+/** What the template's matchers resolve names and builtins through. */
+interface DecoderContext {
+    readonly scopes: ScopeInfo;
+    readonly matcher: StorageMatcher;
+    readonly callAliases: RuntimeModel["callAliases"];
+    /** Each alias's original, by `owner.alias`. */
+    readonly originals: ReadonlyMap<string, string>;
 }
 
 const declaratorIn = (variable: Variable, body: readonly Statement[]): VariableDeclarator | undefined => {
@@ -126,15 +135,7 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
     const templated = new Set<string>();
     const settlingCalls = new Set<LoggedCall>();
     const { storage, wrappers, aliases, callAliases } = runtime;
-    const originals = new Map(aliases.map((alias) => [`${pathName(alias.owner)}.${alias.alias}`, alias.original]));
-    /** An alias's original, or the name itself (relies on model 7: builtins intact). */
-    const builtin = (owner: string, name: string | undefined): string | undefined => (name === undefined ? undefined : (originals.get(`${owner}.${name}`) ?? name));
-    /** As `owner.original`. */
-    const callAliasOf = (callee: Node): string | undefined => {
-        if (callee.type !== "MemberExpression" || !matcher.isStorage(callee.object)) return undefined;
-        const alias = callAliases.get(propertyKey(callee) ?? "");
-        return alias === undefined ? undefined : `${pathName(alias.owner)}.${alias.original}`;
-    };
+    const cx: DecoderContext = { scopes, matcher, callAliases, originals: new Map(aliases.map((alias) => [`${pathName(alias.owner)}.${alias.alias}`, alias.original])) };
 
     const targets = new Map<string, PropertyPath>();
     const targetOf = new Map<string, string>();
@@ -165,7 +166,7 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
             );
             continue;
         }
-        const template = templateOf(statement, method);
+        const template = templateOf(cx, statement, method);
         if (typeof template === "string") {
             log.debug(`${name}: not a string decoder of the known template, ${template}`, statement);
             continue;
@@ -218,318 +219,330 @@ export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, s
     }
     if (settledKeys.size > 0) log.info(`${settledKeys.size} wrapper(s) of string decoders proven settled during the prelude; ${lookups.size} recorded call(s) on them were pure lookups`);
     return { lookups, settled: settledKeys, templated, settlingCalls };
+};
 
-    function templateOf(statement: Statement, method: string): Template | string {
-        if (statement.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression" || statement.expression.operator !== "=")
-            return "its holder isn't assigned by a plain assignment";
-        const built = statement.expression.right;
-        const builder = built.type === "CallExpression" && built.arguments.length === 0 ? plainFunction(built.callee) : undefined;
-        const builderBody = builder === undefined ? undefined : blockOf(builder);
-        if (builder === undefined || builderBody === undefined) return "its holder isn't built by an immediately invoked function";
-        const returned = returnsOf(builder);
-        const last = builderBody.at(-1);
-        if (returned.length !== 1 || last?.type !== "ReturnStatement" || last.argument?.type !== "Identifier") return "the builder doesn't end in its one return of a local";
-        const holder = scopes.variableOf(last.argument);
-        const holderDeclarator = holder === undefined ? undefined : declaratorIn(holder, builderBody);
-        if (holder === undefined || holderDeclarator?.init?.type !== "ObjectExpression") return "the builder's result isn't an object literal its own code declares";
-        const properties = holderDeclarator.init.properties;
-        if (properties.some((p) => p.type !== "Property" || p.computed)) return "the holder literal has a computed or spread property";
-        const methods = properties.filter((p) => p.type === "Property" && propertyName(p.key) === method);
-        const [property] = methods;
-        if (methods.length !== 1 || property?.type !== "Property" || property.kind !== "init" || property.method) return `the holder literal doesn't have exactly one plain property ${method}`;
-        const setup = property.value.type === "CallExpression" ? plainFunction(property.value.callee) : undefined;
-        const setupBody = setup === undefined ? undefined : blockOf(setup);
-        if (setup === undefined || setupBody === undefined) return `${method} isn't the result of an immediately invoked function`;
-        const setupReturns = returnsOf(setup);
-        const setupLast = setupBody.at(-1);
-        if (setupReturns.length !== 1 || setupLast?.type !== "ReturnStatement" || setupLast.argument?.type !== "Identifier") return "its setup function doesn't end in its one return of a local";
-        const stageVariable = scopes.variableOf(setupLast.argument);
-        const stageFn = stageVariable === undefined ? undefined : localFunction(stageVariable, setupBody);
-        if (stageVariable === undefined || stageFn === undefined) return "the stage function isn't a function local to the setup";
-        const [param] = stageFn.params;
-        const argument = stageFn.params.length === 1 && param?.type === "Identifier" ? scopes.variableOf(param) : undefined;
-        if (argument === undefined) return "the stage function doesn't take one plain parameter";
+/** An alias's original, or the name itself (relies on model 7: builtins intact). */
+const builtin = (cx: DecoderContext, owner: string, name: string | undefined): string | undefined => (name === undefined ? undefined : (cx.originals.get(`${owner}.${name}`) ?? name));
 
-        const bindings: Bindings = { holder, argument, state: undefined, lookup: undefined, table: undefined };
-        const accepted = new Set<Node>();
-        const stage = matchStage(stageFn, method, setupBody, bindings, accepted);
-        if (typeof stage === "string") return stage;
-        const { state, lookup, table } = bindings;
-        if (state === undefined || lookup === undefined || table === undefined) return "the stage function's names weren't all found";
+/** As `owner.original`. */
+const callAliasOf = (cx: DecoderContext, callee: Node): string | undefined => {
+    if (callee.type !== "MemberExpression" || !cx.matcher.isStorage(callee.object)) return undefined;
+    const alias = cx.callAliases.get(propertyKey(callee) ?? "");
+    return alias === undefined ? undefined : `${pathName(alias.owner)}.${alias.original}`;
+};
 
-        const only = (variable: Variable, allowed: (identifier: Node) => boolean): boolean =>
-            scopes.staticReferences(variable).every((reference) => {
-                const identifier = reference.identifier as unknown as Node;
-                return accepted.has(identifier) || variable.identifiers.includes(identifier as never) || allowed(identifier);
-            });
-        if (!only(holder, (identifier) => identifier === last.argument)) return "the holder is used outside the template";
-        if (!only(stageVariable, (identifier) => identifier === setupLast.argument)) return "the stage function is used outside the template";
-        if (!only(lookup, () => false)) return "the lookup is used outside the stage function";
-        if (!only(argument, () => false)) return "the stage function's parameter is used outside its guards and lookups";
-        const stateInit = declaratorIn(state, setupBody)?.init;
-        if (stateInit === null || stateInit === undefined || numberOf(stateInit) === undefined) return "the stage counter isn't a number the setup's own code declares";
-        if (!only(state, () => false)) return "the stage counter is used outside the stage function";
-        const tableProblem = checkTable(table, setup, setupBody, accepted);
-        return tableProblem ?? stage;
+const templateOf = (cx: DecoderContext, statement: Statement, method: string): Template | string => {
+    const { scopes } = cx;
+    if (statement.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression" || statement.expression.operator !== "=")
+        return "its holder isn't assigned by a plain assignment";
+    const built = statement.expression.right;
+    const builder = built.type === "CallExpression" && built.arguments.length === 0 ? plainFunction(built.callee) : undefined;
+    const builderBody = builder === undefined ? undefined : blockOf(builder);
+    if (builder === undefined || builderBody === undefined) return "its holder isn't built by an immediately invoked function";
+    const returned = returnsOf(builder);
+    const last = builderBody.at(-1);
+    if (returned.length !== 1 || last?.type !== "ReturnStatement" || last.argument?.type !== "Identifier") return "the builder doesn't end in its one return of a local";
+    const holder = scopes.variableOf(last.argument);
+    const holderDeclarator = holder === undefined ? undefined : declaratorIn(holder, builderBody);
+    if (holder === undefined || holderDeclarator?.init?.type !== "ObjectExpression") return "the builder's result isn't an object literal its own code declares";
+    const properties = holderDeclarator.init.properties;
+    if (properties.some((p) => p.type !== "Property" || p.computed)) return "the holder literal has a computed or spread property";
+    const methods = properties.filter((p) => p.type === "Property" && keyName(p.key) === method);
+    const [property] = methods;
+    if (methods.length !== 1 || property?.type !== "Property" || property.kind !== "init" || property.method) return `the holder literal doesn't have exactly one plain property ${method}`;
+    const setup = property.value.type === "CallExpression" ? plainFunction(property.value.callee) : undefined;
+    const setupBody = setup === undefined ? undefined : blockOf(setup);
+    if (setup === undefined || setupBody === undefined) return `${method} isn't the result of an immediately invoked function`;
+    const setupReturns = returnsOf(setup);
+    const setupLast = setupBody.at(-1);
+    if (setupReturns.length !== 1 || setupLast?.type !== "ReturnStatement" || setupLast.argument?.type !== "Identifier") return "its setup function doesn't end in its one return of a local";
+    const stageVariable = scopes.variableOf(setupLast.argument);
+    const stageFn = stageVariable === undefined ? undefined : localFunction(stageVariable, setupBody);
+    if (stageVariable === undefined || stageFn === undefined) return "the stage function isn't a function local to the setup";
+    const [param] = stageFn.params;
+    const argument = stageFn.params.length === 1 && param?.type === "Identifier" ? scopes.variableOf(param) : undefined;
+    if (argument === undefined) return "the stage function doesn't take one plain parameter";
+
+    const bindings: Bindings = { holder, argument, state: undefined, lookup: undefined, table: undefined };
+    const accepted = new Set<Node>();
+    const stage = matchStage(cx, stageFn, method, setupBody, bindings, accepted);
+    if (typeof stage === "string") return stage;
+    const { state, lookup, table } = bindings;
+    if (state === undefined || lookup === undefined || table === undefined) return "the stage function's names weren't all found";
+
+    const only = (variable: Variable, allowed: (identifier: Node) => boolean): boolean =>
+        scopes.staticReferences(variable).every((reference) => {
+            const identifier = reference.identifier as unknown as Node;
+            return accepted.has(identifier) || variable.identifiers.includes(identifier as never) || allowed(identifier);
+        });
+    if (!only(holder, (identifier) => identifier === last.argument)) return "the holder is used outside the template";
+    if (!only(stageVariable, (identifier) => identifier === setupLast.argument)) return "the stage function is used outside the template";
+    if (!only(lookup, () => false)) return "the lookup is used outside the stage function";
+    if (!only(argument, () => false)) return "the stage function's parameter is used outside its guards and lookups";
+    const stateInit = declaratorIn(state, setupBody)?.init;
+    if (stateInit === null || stateInit === undefined || numberOf(stateInit) === undefined) return "the stage counter isn't a number the setup's own code declares";
+    if (!only(state, () => false)) return "the stage counter is used outside the stage function";
+    const tableProblem = checkTable(cx, table, setup, setupBody, accepted);
+    return tableProblem ?? stage;
+};
+
+const matchStage = (cx: DecoderContext, fn: FunctionNode, method: string, setupBody: readonly Statement[], bindings: Bindings, accepted: Set<Node>): Template | string => {
+    const { scopes } = cx;
+    const body = blockOf(fn);
+    const tail = body?.at(-1);
+    const chain = body?.at(-2);
+    if (body === undefined || tail?.type !== "ReturnStatement" || tail.argument === null || chain?.type !== "IfStatement")
+        return "the stage function doesn't end in its stage chain and a return of its counter";
+    const returned = tail.argument;
+    const counter = returned.type === "UpdateExpression" && returned.operator === "++" ? returned.argument : returned;
+    if (counter.type !== "Identifier") return "the stage function doesn't return its counter";
+    bindings.state = scopes.variableOf(counter);
+    if (bindings.state === undefined) return "the stage counter isn't a local";
+    accepted.add(counter);
+    const tailKind = returned.type === "UpdateExpression" ? (returned.prefix ? "pre" : "post") : "after";
+
+    const branches: { test: Expression; body: Node }[] = [];
+    let link: Node = chain;
+    while (link.type === "IfStatement") {
+        branches.push({ test: link.test, body: link.consequent });
+        if (link.alternate === null) return "the stage chain has no final freeze";
+        link = link.alternate;
     }
+    const freeze = lookupExit(cx, link, method, bindings, accepted);
+    if (freeze !== undefined) return freeze;
+    const lookupFn = bindings.lookup === undefined ? undefined : localFunction(bindings.lookup, setupBody);
+    const tableProblem = lookupFn === undefined ? "the lookup isn't a function local to the setup" : bindTable(cx, lookupFn, bindings, accepted);
+    if (tableProblem !== undefined) return tableProblem;
 
-    function matchStage(fn: FunctionNode, method: string, setupBody: readonly Statement[], bindings: Bindings, accepted: Set<Node>): Template | string {
-        const body = blockOf(fn);
-        const tail = body?.at(-1);
-        const chain = body?.at(-2);
-        if (body === undefined || tail?.type !== "ReturnStatement" || tail.argument === null || chain?.type !== "IfStatement")
-            return "the stage function doesn't end in its stage chain and a return of its counter";
-        const returned = tail.argument;
-        const counter = returned.type === "UpdateExpression" && returned.operator === "++" ? returned.argument : returned;
-        if (counter.type !== "Identifier") return "the stage function doesn't return its counter";
-        bindings.state = scopes.variableOf(counter);
-        if (bindings.state === undefined) return "the stage counter isn't a local";
-        accepted.add(counter);
-        const tailKind = returned.type === "UpdateExpression" ? (returned.prefix ? "pre" : "post") : "after";
-
-        const branches: { test: Expression; body: Node }[] = [];
-        let link: Node = chain;
-        while (link.type === "IfStatement") {
-            branches.push({ test: link.test, body: link.consequent });
-            if (link.alternate === null) return "the stage chain has no final freeze";
-            link = link.alternate;
-        }
-        const freeze = lookupExit(link, method, bindings, accepted);
-        if (freeze !== undefined) return freeze;
-        const lookupFn = bindings.lookup === undefined ? undefined : localFunction(bindings.lookup, setupBody);
-        const tableProblem = lookupFn === undefined ? "the lookup isn't a function local to the setup" : bindTable(lookupFn, bindings, accepted);
-        if (tableProblem !== undefined) return tableProblem;
-
-        for (const statement of body.slice(0, -2)) {
-            if (statement.type !== "IfStatement" || statement.alternate !== null) return "the stage function has other statements than its exits, chain and return";
-            const guard = guardOf(statement.test, bindings, accepted);
-            if (typeof guard === "string") return guard;
-            const exit = lookupExit(statement.consequent, method, bindings, accepted);
-            if (exit !== undefined) return exit;
-        }
-        const stages: { state: number; argument: number | undefined }[] = [];
-        let bodyStep: number | undefined;
-        for (const branch of branches) {
-            const guard = guardOf(branch.test, bindings, accepted);
-            if (typeof guard === "string") return guard;
-            if (guard.state === undefined) return "a stage branch isn't guarded by its counter";
-            stages.push({ state: guard.state, argument: guard.argument });
-            const step = stageBody(branch.body, bindings, accepted);
-            if (typeof step === "string") return step;
-            if (bodyStep !== undefined && step !== bodyStep) return "the stage branches step the counter by different amounts";
-            bodyStep = step;
-        }
-        if (bodyStep === undefined || bodyStep + (tailKind === "after" ? 0 : 1) <= 0) return "the stages don't step the counter";
-        return { stages, bodyStep, tail: tailKind };
+    for (const statement of body.slice(0, -2)) {
+        if (statement.type !== "IfStatement" || statement.alternate !== null) return "the stage function has other statements than its exits, chain and return";
+        const guard = guardOf(cx, statement.test, bindings, accepted);
+        if (typeof guard === "string") return guard;
+        const exit = lookupExit(cx, statement.consequent, method, bindings, accepted);
+        if (exit !== undefined) return exit;
     }
-
-    /** `{ [Q.m = L;] [if (true) { Q.m = L; }] return L(x); }` */
-    function lookupExit(node: Node, method: string, bindings: Bindings, accepted: Set<Node>): string | undefined {
-        const statements = node.type === "BlockStatement" ? node.body : [node as Statement];
-        const last = statements.at(-1);
-        const call = last?.type === "ReturnStatement" ? last.argument : null;
-        if (call?.type !== "CallExpression" || call.callee.type !== "Identifier" || call.arguments.length !== 1) return "an exit of the stage function doesn't return a lookup";
-        const lookup = scopes.variableOf(call.callee);
-        bindings.lookup ??= lookup;
-        const [argument] = call.arguments;
-        if (lookup === undefined || lookup !== bindings.lookup || argument?.type !== "Identifier" || scopes.variableOf(argument) !== bindings.argument)
-            return "an exit of the stage function doesn't look its argument up";
-        accepted.add(call.callee).add(argument);
-        const freezeWrite = (statement: Node): boolean => {
-            if (statement.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression" || statement.expression.operator !== "=") return false;
-            const { left, right } = statement.expression;
-            if (left.type !== "MemberExpression" || left.object.type !== "Identifier" || propertyKey(left) !== method || scopes.variableOf(left.object) !== bindings.holder) return false;
-            if (right.type !== "Identifier" || scopes.variableOf(right) !== bindings.lookup) return false;
-            accepted.add(left.object).add(right);
-            return true;
-        };
-        for (const statement of statements.slice(0, -1)) {
-            if (freezeWrite(statement)) continue;
-            // `if (true) { Q.m = L; }`, as unflattening leaves it.
-            if (statement.type === "IfStatement" && statement.alternate === null) {
-                const test = evaluate(statement.test);
-                const writes = statement.consequent.type === "BlockStatement" ? statement.consequent.body : [statement.consequent];
-                if (test.ok && Boolean(test.value) && writes.every(freezeWrite)) continue;
-            }
-            return "an exit of the stage function does more than write the lookup to the holder";
-        }
-        return undefined;
+    const stages: { state: number; argument: number | undefined }[] = [];
+    let bodyStep: number | undefined;
+    for (const branch of branches) {
+        const guard = guardOf(cx, branch.test, bindings, accepted);
+        if (typeof guard === "string") return guard;
+        if (guard.state === undefined) return "a stage branch isn't guarded by its counter";
+        stages.push({ state: guard.state, argument: guard.argument });
+        const step = stageBody(cx, branch.body, bindings, accepted);
+        if (typeof step === "string") return step;
+        if (bodyStep !== undefined && step !== bodyStep) return "the stage branches step the counter by different amounts";
+        bodyStep = step;
     }
+    if (bodyStep === undefined || bodyStep + (tailKind === "after" ? 0 : 1) <= 0) return "the stages don't step the counter";
+    return { stages, bodyStep, tail: tailKind };
+};
 
-    function bindTable(fn: Node, bindings: Bindings, accepted: Set<Node>): string | undefined {
-        const lookupFn = plainFunction(fn);
-        const [param] = lookupFn?.params ?? [];
-        const body = lookupFn?.body;
-        const statements = body?.type === "BlockStatement" ? body.body : undefined;
-        const only = statements?.length === 1 ? statements[0] : undefined;
-        const read = body?.type === "BlockStatement" ? (only?.type === "ReturnStatement" ? only.argument : null) : body;
-        if (
-            lookupFn?.params.length !== 1 ||
-            param?.type !== "Identifier" ||
-            read?.type !== "MemberExpression" ||
-            !read.computed ||
-            read.object.type !== "Identifier" ||
-            read.property.type !== "Identifier"
-        )
-            return "the lookup isn't `y => T[y]`";
-        const index = scopes.variableOf(read.property);
-        if (index === undefined || index !== scopes.variableOf(param) || !scopes.staticReferences(index).every((reference) => (reference.identifier as unknown as Node) === read.property))
-            return "the lookup isn't `y => T[y]`";
-        bindings.table = scopes.variableOf(read.object);
-        if (bindings.table === undefined) return "the lookup's table isn't a local";
-        accepted.add(read.object);
-        return undefined;
-    }
-
-    /** `R === c && x === d`, either order and side. */
-    function guardOf(test: Expression, bindings: Bindings, accepted: Set<Node>): { state: number | undefined; argument: number | undefined } | string {
-        let state: number | undefined;
-        let argument: number | undefined;
-        for (const conjunct of conjuncts(test)) {
-            if (conjunct.type !== "BinaryExpression" || conjunct.operator !== "===") return "a guard in the stage function isn't a conjunction of strict comparisons";
-            const [name, constant] = conjunct.left.type === "Identifier" ? [conjunct.left, conjunct.right] : [conjunct.right, conjunct.left];
-            const value = numberOf(constant);
-            const variable = name.type === "Identifier" ? scopes.variableOf(name) : undefined;
-            if (value === undefined || variable === undefined) return "a guard in the stage function doesn't compare a name with a number";
-            if (variable === bindings.state && state === undefined) state = value;
-            else if (variable === bindings.argument && argument === undefined) argument = value;
-            else return "a guard in the stage function compares other names";
-            accepted.add(name);
-        }
-        return { state, argument };
-    }
-
-    function stageBody(node: Node, bindings: Bindings, accepted: Set<Node>): number | string {
-        let step = 0;
-        for (const statement of node.type === "BlockStatement" ? node.body : [node as Statement]) {
-            if (statement.type !== "ExpressionStatement") return "a stage body has other statements than increments and shuffles";
-            const e = statement.expression;
-            const increment =
-                e.type === "UpdateExpression" && e.operator === "++"
-                    ? { name: e.argument, by: 1 }
-                    : e.type === "AssignmentExpression" && e.operator === "+="
-                      ? { name: e.left, by: numberOf(e.right) }
-                      : undefined;
-            if (increment !== undefined) {
-                if (increment.name.type !== "Identifier" || scopes.variableOf(increment.name) !== bindings.state || increment.by === undefined || increment.by <= 0)
-                    return "a stage body changes the counter otherwise than by a positive step";
-                accepted.add(increment.name);
-                step += increment.by;
-                continue;
-            }
-            if (!shuffle(e, bindings, accepted)) return "a stage body has a statement other than the table shuffle";
-        }
-        return step;
-    }
-
-    function isTable(node: Node, bindings: Bindings, accepted: Set<Node>): boolean {
-        if (node.type !== "Identifier" || scopes.variableOf(node) !== bindings.table) return false;
-        accepted.add(node);
+/** `{ [Q.m = L;] [if (true) { Q.m = L; }] return L(x); }` */
+const lookupExit = (cx: DecoderContext, node: Node, method: string, bindings: Bindings, accepted: Set<Node>): string | undefined => {
+    const { scopes } = cx;
+    const statements = node.type === "BlockStatement" ? node.body : [node as Statement];
+    const last = statements.at(-1);
+    const call = last?.type === "ReturnStatement" ? last.argument : null;
+    if (call?.type !== "CallExpression" || call.callee.type !== "Identifier" || call.arguments.length !== 1) return "an exit of the stage function doesn't return a lookup";
+    const lookup = scopes.variableOf(call.callee);
+    bindings.lookup ??= lookup;
+    const [argument] = call.arguments;
+    if (lookup === undefined || lookup !== bindings.lookup || argument?.type !== "Identifier" || scopes.variableOf(argument) !== bindings.argument)
+        return "an exit of the stage function doesn't look its argument up";
+    accepted.add(call.callee).add(argument);
+    const freezeWrite = (statement: Node): boolean => {
+        if (statement.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression" || statement.expression.operator !== "=") return false;
+        const { left, right } = statement.expression;
+        if (left.type !== "MemberExpression" || left.object.type !== "Identifier" || propertyKey(left) !== method || scopes.variableOf(left.object) !== bindings.holder) return false;
+        if (right.type !== "Identifier" || scopes.variableOf(right) !== bindings.lookup) return false;
+        accepted.add(left.object).add(right);
         return true;
-    }
-
-    /** `X.splice(a, b)` / `G.splice(X, a, b)` (relies on model 7: builtins intact). */
-    function splice(node: Node, inner: (node: Node) => boolean): boolean {
-        if (node.type !== "CallExpression") return false;
-        const { callee } = node;
-        if (callee.type === "MemberExpression" && builtin("Array.prototype", propertyKey(callee)) === "splice") return twoNumbers(node.arguments) && inner(callee.object);
-        const [receiver, ...rest] = node.arguments;
-        return callAliasOf(callee) === "Array.prototype.splice" && receiver !== undefined && twoNumbers(rest) && inner(receiver);
-    }
-
-    /**
-     * `T.unshift.apply(T, T.splice(a, b).splice(c, d))` or its call-alias form: hands T to builtins only as their
-     * receiver (relies on model 7: builtins intact).
-     */
-    function shuffle(node: Node, bindings: Bindings, accepted: Set<Node>): boolean {
-        if (node.type !== "CallExpression") return false;
-        const table = (n: Node): boolean => isTable(n, bindings, accepted);
-        const spliced = (n: Node): boolean => splice(n, (inner) => splice(inner, table));
-        const { callee } = node;
-        if (callee.type === "MemberExpression" && builtin("Function.prototype", propertyKey(callee)) === "apply") {
-            const unshift = callee.object;
-            const [receiver, items] = node.arguments;
-            return (
-                node.arguments.length === 2 &&
-                unshift.type === "MemberExpression" &&
-                builtin("Array.prototype", propertyKey(unshift)) === "unshift" &&
-                table(unshift.object) &&
-                receiver !== undefined &&
-                table(receiver) &&
-                items !== undefined &&
-                spliced(items)
-            );
+    };
+    for (const statement of statements.slice(0, -1)) {
+        if (freezeWrite(statement)) continue;
+        // `if (true) { Q.m = L; }`, as unflattening leaves it.
+        if (statement.type === "IfStatement" && statement.alternate === null) {
+            const test = evaluate(statement.test);
+            const writes = statement.consequent.type === "BlockStatement" ? statement.consequent.body : [statement.consequent];
+            if (test.ok && Boolean(test.value) && writes.every(freezeWrite)) continue;
         }
-        const [handout, receiver, items] = node.arguments;
+        return "an exit of the stage function does more than write the lookup to the holder";
+    }
+    return undefined;
+};
+
+const bindTable = (cx: DecoderContext, fn: Node, bindings: Bindings, accepted: Set<Node>): string | undefined => {
+    const { scopes } = cx;
+    const lookupFn = plainFunction(fn);
+    const [param] = lookupFn?.params ?? [];
+    const body = lookupFn?.body;
+    const statements = body?.type === "BlockStatement" ? body.body : undefined;
+    const only = statements?.length === 1 ? statements[0] : undefined;
+    const read = body?.type === "BlockStatement" ? (only?.type === "ReturnStatement" ? only.argument : null) : body;
+    if (
+        lookupFn?.params.length !== 1 ||
+        param?.type !== "Identifier" ||
+        read?.type !== "MemberExpression" ||
+        !read.computed ||
+        read.object.type !== "Identifier" ||
+        read.property.type !== "Identifier"
+    )
+        return "the lookup isn't `y => T[y]`";
+    const index = scopes.variableOf(read.property);
+    if (index === undefined || index !== scopes.variableOf(param) || !scopes.staticReferences(index).every((reference) => (reference.identifier as unknown as Node) === read.property))
+        return "the lookup isn't `y => T[y]`";
+    bindings.table = scopes.variableOf(read.object);
+    if (bindings.table === undefined) return "the lookup's table isn't a local";
+    accepted.add(read.object);
+    return undefined;
+};
+
+/** `R === c && x === d`, either order and side. */
+const guardOf = (cx: DecoderContext, test: Expression, bindings: Bindings, accepted: Set<Node>): { state: number | undefined; argument: number | undefined } | string => {
+    const { scopes } = cx;
+    let state: number | undefined;
+    let argument: number | undefined;
+    for (const conjunct of conjuncts(test)) {
+        if (conjunct.type !== "BinaryExpression" || conjunct.operator !== "===") return "a guard in the stage function isn't a conjunction of strict comparisons";
+        const [name, constant] = conjunct.left.type === "Identifier" ? [conjunct.left, conjunct.right] : [conjunct.right, conjunct.left];
+        const value = numberOf(constant);
+        const variable = name.type === "Identifier" ? scopes.variableOf(name) : undefined;
+        if (value === undefined || variable === undefined) return "a guard in the stage function doesn't compare a name with a number";
+        if (variable === bindings.state && state === undefined) state = value;
+        else if (variable === bindings.argument && argument === undefined) argument = value;
+        else return "a guard in the stage function compares other names";
+        accepted.add(name);
+    }
+    return { state, argument };
+};
+
+const stageBody = (cx: DecoderContext, node: Node, bindings: Bindings, accepted: Set<Node>): number | string => {
+    const { scopes } = cx;
+    let step = 0;
+    for (const statement of node.type === "BlockStatement" ? node.body : [node as Statement]) {
+        if (statement.type !== "ExpressionStatement") return "a stage body has other statements than increments and shuffles";
+        const e = statement.expression;
+        const increment =
+            e.type === "UpdateExpression" && e.operator === "++"
+                ? { name: e.argument, by: 1 }
+                : e.type === "AssignmentExpression" && e.operator === "+="
+                  ? { name: e.left, by: numberOf(e.right) }
+                  : undefined;
+        if (increment !== undefined) {
+            if (increment.name.type !== "Identifier" || scopes.variableOf(increment.name) !== bindings.state || increment.by === undefined || increment.by <= 0)
+                return "a stage body changes the counter otherwise than by a positive step";
+            accepted.add(increment.name);
+            step += increment.by;
+            continue;
+        }
+        if (!shuffle(cx, e, bindings, accepted)) return "a stage body has a statement other than the table shuffle";
+    }
+    return step;
+};
+
+const isTable = (cx: DecoderContext, node: Node, bindings: Bindings, accepted: Set<Node>): boolean => {
+    if (node.type !== "Identifier" || cx.scopes.variableOf(node) !== bindings.table) return false;
+    accepted.add(node);
+    return true;
+};
+
+/** `X.splice(a, b)` / `G.splice(X, a, b)` (relies on model 7: builtins intact). */
+const splice = (cx: DecoderContext, node: Node, inner: (node: Node) => boolean): boolean => {
+    if (node.type !== "CallExpression") return false;
+    const { callee } = node;
+    if (callee.type === "MemberExpression" && builtin(cx, "Array.prototype", propertyKey(callee)) === "splice") return twoNumbers(node.arguments) && inner(callee.object);
+    const [receiver, ...rest] = node.arguments;
+    return callAliasOf(cx, callee) === "Array.prototype.splice" && receiver !== undefined && twoNumbers(rest) && inner(receiver);
+};
+
+/**
+ * `T.unshift.apply(T, T.splice(a, b).splice(c, d))` or its call-alias form: hands T to builtins only as their
+ * receiver (relies on model 7: builtins intact).
+ */
+const shuffle = (cx: DecoderContext, node: Node, bindings: Bindings, accepted: Set<Node>): boolean => {
+    if (node.type !== "CallExpression") return false;
+    const table = (n: Node): boolean => isTable(cx, n, bindings, accepted);
+    const spliced = (n: Node): boolean => splice(cx, n, (inner) => splice(cx, inner, table));
+    const { callee } = node;
+    if (callee.type === "MemberExpression" && builtin(cx, "Function.prototype", propertyKey(callee)) === "apply") {
+        const unshift = callee.object;
+        const [receiver, items] = node.arguments;
         return (
-            callAliasOf(callee) === "Function.prototype.apply" &&
-            node.arguments.length === 3 &&
-            handout?.type === "CallExpression" &&
-            handout.arguments.length === 0 &&
-            callAliasOf(handout.callee) === "Array.prototype.unshift" &&
+            node.arguments.length === 2 &&
+            unshift.type === "MemberExpression" &&
+            builtin(cx, "Array.prototype", propertyKey(unshift)) === "unshift" &&
+            table(unshift.object) &&
             receiver !== undefined &&
             table(receiver) &&
             items !== undefined &&
             spliced(items)
         );
     }
-
-    /** T is a string (only literals and `+=` write it) until the setup's top-level statement that splits it. */
-    function checkTable(table: Variable, setup: FunctionNode, setupBody: readonly Statement[], accepted: ReadonlySet<Node>): string | undefined {
-        if (table.scope.block !== (setup as never)) return "the table isn't a local of the setup";
-        const parents = parentsWithin(setup);
-        /** By containing statement: positions don't tell, as earlier passes moved code. */
-        const statementIndex = (node: Node): number => {
-            let current: Node | undefined = node;
-            while (current !== undefined && !setupBody.includes(current as Statement)) current = parents.get(current);
-            return current === undefined ? -1 : setupBody.indexOf(current as Statement);
-        };
-        const own: { identifier: Node; index: number }[] = [];
-        for (const reference of scopes.staticReferences(table)) {
-            const identifier = reference.identifier as unknown as Node;
-            if (accepted.has(identifier)) continue;
-            if ((reference.from.variableScope.block as unknown as Node) !== setup) return "the table is used by another function";
-            own.push({ identifier, index: statementIndex(identifier) });
-        }
-        const writeOf = (identifier: Node): Node | undefined => {
-            const parent = parents.get(identifier);
-            return (parent?.type === "AssignmentExpression" && parent.left === identifier) || (parent?.type === "VariableDeclarator" && parent.id === identifier) ? parent : undefined;
-        };
-        const writes = own.filter(({ identifier }) => writeOf(identifier) !== undefined);
-        const lastIndex = writes.reduce((highest, { index }) => Math.max(highest, index), Number.NEGATIVE_INFINITY);
-        const last = writes.filter(({ index }) => index === lastIndex);
-        const [final] = last;
-        const write = final === undefined ? undefined : writeOf(final.identifier);
-        const statement = setupBody[lastIndex];
-        const value = write?.type === "AssignmentExpression" && write.operator === "=" ? write.right : write?.type === "VariableDeclarator" ? write.init : null;
-        if (last.length !== 1 || write === undefined || statement === undefined || parents.get(write) !== statement || value === null || value === undefined || !splits(value, table))
-            return "the table's last write in the setup isn't a top-level statement that splits it";
-        for (const { identifier, index } of own) {
-            if (index < 0 || index > lastIndex) return "the setup uses the table after splitting it";
-            const other = writeOf(identifier);
-            if (other === undefined || other === write) continue;
-            const stringValue = other.type === "AssignmentExpression" ? (other.operator === "+=" ? true : other.right) : other.type === "VariableDeclarator" ? (other.init ?? true) : false;
-            if (stringValue !== true && (stringValue === false || stringValue.type !== "Literal" || typeof stringValue.value !== "string"))
-                return "the setup writes the table with something other than strings before splitting it";
-        }
-        return undefined;
-    }
-
-    /** With `s` a string literal: a fresh array of strings (relies on model 7: builtins intact). */
-    function splits(value: Node, table: Variable): boolean {
-        if (value.type !== "CallExpression") return false;
-        const isTableName = (node: Node | undefined): boolean => node?.type === "Identifier" && scopes.variableOf(node) === table;
-        const { callee } = value;
-        if (callee.type === "MemberExpression" && builtin("String.prototype", propertyKey(callee)) === "split")
-            return isTableName(callee.object) && value.arguments.length === 1 && isStringLiteral(value.arguments[0]);
-        return callAliasOf(callee) === "String.prototype.split" && value.arguments.length === 2 && isTableName(value.arguments[0]) && isStringLiteral(value.arguments[1]);
-    }
+    const [handout, receiver, items] = node.arguments;
+    return (
+        callAliasOf(cx, callee) === "Function.prototype.apply" &&
+        node.arguments.length === 3 &&
+        handout?.type === "CallExpression" &&
+        handout.arguments.length === 0 &&
+        callAliasOf(cx, handout.callee) === "Array.prototype.unshift" &&
+        receiver !== undefined &&
+        table(receiver) &&
+        items !== undefined &&
+        spliced(items)
+    );
 };
 
-const propertyName = (key: Node): string | undefined => {
-    if (key.type === "Identifier") return key.name;
-    if (key.type === "Literal" && (typeof key.value === "string" || typeof key.value === "number")) return String(key.value);
+/** T is a string (only literals and `+=` write it) until the setup's top-level statement that splits it. */
+const checkTable = (cx: DecoderContext, table: Variable, setup: FunctionNode, setupBody: readonly Statement[], accepted: ReadonlySet<Node>): string | undefined => {
+    const { scopes } = cx;
+    if (table.scope.block !== (setup as never)) return "the table isn't a local of the setup";
+    const parents = parentsWithin(setup);
+    /** By containing statement: positions don't tell, as earlier passes moved code. */
+    const statementIndex = (node: Node): number => {
+        let current: Node | undefined = node;
+        while (current !== undefined && !setupBody.includes(current as Statement)) current = parents.get(current);
+        return current === undefined ? -1 : setupBody.indexOf(current as Statement);
+    };
+    const own: { identifier: Node; index: number }[] = [];
+    for (const reference of scopes.staticReferences(table)) {
+        const identifier = reference.identifier as unknown as Node;
+        if (accepted.has(identifier)) continue;
+        if ((reference.from.variableScope.block as unknown as Node) !== setup) return "the table is used by another function";
+        own.push({ identifier, index: statementIndex(identifier) });
+    }
+    const writeOf = (identifier: Node): Node | undefined => {
+        const parent = parents.get(identifier);
+        return (parent?.type === "AssignmentExpression" && parent.left === identifier) || (parent?.type === "VariableDeclarator" && parent.id === identifier) ? parent : undefined;
+    };
+    const writes = own.filter(({ identifier }) => writeOf(identifier) !== undefined);
+    const lastIndex = writes.reduce((highest, { index }) => Math.max(highest, index), Number.NEGATIVE_INFINITY);
+    const last = writes.filter(({ index }) => index === lastIndex);
+    const [final] = last;
+    const write = final === undefined ? undefined : writeOf(final.identifier);
+    const statement = setupBody[lastIndex];
+    const value = write?.type === "AssignmentExpression" && write.operator === "=" ? write.right : write?.type === "VariableDeclarator" ? write.init : null;
+    if (last.length !== 1 || write === undefined || statement === undefined || parents.get(write) !== statement || value === null || value === undefined || !splits(cx, value, table))
+        return "the table's last write in the setup isn't a top-level statement that splits it";
+    for (const { identifier, index } of own) {
+        if (index < 0 || index > lastIndex) return "the setup uses the table after splitting it";
+        const other = writeOf(identifier);
+        if (other === undefined || other === write) continue;
+        const stringValue = other.type === "AssignmentExpression" ? (other.operator === "+=" ? true : other.right) : other.type === "VariableDeclarator" ? (other.init ?? true) : false;
+        if (stringValue !== true && (stringValue === false || stringValue.type !== "Literal" || typeof stringValue.value !== "string"))
+            return "the setup writes the table with something other than strings before splitting it";
+    }
     return undefined;
+};
+
+/** With `s` a string literal: a fresh array of strings (relies on model 7: builtins intact). */
+const splits = (cx: DecoderContext, value: Node, table: Variable): boolean => {
+    const { scopes } = cx;
+    if (value.type !== "CallExpression") return false;
+    const isTableName = (node: Node | undefined): boolean => node?.type === "Identifier" && scopes.variableOf(node) === table;
+    const { callee } = value;
+    if (callee.type === "MemberExpression" && builtin(cx, "String.prototype", propertyKey(callee)) === "split")
+        return isTableName(callee.object) && value.arguments.length === 1 && isStringLiteral(value.arguments[0]);
+    return callAliasOf(cx, callee) === "String.prototype.split" && value.arguments.length === 2 && isTableName(value.arguments[0]) && isStringLiteral(value.arguments[1]);
 };
 
 /** The first call, made while the guest followed a real run, leaving S in place and the counter past every guard. */

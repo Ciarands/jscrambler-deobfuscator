@@ -1,22 +1,16 @@
 import type { BlockStatement, Expression, Function as FunctionDeclaration, IfStatement, LabelIdentifier, Node, Statement } from "../../core/ast.js";
-import { isBreakTarget, isFunctionNode, isJump } from "../../core/ast.js";
+import { isJump } from "../../core/ast.js";
 import { at } from "../../core/build.js";
 import { bindingNames, hoistedDeclarations, placeholderDeclaration } from "../../core/hoisting.js";
+import type { JumpKind } from "../../core/jumps.js";
+import { hasPlainBreak, isBlockScoped, isJumpingIf, isJumpTo, JumpCounts, labeledJumps } from "../../core/jumps.js";
 import { pushAll } from "../../core/list.js";
 import type { PassLog } from "../../core/log.js";
-import { forEachChild } from "../../core/traverse.js";
 
 /**
  * Exact readability clean-ups for code produced by `structure`. Statements only leave their block when none of them is
  * a lexical declaration (`let`, `const`, `class`, a block function): those would change scope.
  */
-
-type JumpKind = "BreakStatement" | "ContinueStatement";
-
-interface JumpCount {
-    breaks: number;
-    continues: number;
-}
 
 export interface Dropped {
     /** `var` names: they bind wherever they are, so a placeholder anywhere in the function keeps them. */
@@ -28,11 +22,8 @@ export interface Dropped {
 interface Context {
     readonly log: PassLog;
     changed: number;
-    /**
-     * Jumps to each label name, from one walk over the whole output, kept current as jumps are removed. By name, so
-     * two sibling labels sharing one are counted together: every check stays conservative.
-     */
-    readonly jumps: Map<string, JumpCount>;
+    /** Jumps to each label name, from one walk over the whole output, kept current as jumps are removed. */
+    readonly jumps: JumpCounts;
     readonly dropped: Dropped;
 }
 
@@ -41,47 +32,7 @@ const change = (cx: Context, decision: string, node: Node): void => {
     cx.log.debug(`tidy: ${decision}`, node);
 };
 
-const countOf = (cx: Context, label: string): JumpCount => {
-    let count = cx.jumps.get(label);
-    if (count === undefined) {
-        count = { breaks: 0, continues: 0 };
-        cx.jumps.set(label, count);
-    }
-    return count;
-};
-
-const used = (cx: Context, label: string): boolean => {
-    const count = countOf(cx, label);
-    return count.breaks + count.continues > 0;
-};
-
-/** Add `delta` for every labeled jump in `node` (functions are their own label scope and not entered). */
-const countJumps = (cx: Context, node: Node, delta: number): void => {
-    if (isFunctionNode(node)) return;
-    if ((node.type === "BreakStatement" || node.type === "ContinueStatement") && node.label !== null) {
-        const count = countOf(cx, node.label.name);
-        if (node.type === "BreakStatement") count.breaks += delta;
-        else count.continues += delta;
-        return;
-    }
-    forEachChild(node, (child) => countJumps(cx, child, delta));
-};
-
-/** Labeled jumps of `kind` to `label` inside `statements`. For the few checks the totals can't answer. */
-const jumpsIn = (statements: readonly Statement[], label: string, kind: JumpKind): number => {
-    let found = 0;
-    const walk = (node: Node): void => {
-        if (isFunctionNode(node)) return;
-        if (node.type === kind && node.label?.name === label) found++;
-        else forEachChild(node, walk);
-    };
-    for (const statement of statements) walk(statement);
-    return found;
-};
-
-const isLexical = (s: Statement): boolean => (s.type === "VariableDeclaration" && s.kind !== "var") || s.type === "ClassDeclaration" || s.type === "FunctionDeclaration";
-
-const declaresLexically = (statements: readonly Statement[]): boolean => statements.some(isLexical);
+const declaresLexically = (statements: readonly Statement[]): boolean => statements.some(isBlockScoped);
 
 const asBlock = (s: Statement | null): BlockStatement | undefined => (s?.type === "BlockStatement" ? s : undefined);
 
@@ -89,9 +40,9 @@ const asBlock = (s: Statement | null): BlockStatement | undefined => (s?.type ==
 const dropTailJumps = (cx: Context, statements: Statement[], label: string, kind: JumpKind): void => {
     const last = statements.at(-1);
     if (last === undefined) return;
-    if (last.type === kind && last.label?.name === label) {
+    if (isJumpTo(last, label, kind)) {
         statements.pop();
-        countJumps(cx, last, -1);
+        cx.jumps.add(last, -1);
         change(cx, `dropped ${kind === "BreakStatement" ? "break" : "continue"} ${label} in tail position`, last);
         dropTailJumps(cx, statements, label, kind);
         return;
@@ -113,18 +64,6 @@ const negate = (test: Expression): Expression =>
 
 const isLiteralTrue = (node: Expression): boolean => node.type === "Literal" && node.value === true;
 
-/** Stops at loops, switches and functions. */
-const hasOwnBreak = (statements: readonly Statement[]): boolean => {
-    let found = false;
-    const walk = (node: Node): void => {
-        if (found || isFunctionNode(node) || isBreakTarget(node)) return;
-        if (node.type === "BreakStatement") found = node.label === null;
-        else forEachChild(node, walk);
-    };
-    for (const statement of statements) walk(statement);
-    return found;
-};
-
 /** Conservative: when unsure, says yes. */
 const canCompleteNormally = (cx: Context, statements: readonly Statement[]): boolean => statements.every((s) => statementCanComplete(cx, s));
 
@@ -140,10 +79,10 @@ const statementCanComplete = (cx: Context, s: Statement): boolean => {
         case "IfStatement":
             return s.alternate === null || statementCanComplete(cx, s.consequent) || statementCanComplete(cx, s.alternate);
         case "LabeledStatement":
-            return statementCanComplete(cx, s.body) || countOf(cx, s.label.name).breaks > 0;
+            return statementCanComplete(cx, s.body) || cx.jumps.of(s.label.name).breaks > 0;
         case "WhileStatement":
             if (!isLiteralTrue(s.test)) return true;
-            return s.body.type !== "BlockStatement" || hasOwnBreak(s.body.body);
+            return s.body.type !== "BlockStatement" || hasPlainBreak(s.body.body);
         default:
             return true;
     }
@@ -164,8 +103,8 @@ const branchOf = (body: Statement[], like: Statement): Statement => (body.length
  */
 const recognizeLoop = (cx: Context, labelNode: LabelIdentifier, body: readonly Statement[]): Statement[] | undefined => {
     const label = labelNode.name;
-    const count = countOf(cx, label);
-    const wrap = (loop: Statement): Statement => (used(cx, label) ? at<Statement>({ type: "LabeledStatement", label: labelNode, body: loop }, loop) : loop);
+    const count = cx.jumps.of(label);
+    const wrap = (loop: Statement): Statement => (cx.jumps.used(label) ? at<Statement>({ type: "LabeledStatement", label: labelNode, body: loop }, loop) : loop);
 
     const first = body[0];
     if (count.breaks === 0 && first?.type === "IfStatement" && first.alternate === null && first.consequent.type === "BlockStatement" && !declaresLexically(first.consequent.body)) {
@@ -173,33 +112,25 @@ const recognizeLoop = (cx: Context, labelNode: LabelIdentifier, body: readonly S
         const rest = body.slice(1);
         const last = then.at(-1);
         // while (c) { B } R: every continue L is in the if (so none in R).
-        if (last?.type === "ContinueStatement" && last.label?.name === label && !canCompleteNormally(cx, rest) && jumpsIn(then, label, "ContinueStatement") === count.continues) {
-            countJumps(cx, last, -1);
+        if (isJumpTo(last, label, "ContinueStatement") && !canCompleteNormally(cx, rest) && labeledJumps(then, label, "ContinueStatement").length === count.continues) {
+            cx.jumps.add(last, -1);
             return [wrap(at<Statement>({ type: "WhileStatement", test: first.test, body: blockAt(then.slice(0, -1), first) }, first)), ...rest];
         }
         // while (!c) { R } X: no continue L in X.
-        if (!canCompleteNormally(cx, then) && jumpsIn(then, label, "ContinueStatement") === 0) {
+        if (!canCompleteNormally(cx, then) && labeledJumps(then, label, "ContinueStatement").length === 0) {
             return [wrap(at<Statement>({ type: "WhileStatement", test: negate(first.test), body: blockAt(rest, first) }, first)), ...then];
         }
     }
 
     // do { B } while (c); X: the check's continue is the only jump to L.
     if (count.breaks !== 0 || count.continues !== 1) return undefined;
-    const index = body.findIndex(
-        (s) =>
-            s.type === "IfStatement" &&
-            s.alternate === null &&
-            s.consequent.type === "BlockStatement" &&
-            s.consequent.body.length === 1 &&
-            s.consequent.body[0]?.type === "ContinueStatement" &&
-            s.consequent.body[0].label?.name === label
-    );
+    const index = body.findIndex((s) => isJumpingIf(s, label, "ContinueStatement") && s.consequent.body.length === 1);
     const check = body[index];
     if (index > 0 && check?.type === "IfStatement") {
         const before = body.slice(0, index);
         const after = body.slice(index + 1);
-        if (!canCompleteNormally(cx, after) && !hasOwnBreak(before)) {
-            countJumps(cx, check, -1);
+        if (!canCompleteNormally(cx, after) && !hasPlainBreak(before)) {
+            cx.jumps.add(check, -1);
             return [at<Statement>({ type: "DoWhileStatement", test: check.test, body: blockAt(before, check) }, check), ...after];
         }
     }
@@ -211,14 +142,12 @@ const recognizeLoop = (cx: Context, labelNode: LabelIdentifier, body: readonly S
  * jump to B is the last statement of one of those ifs: the trailing breaks consumed must add up to all of B's jumps.
  */
 const ifChain = (cx: Context, statements: readonly Statement[], label: string): Statement[] | undefined => {
-    const count = countOf(cx, label);
+    const count = cx.jumps.of(label);
     if (count.continues !== 0) return undefined;
     const heads: { head: IfStatement; branch: BlockStatement }[] = [];
     while (heads.length < count.breaks) {
         const s = statements[heads.length];
-        if (s?.type !== "IfStatement" || s.alternate !== null || s.consequent.type !== "BlockStatement") return undefined;
-        const last = s.consequent.body.at(-1);
-        if (last?.type !== "BreakStatement" || last.label?.name !== label) return undefined;
+        if (!isJumpingIf(s, label, "BreakStatement")) return undefined;
         heads.push({ head: s, branch: s.consequent });
     }
     const innermost = heads.at(-1);
@@ -235,7 +164,7 @@ const ifChain = (cx: Context, statements: readonly Statement[], label: string): 
  * their temporal dead zone, as the originals would be forever) and their function declarations whole (hoisted, may be
  * called). Their `var`s and nested block functions go to `cx.dropped`; their labeled jumps leave the counts.
  */
-const deadRemainder = (cx: Context, dead: readonly Statement[]): Statement[] => {
+const unreachableDeclarations = (cx: Context, dead: readonly Statement[]): Statement[] => {
     const kept: Statement[] = [];
     const lexicalNames = new Set<string>();
     let origin: Statement | undefined;
@@ -248,7 +177,7 @@ const deadRemainder = (cx: Context, dead: readonly Statement[]): Statement[] => 
         else if (s.type === "ClassDeclaration" && s.id !== null) lexicalNames.add(s.id.name);
         else hoistedDeclarations(s, cx.dropped);
         origin ??= s;
-        countJumps(cx, s, -1);
+        cx.jumps.add(s, -1);
         change(cx, "dropped unreachable statement", s);
     }
     return origin === undefined ? kept : [...placeholderDeclaration("let", lexicalNames, origin), ...kept];
@@ -278,7 +207,7 @@ const tidyList = (cx: Context, statements: readonly Statement[]): Statement[] =>
             body.body = tidyList(cx, body.body);
             dropTailJumps(cx, body.body, label, "BreakStatement");
             if (!declaresLexically(body.body)) {
-                if (!used(cx, label)) {
+                if (!cx.jumps.used(label)) {
                     change(cx, `removed unused label ${label}`, statement);
                     for (const s of body.body) push(s);
                     continue;
@@ -289,7 +218,7 @@ const tidyList = (cx: Context, statements: readonly Statement[]): Statement[] =>
                     for (const s of chained) push(s);
                     continue;
                 }
-            } else if (!used(cx, label)) {
+            } else if (!cx.jumps.used(label)) {
                 change(cx, `removed unused label ${label}`, statement);
                 statement = body;
             }
@@ -305,7 +234,7 @@ const tidyList = (cx: Context, statements: readonly Statement[]): Statement[] =>
                 for (const s of rewritten) push(s);
                 continue;
             }
-            if (!used(cx, label)) {
+            if (!cx.jumps.used(label)) {
                 change(cx, `removed unused label ${label}`, statement);
                 statement = loop;
             }
@@ -333,15 +262,15 @@ const tidyList = (cx: Context, statements: readonly Statement[]): Statement[] =>
         }
         push(statement);
     }
-    if (dead !== undefined) pushAll(out, deadRemainder(cx, dead));
+    if (dead !== undefined) pushAll(out, unreachableDeclarations(cx, dead));
     return out;
 };
 
 const MAX_ROUNDS = 8;
 
 export const tidy = (statements: Statement[], log: PassLog): { statements: Statement[]; dropped: Dropped } => {
-    const cx: Context = { log, changed: 0, jumps: new Map(), dropped: { vars: new Set(), functions: [] } };
-    for (const statement of statements) countJumps(cx, statement, 1);
+    const cx: Context = { log, changed: 0, jumps: new JumpCounts(), dropped: { vars: new Set(), functions: [] } };
+    for (const statement of statements) cx.jumps.add(statement, 1);
     let current = statements;
     for (let round = 1; ; round++) {
         cx.changed = 0;

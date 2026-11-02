@@ -1,4 +1,3 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import type { Node } from "../src/core/ast.js";
 import { SourceMap } from "../src/core/log.js";
@@ -9,20 +8,11 @@ import { deobfuscate } from "../src/index.js";
 import { silentLogger } from "../src/logger.js";
 import { unflatten } from "../src/passes/unflatten/index.js";
 import { runPipeline } from "../src/pipeline/run.js";
-
-const run = (code: string): string => {
-    const context: Record<string, unknown> = {};
-    try {
-        runInNewContext(`${code}\nresult = f();`, context);
-        return JSON.stringify(context["result"]);
-    } catch (error) {
-        return `threw ${error instanceof Error ? error.constructor.name : String(error)}`;
-    }
-};
+import { machinesLeft, observe } from "./helpers.js";
 
 const unflattened = async (source: string) => {
     const { code } = await deobfuscate(source, { passes: ["unflatten"] });
-    return { code, flat: code.includes("switch"), expected: run(source), got: run(code) };
+    return { code, flat: machinesLeft(code) > 0, expected: observe(`${source}\nresult = f();`), got: observe(`${code}\nresult = f();`) };
 };
 
 describe("unflatten keeps what dead code declares (A5)", () => {
@@ -263,7 +253,7 @@ function f() {
     it("never puts one node in two places", async () => {
         const program = parse(source);
         await runPipeline(program, [unflatten], { logger: silentLogger, source: new SourceMap(source) });
-        expect(print(program)).not.toContain("switch");
+        expect(machinesLeft(print(program))).toBe(0);
         expect(sharedNodes(program)).toEqual([]);
     });
 });

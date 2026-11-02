@@ -1,21 +1,21 @@
 import type {
     ArrayExpression,
-    ArrowFunctionExpression,
     Expression,
     ExpressionStatement,
     FunctionBody,
     Function as FunctionNode,
+    FunctionLike,
     MemberExpression,
     Node,
     VariableDeclaration,
     VariableDeclarator,
 } from "../core/ast.js";
-import { isFunctionNode, isIndexKey, propertyKey } from "../core/ast.js";
+import { isIndexKey, propertyKey } from "../core/ast.js";
 import { at, identifier } from "../core/build.js";
 import { pushAll } from "../core/list.js";
 import type { Scope, ScopeInfo, Variable } from "../core/scope.js";
 import type { Path } from "../core/traverse.js";
-import { forEachChild, traverse } from "../core/traverse.js";
+import { forEachChild, traverse, walkSkippingFunctions } from "../core/traverse.js";
 import type { PassLog } from "../core/log.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
 
@@ -47,7 +47,7 @@ interface ArgumentsUse {
 interface Candidate {
     readonly variable: Variable;
     readonly scope: Scope;
-    readonly fn: FunctionNode | ArrowFunctionExpression;
+    readonly fn: FunctionLike;
     readonly body: FunctionBody;
     readonly declarator: VariableDeclarator;
     readonly literal: ArrayExpression;
@@ -111,11 +111,13 @@ const indexedBy = (path: Path): { member: Path; node: MemberExpression; index: n
 
 /** Names bound per scope by the conversions: `added` declared, `removed` no longer declared (converted arrays). */
 interface Bindings {
+    readonly scopes: ScopeInfo;
     readonly added: Map<Scope, Set<string>>;
     readonly removed: Map<Scope, Set<string>>;
 }
 
-const binds = (scope: Scope, name: string, bindings: Bindings): boolean => (scope.set.has(name) && bindings.removed.get(scope)?.has(name) !== true) || bindings.added.get(scope)?.has(name) === true;
+const binds = (scope: Scope, name: string, bindings: Bindings): boolean =>
+    (bindings.scopes.bindsName(scope, name) && bindings.removed.get(scope)?.has(name) !== true) || bindings.added.get(scope)?.has(name) === true;
 
 /** Whether a scope from `from` up to, not including, `fnScope` passes `test`. */
 const anyScopeBetween = (from: Scope, fnScope: Scope, test: (scope: Scope) => boolean): boolean => {
@@ -143,7 +145,7 @@ const findCandidates = (scopes: ScopeInfo): Candidate[] => {
     for (const scope of scopes.manager.scopes.toReversed()) {
         if (scope.type !== "function") continue;
         // eslint-scope's function scopes are those of functions and arrows; one without a block body declares no var.
-        const fn = scope.block as unknown as FunctionNode | ArrowFunctionExpression;
+        const fn = scope.block as unknown as FunctionLike;
         const body = fn.body !== null && fn.body.type === "BlockStatement" ? fn.body : undefined;
         if (body === undefined) continue;
         for (const variable of scope.variables) {
@@ -157,14 +159,15 @@ const findCandidates = (scopes: ScopeInfo): Candidate[] => {
                 literal = declarator.init;
             } else {
                 // The first write that creates such an array: another write of the name is a use `recordUse` refuses.
-                const write = variable.references.find((r) => r.isWrite() && isArgumentsArray(r.writeExpr as unknown as Node | null | undefined));
+                const write = scopes.references(variable)?.find((r) => r.isWrite() && isArgumentsArray(r.writeExpr as unknown as Node | null | undefined));
                 if (write === undefined) continue;
                 literal = write.writeExpr as unknown as ArrayExpression;
                 assigned = write.identifier as unknown as Node;
             }
             const declaration = def.parent as unknown as VariableDeclaration;
             const argumentsVariable = scopes.variableOf(literal.elements[0] as Node);
-            const owned = argumentsVariable?.scope === scope && argumentsVariable.defs.length === 0 && argumentsVariable.references.every((r) => !r.isWrite());
+            const argumentsReferences = argumentsVariable === undefined ? undefined : scopes.references(argumentsVariable);
+            const owned = argumentsVariable?.scope === scope && argumentsVariable.defs.length === 0 && argumentsReferences !== undefined && argumentsReferences.every((r) => !r.isWrite());
             const candidate: Candidate = {
                 variable,
                 scope,
@@ -193,11 +196,12 @@ const findCandidates = (scopes: ScopeInfo): Candidate[] => {
 
 /** Labels don't reach into nested functions. */
 const breaksTo = (node: Node, labels: ReadonlySet<string>): boolean => {
-    if (node.type === "BreakStatement") return node.label !== null && labels.has(node.label.name);
-    if (isFunctionNode(node) || node.type === "ClassBody") return false;
     let found = false;
-    forEachChild(node, (child) => {
-        found ||= breaksTo(child, labels);
+    walkSkippingFunctions(node, (child) => {
+        if (found || child.type === "ClassBody") return false;
+        if (child.type !== "BreakStatement") return true;
+        found = child.label !== null && labels.has(child.label.name);
+        return false;
     });
     return found;
 };
@@ -306,7 +310,7 @@ const firstWriteOf = (member: Path, blocks: ReadonlySet<Node>): FirstWrite | nul
  * which only reads the object's length and elements to build the call's own argument list: the called function gets
  * copies of the values and never the object itself.
  */
-const appliedTo = (path: Path): FunctionNode | ArrowFunctionExpression | undefined => {
+const appliedTo = (path: Path): FunctionLike | undefined => {
     const call = path.parent;
     // The second argument after a plain first one: behind a spread it could become `thisArg` (`apply(...[], arguments)`).
     if (call?.type !== "CallExpression" || path.key !== "arguments" || call.arguments[1] !== path.node || call.arguments[0]?.type === "SpreadElement") return undefined;
@@ -321,16 +325,19 @@ const appliedTo = (path: Path): FunctionNode | ArrowFunctionExpression | undefin
  * element (`owners`: the arrays by that identifier; once converted, nothing names the object). (`fn` sits in the
  * array's function, which calls no eval, so `fn` doesn't either.)
  */
-const ignoresArguments = (fn: FunctionNode | ArrowFunctionExpression, scopes: ScopeInfo, owners: ReadonlyMap<Node, Candidate>): boolean => {
+const ignoresArguments = (fn: FunctionLike, scopes: ScopeInfo, owners: ReadonlyMap<Node, Candidate>): boolean => {
     if (fn.params.length > 0) return false;
     if (fn.type === "ArrowFunctionExpression") return true;
     // The function's own scope (inside the one a named function expression gives its name).
-    const own = scopes.manager.acquire(fn as unknown as Parameters<ScopeInfo["manager"]["acquire"]>[0], true)?.set.get("arguments");
-    if (own === undefined) return false;
-    return own.references.every((reference) => {
-        const owner = owners.get(reference.identifier as unknown as Node);
-        return owner !== undefined && owner.refusal === undefined && owner.argumentsUses.length === 0;
-    });
+    const own = scopes.scopeOf(fn, true)?.set.get("arguments");
+    const references = own === undefined ? undefined : scopes.references(own);
+    return (
+        references !== undefined &&
+        references.every((reference) => {
+            const owner = owners.get(reference.identifier as unknown as Node);
+            return owner !== undefined && owner.refusal === undefined && owner.argumentsUses.length === 0;
+        })
+    );
 };
 
 /**
@@ -345,14 +352,13 @@ interface ArgumentsReferences {
     readonly unsafe: Node[];
     readonly elementReads: Node[];
     readonly indexed: { readonly member: MemberExpression; readonly index: number }[];
-    readonly applied: (FunctionNode | ArrowFunctionExpression)[];
+    readonly applied: FunctionLike[];
 }
 
 const recordArgumentsUse = (references: ArgumentsReferences, path: Path): void => {
     const member = path.parentPath;
-    const read = member !== null && path.key === "object" && member.node.type === "MemberExpression" && !member.isWriteTarget() && !isCallee(member);
-    if (read) {
-        if (member.node.type !== "MemberExpression" || propertyKey(member.node) !== "length") references.elementReads.push(path.node);
+    if (member !== null && path.key === "object" && member.node.type === "MemberExpression" && !member.isWriteTarget() && !isCallee(member)) {
+        if (propertyKey(member.node) !== "length") references.elementReads.push(path.node);
         const element = indexedBy(path);
         if (element !== undefined) references.indexed.push({ member: element.node, index: element.index });
         return;
@@ -366,7 +372,7 @@ const recordArgumentsUse = (references: ArgumentsReferences, path: Path): void =
  * Whether the parameter list names `arguments` (outside nested non-arrow functions). eslint-scope never resolves such
  * a use (`__isValidResolution`), so it is missing from the recorded uses: `b = (arguments[0] = x)` would go unseen.
  */
-const parametersNameArguments = (fn: FunctionNode | ArrowFunctionExpression): boolean => {
+const parametersNameArguments = (fn: FunctionLike): boolean => {
     const names = (node: Node): boolean => {
         if (node.type === "Identifier") return node.name === "arguments";
         if (node.type === "FunctionExpression" || node.type === "FunctionDeclaration") return false;
@@ -396,7 +402,8 @@ const convertDirectReads = (variable: Variable, references: ArgumentsReferences,
         const param = fn.params[index];
         if (param?.type !== "Identifier") continue;
         const parameter = scopes.variableOf(param);
-        if (parameter === undefined || parameter.defs.length !== 1 || parameter.references.some((r) => r.isWrite())) continue;
+        const written = parameter === undefined ? undefined : scopes.references(parameter)?.some((r) => r.isWrite());
+        if (parameter === undefined || parameter.defs.length !== 1 || written !== false) continue;
         const reference = scopes.referenceOf(member.object);
         if (reference === undefined || anyScopeBetween(reference.from, scope, (s) => s.type === "with") || shadowedBetween(reference.from, scope, param.name, rewrite)) continue;
         rewrite.replacements.set(member, identifier(param.name, member));
@@ -535,8 +542,10 @@ const parameterFor = (candidate: Candidate, index: number, uses: readonly Argume
     if (param.type !== "Identifier") return { refused: `parameter ${index} has a default value, a pattern or is a rest parameter` };
     const variable = scopes.variableOf(param);
     if (variable === undefined || variable.defs.length !== 1) return { refused: `parameter ${param.name} is declared again` };
-    if (!uses.some((use) => use.element?.write === true)) return variable.references.some((r) => r.isWrite()) ? { refused: `parameter ${param.name} is written` } : param.name;
-    if (variable.references.length > 0) return { refused: `S[0][${index}] is written and parameter ${param.name} is also used directly` };
+    const references = scopes.references(variable);
+    if (references === undefined) return { refused: `a with statement may intercept a use of parameter ${param.name}` };
+    if (!uses.some((use) => use.element?.write === true)) return references.some((r) => r.isWrite()) ? { refused: `parameter ${param.name} is written` } : param.name;
+    if (references.length > 0) return { refused: `S[0][${index}] is written and parameter ${param.name} is also used directly` };
     if (elementsRead) return { refused: `S[0][${index}] is written and arguments is also read directly` };
     if (uses.some((use) => shadowedBetween(use.from, candidate.scope, param.name, bindings))) return { refused: `S[0][${index}] is written and parameter ${param.name} is shadowed at a use` };
     return param.name;
@@ -693,25 +702,33 @@ export const argumentsArrays: Pass = {
         const declarations = new Map<Node, Candidate[]>();
         for (const candidate of candidates) {
             if (candidate.refusal !== undefined) continue;
-            for (const reference of candidate.variable.references) sites.set(reference.identifier as unknown as Node, candidate);
+            const own = scopes.references(candidate.variable);
+            const names = candidate.scope.variables.filter((variable) => variable.defs.some((def) => def.type === "FunctionName"));
+            const nameReferences = names.map((variable) => scopes.references(variable));
+            if (own === undefined || nameReferences.includes(undefined)) {
+                candidate.refusal = { reason: "a with statement may intercept a use of the array or of a function declared next to it", node: candidate.assigned ?? candidate.declarator };
+                continue;
+            }
+            for (const reference of own) sites.set(reference.identifier as unknown as Node, candidate);
             if (candidate.assigned !== undefined) {
                 const declaration = candidate.variable.defs[0]?.parent as unknown as Node;
                 declarations.set(declaration, [...(declarations.get(declaration) ?? []), candidate]);
             }
-            for (const variable of candidate.scope.variables) {
-                if (!variable.defs.some((def) => def.type === "FunctionName")) continue;
-                for (const reference of variable.references) {
+            for (const list of nameReferences) {
+                for (const reference of list ?? []) {
                     const id = reference.identifier as unknown as Node;
                     hoisted.set(id, [...(hoisted.get(id) ?? []), candidate]);
                 }
             }
         }
         for (const fnScope of scopes.manager.scopes) {
-            const args = fnScope.type === "function" ? fnScope.set.get("arguments") : undefined;
-            if (args === undefined || args.defs.length > 0 || args.references.length === 0) continue;
+            // A function calling eval (or nesting a call) records no uses (see `convertDirectReads`).
+            const args = fnScope.type === "function" && !fnScope.dynamic ? fnScope.set.get("arguments") : undefined;
+            const argumentsReferences = args === undefined || args.defs.length > 0 ? undefined : scopes.references(args);
+            if (args === undefined || argumentsReferences === undefined || argumentsReferences.length === 0) continue;
             const entry: ArgumentsReferences = { unsafe: [], elementReads: [], indexed: [], applied: [] };
             references.set(args, entry);
-            for (const reference of args.references) argumentsSites.set(reference.identifier as unknown as Node, entry);
+            for (const reference of argumentsReferences) argumentsSites.set(reference.identifier as unknown as Node, entry);
         }
         let folded = 0;
         traverse(program, {
@@ -753,7 +770,7 @@ export const argumentsArrays: Pass = {
             return names;
         };
         const counts: Counts = { folded, arrays: candidates.length, removed: 0, refused: 0, slots: 0, parameters: 0, copies: 0, argumentsReads: 0, argumentsLocals: 0, directReads: 0 };
-        const rewrite: Rewrite = { replacements: new Map(), declarators: new Map(), added: new Map(), removed: new Map() };
+        const rewrite: Rewrite = { scopes, replacements: new Map(), declarators: new Map(), added: new Map(), removed: new Map() };
         const owners = new Map(candidates.map((candidate) => [candidate.literal.elements[0] as Node, candidate]));
         for (const candidate of candidates) {
             if (candidate.refusal !== undefined) {
@@ -771,13 +788,15 @@ export const argumentsArrays: Pass = {
             const declarators = declaration.declarations.flatMap((d) => rewrite.declarators.get(d) ?? [d]);
             rewrite.replacements.set(declaration, declarators.length === 0 ? REMOVE : at<VariableDeclaration>({ ...declaration, declarations: declarators }, declaration));
         }
-        traverse(program, {
-            enter(path) {
-                const replacement = rewrite.replacements.get(path.node);
-                if (replacement === REMOVE) path.remove();
-                else if (replacement !== undefined) path.replace(replacement);
-            },
-        });
+        if (rewrite.replacements.size > 0) {
+            traverse(program, {
+                enter(path) {
+                    const replacement = rewrite.replacements.get(path.node);
+                    if (replacement === REMOVE) path.remove();
+                    else if (replacement !== undefined) path.replace(replacement);
+                },
+            });
+        }
 
         log.info(
             `${counts.arrays} arguments array(s): ${counts.removed} removed, ${counts.refused} refused; ${counts.slots} slot(s) to locals, ${counts.parameters} S[0][i] to parameters, ${counts.copies} parameter copies, ${counts.argumentsReads} S[0] to arguments, ${counts.argumentsLocals} S[0] to locals; ${folded} [arguments][0] folded, ${counts.directReads} arguments[i] to parameters`

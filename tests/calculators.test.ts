@@ -1,20 +1,14 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
-const observed = (source: string): string => {
-    const timers: (() => void)[] = [];
-    const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };
-    runInNewContext(source, context);
-    for (const callback of timers) callback();
-    return JSON.stringify(context.result);
-};
+const RUN: Run = { timers: true };
 
 const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "calculators", "calculators-bound"] })).code;
 
 const sameBehaviour = async (program: string): Promise<string> => {
     const output = await run(program);
-    expect(observed(output)).toBe(observed(program));
+    expect(observe(output, RUN)).toBe(observe(program, RUN));
     return output;
 };
 
@@ -142,10 +136,10 @@ describe("calculators", () => {
         const body = "  var o = { get v() { G.s(2); return 1; } };\n  G.s(0);\n  result = o.v + G.c(5, 1, 1);";
         // The getter's selector call decides the case: 1 + (5 + 1 * 1). Model 8 says that doesn't happen, so the
         // calculation becomes the case the visible selector call chose: 1 + (5 - 1).
-        expect(observed(later(body))).toBe("7");
+        expect(observe(later(body), RUN)).toBe("7");
         const output = await run(later(body));
         expect(output).toContain("result = o.v + (5 - 1);");
-        expect(observed(output)).toBe("5");
+        expect(observe(output, RUN)).toBe("5");
     });
 
     it("keeps calculations whose selector value isn't a constant", async () => {
@@ -156,12 +150,12 @@ describe("calculators", () => {
     it("binds the arguments first when one would be read after a conversion that may run code", async () => {
         const body = "  var z = 2;\n  var o = { valueOf: function () { z = 100; return 7; } };\n  G.s(4);\n  result = G.c(o, 1, z);";
         // The calculation reads z before o's valueOf changes it: (7 - 1) * 2.
-        expect(observed(later(body))).toBe("12");
+        expect(observe(later(body), RUN)).toBe("12");
         const output = await sameBehaviour(later(body));
         expect(output).toContain("result = ((p0, p1) => (p0 - 1) * p1)(o, z);");
         // Also when a getter argument returns the object whose conversion writes z.
         const getter = "  var z = 2;\n  var w = { valueOf: function () { z = 100; return 7; } };\n  var o = { get v() { return w; } };\n  G.s(4);\n  result = G.c(o.v, 1, z);";
-        expect(observed(later(getter))).toBe("12");
+        expect(observe(later(getter), RUN)).toBe("12");
         expect(await sameBehaviour(later(getter))).toContain("result = ((p0, p1) => (p0 - 1) * p1)(o.v, z);");
         // A selector call passed among the arguments isn't bound: the case it chose is already in.
         const selecting = "  var z = 2;\n  var o = { valueOf: function () { z = 100; return 7; } };\n  result = G.c(o, 1, z, G.s(4));";
@@ -179,7 +173,7 @@ describe("calculators", () => {
     it("leaves a bound calculation to the passes after it, which don't know its parameters", async () => {
         const program = later("  var z = 2;\n  var o = { valueOf: function () { z = 100; return 7; } };\n  G.s(4);\n  result = G.c(o, 1, z);");
         const { code } = await deobfuscate(program, { passes: ["emulate", "calculators", "calculators-bound", "cleanup", "simplify", "unminify"] });
-        expect(observed(code)).toBe(observed(program));
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
         expect(code).toContain("((p0, p1) => (p0 - 1) * p1)(o, z)");
     });
 
@@ -193,7 +187,7 @@ describe("calculators", () => {
         ];
         for (const body of bodies) {
             const program = later(body, "", "var g = 6;\n");
-            expect(observed(program)).toBe("12");
+            expect(observe(program, RUN)).toBe("12");
             await sameBehaviour(program);
         }
     });
@@ -209,12 +203,12 @@ describe("calculators", () => {
         expect(output).toContain("return (o - 1) * p;");
         // A sloppy function's does: the calculation reads p before the write, (7 - 1) * 2.
         const sloppy = `${object}  function f(o, p) { o.args = arguments; G.s(4); return G.c(o, 1, p); }\n  result = f(o, 2);`;
-        expect(observed(later(sloppy))).toBe("12");
+        expect(observe(later(sloppy), RUN)).toBe("12");
         expect(await sameBehaviour(later(sloppy))).toContain("return ((p0, p1) => (p0 - 1) * p1)(o, p);");
         // A strict parameter another function names may change during the conversion too.
         const closure =
             '  var o = { valueOf: function () { this.set(); return 7; } };\n  function f(o, p) { "use strict"; o.set = function () { p = 100; }; G.s(4); return G.c(o, 1, p); }\n  result = f(o, 2);';
-        expect(observed(later(closure))).toBe("12");
+        expect(observe(later(closure), RUN)).toBe("12");
         expect(await sameBehaviour(later(closure))).toContain("return ((p0, p1) => (p0 - 1) * p1)(o, p);");
     });
 
@@ -226,7 +220,7 @@ describe("calculators", () => {
     it("keeps calculations that would read a getter argument out of turn", async () => {
         // Case 1 reads its second argument first: x, which the first argument's getter sets.
         const body = "  var x = 1;\n  var o = { get p() { x = 5; return 1; } };\n  G.s(1);\n  result = G.c(o.p, x);";
-        expect(observed(later(body))).toBe("10");
+        expect(observe(later(body), RUN)).toBe("10");
         const output = await sameBehaviour(later(body));
         expect(output).toContain("result = G.c(o.p, x);");
     });
@@ -297,6 +291,13 @@ describe("calculators", () => {
         expect(output).not.toContain("G.s(0)");
     });
 
+    it("keeps the selector calls when a block function's computed access to the storage object may run later (Annex B)", async () => {
+        // Calls reach `look` through the binding Annex B gives it outside its block, not through its block's own.
+        const prelude = '{ function look(n) { var v; v = G[n]; return v; } }\nvar early = look("c")(5, 1);\n';
+        const output = await sameBehaviour(later('  G.s(1);\n  S[1] = G.c(1, 2);\n  result = [S[1], look("c")(4, 5)];', "", prelude));
+        expect(output).toContain("G.s(1);");
+    });
+
     it("keeps the prelude's selector calls, which its own calculations may read", async () => {
         const prelude = "function f() { return 1; }\nG.s(2);\nf();\nvar early = G.c(1, 2, 3);\n";
         const output = await sameBehaviour(later("  G.s(0);\n  result = [G.c(3, 1), early];", "", prelude));
@@ -315,7 +316,7 @@ describe("calculators in the whole pipeline", () => {
         // `S[0][1]` read before `S[0][0]` may be a getter read out of turn; as parameters they are plain reads.
         const program = `${calculator()}function f(p, q) {\n  var S = [arguments];\n  G.K.sel(1);\n  return G.K.calc(S[0][0], S[0][1]);\n}\nsetTimeout(function () { result = [f(2, 3), f(1, 8)]; });\n`;
         const { code } = await deobfuscate(program);
-        expect(observed(code)).toBe(observed(program));
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
         expect(code).toContain("return q << p;");
     });
 
@@ -323,7 +324,7 @@ describe("calculators in the whole pipeline", () => {
         // Before, `S[0][1]` would be read after converting `S[0][0]`; as a strict function's parameters they read the same.
         const program = `${calculator()}function f(p, q) {\n  "use strict";\n  var S = [arguments];\n  G.K.sel(4);\n  return G.K.calc(S[0][0], 1, S[0][1]);\n}\nsetTimeout(function () { result = [f(2, 3), f({ valueOf: function () { return 5; } }, 8)]; });\n`;
         const { code } = await deobfuscate(program);
-        expect(observed(code)).toBe(observed(program));
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
         expect(code).toContain("return (p - 1) * q;");
     });
 });

@@ -112,6 +112,21 @@ describe("cli", () => {
         expect(await read("out/b.js")).toBe("keep me");
     });
 
+    it("checks the report target with the outputs, before writing anything", async () => {
+        await write("in.js", "x=1");
+        await write("src/a.js", "a=1");
+        await write("report.json", "keep me");
+        for (const argv of [["in.js", "-o", "out.js"], ["src", "-o", "out"], ["in.js"]]) {
+            const result = await run([...argv, "--report", "report.json"]);
+            expect(result.code).toBe(EXIT_FAILED);
+            expect(result.stderr).toContain('"report.json" already exists, use --force');
+            expect(result.stdout).toBe("");
+        }
+        await expect(read("out.js")).rejects.toThrow();
+        await expect(read("out/a.js")).rejects.toThrow();
+        expect(await read("report.json")).toBe("keep me");
+    });
+
     it("keeps going past a broken file and exits 1", async () => {
         await write("src/a.js", "a=1");
         await write("src/broken.js", "var x = ;");

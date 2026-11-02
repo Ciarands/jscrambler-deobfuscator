@@ -12,7 +12,7 @@ import type { NodeId } from "./structure.js";
  * spreads them over plain blocks and drops the cases that can never run, so:
  *
  * - `var`s in dropped code still bind for the whole function: they're kept as one `var a, b;` placeholder;
- * - block functions in dropped code bind a function-wide name too, when Annex B applies (`annexBName`);
+ * - block functions in dropped code bind a function-wide name too, when Annex B applies (`ScopeInfo.annexBName`);
  * - `let`/`const`/`class` directly in a reachable case would leave the switch's scope: refused. In a dead case they're
  *   in their temporal dead zone forever, so dropping them is exact only when nothing reachable refers to them;
  * - function declarations directly in a case are hoisted to the top of the switch, visible from every case: they move
@@ -32,37 +32,14 @@ export const perIterationCapture = (scopes: ScopeInfo, loop: ForStatement): Refu
     const scope = scopes.scopeOf(loop);
     if (scope === null || scope.dynamic) return refuse("lexical-loop-init", "direct eval in the loop could tell its per-iteration bindings apart", init);
     for (const variable of scope.variables) {
+        const references = scopes.references(variable);
+        if (references === undefined) return refuse("lexical-loop-init", `a with statement may intercept a use of \`${variable.name}\``, init);
         // Never reassigned: every iteration's copy holds the same value.
-        if (!variable.references.some((reference) => reference.isWrite() && !reference.init)) continue;
-        const captured = variable.references.find((reference) => reference.from.variableScope !== scope.variableScope);
+        if (!references.some((reference) => reference.isWrite() && !reference.init)) continue;
+        const captured = references.find((reference) => reference.from.variableScope !== scope.variableScope);
         if (captured !== undefined) return refuse("lexical-loop-init", `a closure captures \`${variable.name}\`, which has one binding per iteration`, captured.identifier as unknown as Node);
     }
     return undefined;
-};
-
-/** Whether a definition clashes with a `var` of the same name in `scope` (so Annex B leaves the block function alone). */
-const blocksAnnexB = (variable: Variable, functionLevel: boolean): boolean =>
-    variable.defs.some(
-        (def) =>
-            def.type === "ClassName" || def.type === "ImportBinding" || def.type === "Parameter" || (def.type === "Variable" && def.kind !== "var") || (def.type === "FunctionName" && !functionLevel)
-    );
-
-/**
- * The function-wide name a block function declares besides its block binding (Annex B.3.3): only in sloppy mode, and
- * only when a `var` of that name would not clash with a lexical declaration (or parameter) on the way up.
- */
-export const annexBName = (scopes: ScopeInfo, declaration: FunctionDeclaration): string | undefined => {
-    if (declaration.id === null) return undefined;
-    const name = declaration.id.name;
-    const variable = scopes.variableOf(declaration.id);
-    if (variable === undefined || variable.scope.isStrict) return undefined;
-    const target = variable.scope.variableScope;
-    for (let scope: Scope | null = variable.scope; scope !== target && scope !== null;) {
-        scope = scope.upper;
-        const other = scope?.set.get(name);
-        if (other !== undefined && blocksAnnexB(other, scope === target)) return undefined;
-    }
-    return name;
 };
 
 /**
@@ -83,24 +60,27 @@ const hoistable = (
 ): { reason: string; node: Node } | undefined => {
     const name = variable.name;
     if (declaration.generator) return { reason: `case-level generator \`${name}\` is re-created on every dispatch`, node: declaration };
-    const asValue = variable.references.find((reference) => {
+    const references = scopes.references(variable);
+    if (references === undefined) return { reason: `a \`with\` may intercept a use of case-level function \`${name}\``, node: declaration };
+    const asValue = references.find((reference) => {
         const identifier = reference.identifier as unknown as Node;
         return isLive(identifier) && !callees.has(identifier);
     });
     if (asValue !== undefined) return { reason: `case-level function \`${name}\` is used as a value, and is re-created on every dispatch`, node: asValue.identifier as unknown as Node };
     const own = scopes.scopeOf(declaration);
     const argumentsVariable = own?.set.get("arguments");
-    if (argumentsVariable !== undefined && argumentsVariable.references.length > 0)
-        return { reason: `case-level function \`${name}\` reads \`arguments\`, whose callee is re-created on every dispatch`, node: argumentsVariable.references[0]?.identifier as unknown as Node };
+    const argumentsReferences = argumentsVariable === undefined ? [] : scopes.references(argumentsVariable);
+    const argumentsUse = argumentsReferences === undefined ? declaration : (argumentsReferences[0]?.identifier as unknown as Node | undefined);
+    if (argumentsUse !== undefined) return { reason: `case-level function \`${name}\` reads \`arguments\`, whose callee is re-created on every dispatch`, node: argumentsUse };
     if (switchScope.isStrict) return undefined;
     const functionScope = switchScope.variableScope;
     if (functionScope.type === "global") return { reason: `sloppy top-level case function \`${name}\` also sets a global, which hoisting would set earlier`, node: declaration };
     const outer = functionScope.set.get(name);
-    const outerUse = outer !== undefined && !outer.defs.every((def) => def.type === "Parameter") ? outer.references[0] : undefined;
-    const through = functionScope.through.find((reference) => reference.identifier.name === name);
-    const conflict = outerUse ?? through;
-    if (conflict !== undefined)
-        return { reason: `\`${name}\` is also a function-wide name here, which the hoisted declaration would set earlier (Annex B)`, node: conflict.identifier as unknown as Node };
+    const outerReferences = outer === undefined || outer.defs.every((def) => def.type === "Parameter") ? [] : scopes.references(outer);
+    // The declaration's own Annex B write is the one hoisting moves.
+    const outerUse = outerReferences === undefined ? declaration : (outerReferences.find((reference) => reference.identifier !== declaration.id)?.identifier as unknown as Node | undefined);
+    const conflict = outerUse ?? (functionScope.through.find((reference) => reference.identifier.name === name)?.identifier as unknown as Node | undefined);
+    if (conflict !== undefined) return { reason: `\`${name}\` is also a function-wide name here, which the hoisted declaration would set earlier (Annex B)`, node: conflict };
     return undefined;
 };
 
@@ -158,8 +138,11 @@ export const caseDeclarations = (
         };
         for (const s of dead) collect(s);
         const isLive = (identifier: Node): boolean => !deadIdentifiers.has(identifier);
-        const liveUse = (variable: Variable | undefined): Node | undefined =>
-            variable?.references.find((reference) => isLive(reference.identifier as unknown as Node))?.identifier as unknown as Node | undefined;
+        // A use a `with` may intercept counts as live.
+        const liveUse = (variable: Variable | undefined): Node | undefined => {
+            const references = variable === undefined ? [] : scopes.references(variable);
+            return references === undefined ? first : (references.find((reference) => isLive(reference.identifier as unknown as Node))?.identifier as unknown as Node | undefined);
+        };
 
         for (const s of deadLexical) {
             const names = new Set<string>();
@@ -186,7 +169,7 @@ export const caseDeclarations = (
     }
 
     for (const declaration of blockFunctions) {
-        const name = annexBName(scopes, declaration);
+        const name = scopes.annexBName(declaration);
         if (name !== undefined) vars.add(name);
     }
     for (const switchCase of deadCases) log.debug("dropped unreachable case", switchCase);

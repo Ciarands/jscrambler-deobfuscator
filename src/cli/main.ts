@@ -151,14 +151,12 @@ export const runCli = async (argv: readonly string[], env: CliEnv): Promise<numb
         const outputPath = values.output === undefined ? undefined : path.resolve(env.cwd, values.output);
         const dumpDir = values["dump-dir"] === undefined ? undefined : path.resolve(env.cwd, values["dump-dir"]);
         const progress = values.quiet ? () => {} : (line: string) => env.stderr(`${sanitizeLine(line)}\n`);
-        const options: RunOptions = { force: values.force === true, outputPath, dumpDir, selection, logger, progress, env };
+        const reportPath = values.report === undefined ? undefined : path.resolve(env.cwd, values.report);
+        const options: RunOptions = { force: values.force === true, outputPath, reportPath, dumpDir, selection, logger, progress, env };
         const input = positionals[0];
         const results = input === undefined ? await runStdin(options) : await runPath(path.resolve(env.cwd, input), options);
 
-        if (values.report !== undefined) {
-            const reportPath = path.resolve(env.cwd, values.report);
-            writeOutput(reportPath, `${JSON.stringify({ files: results }, null, 2)}\n`, options.force, display(env, reportPath));
-        }
+        if (reportPath !== undefined) writeOutput(reportPath, `${JSON.stringify({ files: results }, null, 2)}\n`, options.force, display(env, reportPath));
         return results.every((result) => result.ok) ? EXIT_OK : EXIT_FAILED;
     } catch (error) {
         if (error instanceof UsageError || error instanceof UnknownPassError) {
@@ -173,6 +171,7 @@ export const runCli = async (argv: readonly string[], env: CliEnv): Promise<numb
 interface RunOptions {
     readonly force: boolean;
     readonly outputPath: string | undefined;
+    readonly reportPath: string | undefined;
     readonly dumpDir: string | undefined;
     readonly selection: PassSelection;
     readonly logger: Logger;
@@ -199,11 +198,14 @@ const runOne = async (code: string, label: string, name: string, outputPath: str
     }
 };
 
-/** Checked before the (possibly long) run, and again by each write. Targets that differ only in case are refused too. */
+/**
+ * Checked before the (possibly long) run, and again by each write: the outputs `targets` and the report. Targets that
+ * differ only in case are refused too.
+ */
 const refuseOverwrite = (targets: readonly string[], run: RunOptions): void => {
     const blocked: string[] = [];
     const seen = new Map<string, string>();
-    for (const target of targets) {
+    for (const target of run.reportPath === undefined ? targets : [...targets, run.reportPath]) {
         const reason = blockedTarget(target, run.force);
         if (reason !== undefined) blocked.push(`${JSON.stringify(display(run.env, target))} ${reason}`);
         const other = seen.get(target.toLowerCase());
@@ -218,7 +220,7 @@ const refuseOverwrite = (targets: readonly string[], run: RunOptions): void => {
 
 const runStdin = async (run: RunOptions): Promise<FileResult[]> => {
     if (run.env.stdinIsTTY) throw new UsageError(`No input given and stdin is a terminal\n\n${USAGE}`);
-    if (run.outputPath !== undefined) refuseOverwrite([run.outputPath], run);
+    refuseOverwrite(run.outputPath === undefined ? [] : [run.outputPath], run);
     return [await runOne(await run.env.readStdin(), "<stdin>", "stdin", run.outputPath, run)];
 };
 
@@ -227,10 +229,10 @@ const runPath = async (inputPath: string, run: RunOptions): Promise<FileResult[]
     if (stat === undefined) throw new UsageError(`No such file or directory: ${display(run.env, inputPath)}`);
 
     if (stat.isFile()) {
-        if (run.outputPath !== undefined) {
-            if ((await fs.realpath(run.outputPath).catch(() => run.outputPath)) === (await fs.realpath(inputPath))) throw new UsageError("The output file can't be the input file");
-            refuseOverwrite([run.outputPath], run);
+        if (run.outputPath !== undefined && (await fs.realpath(run.outputPath).catch(() => run.outputPath)) === (await fs.realpath(inputPath))) {
+            throw new UsageError("The output file can't be the input file");
         }
+        refuseOverwrite(run.outputPath === undefined ? [] : [run.outputPath], run);
         const label = display(run.env, inputPath);
         return [await runOne(await fs.readFile(inputPath, "utf8"), label, path.basename(inputPath), run.outputPath, run)];
     }
@@ -241,16 +243,18 @@ const runPath = async (inputPath: string, run: RunOptions): Promise<FileResult[]
     if (realOutput === (await fs.realpath(inputPath))) throw new UsageError("The output directory can't be the input directory");
 
     const sources = await collectSources(inputPath, realOutput);
+    const files = sources.map((source) => ({ source, target: path.join(outputDir, path.relative(inputPath, source)) }));
+    refuseOverwrite(
+        files.map((file) => file.target),
+        run
+    );
     if (sources.length === 0) {
         run.logger.warn(`No .js/.mjs/.cjs files in ${display(run.env, inputPath)}`);
         return [];
     }
-    const targets = sources.map((source) => path.join(outputDir, path.relative(inputPath, source)));
-    refuseOverwrite(targets, run);
 
     const results: FileResult[] = [];
-    for (const [index, source] of sources.entries()) {
-        const target = targets[index] ?? outputDir;
+    for (const { source, target } of files) {
         const label = display(run.env, source);
         const result = await runOne(await fs.readFile(source, "utf8"), label, path.relative(inputPath, source), target, run);
         if (result.ok) run.progress(`ok: ${JSON.stringify(label)} -> ${JSON.stringify(result.output)}`);

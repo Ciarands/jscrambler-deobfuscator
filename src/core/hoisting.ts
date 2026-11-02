@@ -1,6 +1,7 @@
 import type { Function as FunctionDeclaration, Node, Statement, VariableDeclaration } from "./ast.js";
 import { isFunctionNode } from "./ast.js";
 import { at } from "./build.js";
+import type { ScopeInfo } from "./scope.js";
 import { forEachChild } from "./traverse.js";
 
 export const bindingNames = (pattern: Node, names: Set<string> = new Set()): Set<string> => {
@@ -27,8 +28,9 @@ export const bindingNames = (pattern: Node, names: Set<string> = new Set()): Set
 };
 
 /**
- * `var` names and block functions (Annex B binds them function-wide too), in source order. Nested functions aren't
- * searched; a function declaration is reported, not entered.
+ * `var` names and block functions (in sloppy code Annex B may bind them function-wide too), in source order. Nested
+ * functions and class static blocks (whose `var`s are their own) aren't searched; a function declaration is reported,
+ * not entered.
  */
 const visitHoisted = (node: Node, onVar: (name: string) => void, onFunction: (declaration: FunctionDeclaration) => void): void => {
     if (node.type === "VariableDeclaration" && node.kind === "var") {
@@ -38,19 +40,8 @@ const visitHoisted = (node: Node, onVar: (name: string) => void, onFunction: (de
         onFunction(node);
         return;
     }
-    if (isFunctionNode(node)) return;
+    if (isFunctionNode(node) || node.type === "StaticBlock") return;
     forEachChild(node, (child) => visitHoisted(child, onVar, onFunction));
-};
-
-export const hoistedNames = (node: Node, names: Set<string> = new Set()): Set<string> => {
-    visitHoisted(
-        node,
-        (name) => names.add(name),
-        (declaration) => {
-            if (declaration.id !== null) names.add(declaration.id.name);
-        }
-    );
-    return names;
 };
 
 /** Block functions are reported separately: whether Annex B applies needs scope analysis. */
@@ -60,6 +51,23 @@ export const hoistedDeclarations = (node: Node, into: { readonly vars: Set<strin
         (name) => into.vars.add(name),
         (declaration) => into.functions.push(declaration)
     );
+
+/**
+ * The function-wide names `node` binds, which must stay when it is dropped: its `var`s, and its block functions' where
+ * Annex B binds them (`ScopeInfo.annexBName`: sloppy code only, a strict block function binds only in its block). Undefined
+ * when `scopes` doesn't know a block function (made after the analysis), so whether it binds function-wide is unknown.
+ */
+export const droppedNames = (node: Node, scopes: ScopeInfo, names: Set<string> = new Set()): Set<string> | undefined => {
+    const functions: FunctionDeclaration[] = [];
+    hoistedDeclarations(node, { vars: names, functions });
+    for (const declaration of functions) {
+        if (declaration.id === null) continue;
+        if (scopes.variableOf(declaration.id) === undefined) return undefined;
+        const name = scopes.annexBName(declaration);
+        if (name !== undefined) names.add(name);
+    }
+    return names;
+};
 
 export const placeholderDeclaration = (kind: "var" | "let", names: ReadonlySet<string>, origin: Node): VariableDeclaration[] =>
     names.size === 0
@@ -82,17 +90,21 @@ export const isPlaceholder = (s: Statement): boolean =>
 /**
  * What must stay when unreachable `dead` statements are removed, so no binding changes scope: `var`/Annex B names as
  * `var x;`; the list's own `let`/`const`/`class` names as `let c;` (forever in TDZ, as the originals were, so nothing
- * rebinds to an outer `c`); the list's function declarations whole (hoisted, may be called).
+ * rebinds to an outer `c`); the list's function declarations whole (hoisted, may be called), labelled ones without
+ * their labels (a labelled function declares as a plain one does, and nothing can break to its labels). Undefined where
+ * `droppedNames` doesn't know what a statement binds.
  */
-export const deadRemainder = (dead: readonly Statement[], origin: Node): Statement[] => {
+export const deadRemainder = (dead: readonly Statement[], origin: Node, scopes: ScopeInfo): Statement[] | undefined => {
     const varNames = new Set<string>();
     const lexicalNames = new Set<string>();
     const functions: Statement[] = [];
     for (const statement of dead) {
-        if (statement.type === "FunctionDeclaration") functions.push(statement);
+        let item = statement;
+        while (item.type === "LabeledStatement") item = item.body;
+        if (item.type === "FunctionDeclaration") functions.push(item);
         else if (statement.type === "VariableDeclaration" && statement.kind !== "var") for (const d of statement.declarations) bindingNames(d.id, lexicalNames);
         else if (statement.type === "ClassDeclaration" && statement.id !== null) lexicalNames.add(statement.id.name);
-        else hoistedNames(statement, varNames);
+        else if (droppedNames(statement, scopes, varNames) === undefined) return undefined;
     }
     return [...placeholderDeclaration("var", varNames, origin), ...placeholderDeclaration("let", lexicalNames, origin), ...functions];
 };

@@ -1,14 +1,14 @@
 import type { Expression, ForStatement, Node, Statement, SwitchCase, SwitchStatement } from "../../core/ast.js";
-import { isBreakTarget, isFunctionNode, isLoopNode } from "../../core/ast.js";
+import { isBreakTarget, isLoopNode } from "../../core/ast.js";
 import { at } from "../../core/build.js";
 import { sameReference } from "../../core/equal.js";
 import { evaluate } from "../../core/evaluate.js";
-import { forEachChild } from "../../core/traverse.js";
+import { forEachChild, walkSkippingFunctions } from "../../core/traverse.js";
 
 /** Two states are the same iff their keys are equal. */
 export type StateKey = string;
 
-/** Key of the block choosing a computed initial state; never a state value's key (those carry a `x:` prefix). */
+/** Key of the block choosing a computed initial state; never a state value's key (those carry an `n:`, `s:` or `o:` prefix). */
 const ENTRY: StateKey = "entry";
 
 export type Terminator =
@@ -37,8 +37,6 @@ export interface Machine {
     readonly blocks: ReadonlyMap<StateKey, Block>;
     /** Its cases share one block scope. */
     readonly dispatch: SwitchStatement;
-    /** Cases whose label repeats an earlier one: never dispatched to, but their declarations still count. */
-    readonly duplicates: readonly SwitchCase[];
     /** Earlier sibling statement that only sets the initial state (`var S = 2;`). Removable with the machine. */
     readonly initializer: Statement | null;
     /** What the loop's init clause does besides setting the state (`var a` in `for (var a, S = 2; ...)`), in order. */
@@ -172,35 +170,40 @@ const escapingJump = (statements: readonly Statement[]): Node | undefined => {
     let loops = 0;
     let breakables = 0;
     let found: Node | undefined;
-    const walk = (node: Node): void => {
-        if (found !== undefined || isFunctionNode(node)) return;
-        if (node.type === "LabeledStatement") {
-            labels.push(node.label.name);
-            walk(node.body);
-            labels.pop();
-            return;
-        }
+    const enter = (node: Node): boolean => {
+        if (found !== undefined) return false;
         if (node.type === "BreakStatement") {
             if (node.label ? !labels.includes(node.label.name) : breakables === 0) found = node;
-            return;
+            return false;
         }
         if (node.type === "ContinueStatement") {
             if (node.label ? !labels.includes(node.label.name) : loops === 0) found = node;
-            return;
+            return false;
         }
-        const isLoop = isLoopNode(node);
-        const isBreakable = isBreakTarget(node);
-        if (isLoop) loops++;
-        if (isBreakable) breakables++;
-        forEachChild(node, walk);
-        if (isLoop) loops--;
-        if (isBreakable) breakables--;
+        if (node.type === "LabeledStatement") labels.push(node.label.name);
+        if (isLoopNode(node)) loops++;
+        if (isBreakTarget(node)) breakables++;
+        return true;
     };
-    for (const statement of statements) walk(statement);
+    const leave = (node: Node): void => {
+        if (node.type === "LabeledStatement") labels.pop();
+        if (isLoopNode(node)) loops--;
+        if (isBreakTarget(node)) breakables--;
+    };
+    for (const statement of statements) walkSkippingFunctions(statement, enter, leave);
     return found;
 };
 
 type KeyOf = (node: Node) => StateKey | undefined;
+
+/** What the transitions of one machine are judged against. */
+interface States {
+    readonly isState: IsState;
+    readonly keyOf: KeyOf;
+    readonly terminal: StateKey;
+    /** The first case each label keys: a later duplicate is never reached. */
+    readonly keys: ReadonlyMap<StateKey, SwitchCase>;
+}
 
 type TerminatorResult = { readonly ok: true; readonly terminator: Terminator } | Refusal;
 
@@ -216,14 +219,14 @@ const distribute = (node: Expression): (Expression & { type: "ConditionalExpress
     return { ...inner, consequent: { ...node, object: inner.consequent }, alternate: { ...node, object: inner.alternate } };
 };
 
-const terminatorOf = (value: Expression, isState: IsState, terminal: StateKey, known: (key: StateKey) => boolean, keyOf: KeyOf): TerminatorResult => {
+const terminatorOf = (value: Expression, states: States): TerminatorResult => {
     const distributed = distribute(value);
-    if (distributed !== undefined) return terminatorOf(distributed, isState, terminal, known, keyOf);
+    if (distributed !== undefined) return terminatorOf(distributed, states);
     if (value.type === "ConditionalExpression") {
-        if (mentionsState(value.test, isState)) return refuse("state-escapes", "next state depends on the current state", value.test);
-        const consequent = terminatorOf(value.consequent, isState, terminal, known, keyOf);
+        if (mentionsState(value.test, states.isState)) return refuse("state-escapes", "next state depends on the current state", value.test);
+        const consequent = terminatorOf(value.consequent, states);
         if (!consequent.ok) return consequent;
-        const alternate = terminatorOf(value.alternate, isState, terminal, known, keyOf);
+        const alternate = terminatorOf(value.alternate, states);
         if (!alternate.ok) return alternate;
         const [a, b] = [consequent.terminator, alternate.terminator];
         const test = value.test;
@@ -237,11 +240,129 @@ const terminatorOf = (value: Expression, isState: IsState, terminal: StateKey, k
             return { ok: true, terminator: { kind: "branch", test: logical("&&", a.test), consequent: a.consequent, alternate: b } };
         return { ok: true, terminator: { kind: "branch", test, consequent: a, alternate: b } };
     }
-    const key = keyOf(value);
+    const key = states.keyOf(value);
     if (key === undefined) return refuse("non-constant-state", "next state is not a constant", value);
-    if (key === terminal) return { ok: true, terminator: { kind: "goto", target: "exit" } };
-    if (!known(key)) return refuse("non-constant-state", `next state ${key} has no case`, value);
+    if (key === states.terminal) return { ok: true, terminator: { kind: "goto", target: "exit" } };
+    if (!states.keys.has(key)) return refuse("non-constant-state", `next state ${key} has no case`, value);
     return { ok: true, terminator: { kind: "goto", target: key } };
+};
+
+interface InitialState {
+    readonly ok: true;
+    readonly value: Expression;
+    /** Earlier sibling statement that only sets it (`var S = 2;`). */
+    readonly initializer: Statement | null;
+    /** What the loop's init clause does besides setting it, in order. */
+    readonly preamble: Statement[];
+    /** Whether evaluating it where the machine starts, after the preamble, keeps every effect in order. */
+    readonly inPlace: boolean;
+}
+
+/**
+ * The loop's init clause, or the closest earlier sibling that assigns the state. An init that doesn't touch the state
+ * (`for (c.l49(); ...)`) just runs first: it becomes the preamble.
+ */
+const initialState = ({ loop, siblings, index }: MachineSite, isState: IsState): InitialState | Refusal => {
+    let preamble: Statement[] = [];
+    if (loop.init !== null) {
+        const found = initAssignment(loop.init, isState);
+        if (found !== undefined) {
+            const reordered = found.preamble.find((statement) => mentionsState(statement, isState));
+            if (reordered) return refuse("state-escapes", "loop init uses the state besides setting it", reordered);
+            return { ok: true, value: found.value, initializer: null, preamble: found.preamble, inPlace: found.last };
+        }
+        const init = loop.init;
+        const statement = init.type === "VariableDeclaration" ? init : at<Statement>({ type: "ExpressionStatement", expression: init }, init);
+        if (mentionsState(statement, isState)) return refuse("shape", "loop init doesn't set the state", init);
+        preamble = [statement];
+    }
+    if (siblings === null || index === null) return refuse("shape", "machine is not in a statement list, can't find its initial state", loop);
+    for (let i = index - 1; i >= 0; i--) {
+        const sibling = siblings[i];
+        if (sibling === undefined) break;
+        const value = stateAssignment(sibling, isState);
+        if (value !== undefined) return { ok: true, value, initializer: sibling, preamble, inPlace: i === index - 1 && preamble.length === 0 };
+        if (mentionsState(sibling, isState)) return refuse("state-escapes", "state is used between its initialization and the loop", sibling);
+    }
+    return refuse("shape", "no initial state before the loop", loop);
+};
+
+/**
+ * A case body (its final `break;` gone, `endsWithBreak`) without the state update ending it, and the value that sets
+ * (`transition`): `S = v;`, and minified, the last declarator of `var c = f(), S = v;` or the last expression of
+ * `c(), S = v;`. Without one, `terminator` is `end` after a `return`/`throw` and the same state again for a case that
+ * breaks; neither is given for a case that falls into the next one.
+ */
+const stripTrailingTransition = (
+    statements: Statement[],
+    endsWithBreak: boolean,
+    key: StateKey,
+    switchCase: SwitchCase,
+    isState: IsState
+): { readonly ok: true; readonly statements: Statement[]; readonly transition?: Expression; readonly terminator?: Terminator } | Refusal => {
+    const tail = statements.at(-1);
+    if (tail?.type === "ReturnStatement" || tail?.type === "ThrowStatement") return { ok: true, statements, terminator: { kind: "end" } };
+    const value = stateAssignment(tail, isState);
+    if (value !== undefined) {
+        if (!endsWithBreak) return refuse("shape", "case sets the state and falls through", switchCase);
+        return { ok: true, statements: statements.slice(0, -1), transition: value };
+    }
+    if (!endsWithBreak) return { ok: true, statements };
+    if (tail?.type === "VariableDeclaration" && tail.kind === "var" && tail.declarations.length > 1) {
+        const declarator = tail.declarations.at(-1);
+        if (declarator?.id.type === "Identifier" && isState(declarator.id) && declarator.init) {
+            return { ok: true, statements: [...statements.slice(0, -1), { ...tail, declarations: tail.declarations.slice(0, -1) }], transition: declarator.init };
+        }
+    }
+    if (tail?.type === "ExpressionStatement" && tail.expression.type === "SequenceExpression") {
+        const expressions = tail.expression.expressions;
+        const last = expressions.at(-1);
+        if (last?.type === "AssignmentExpression" && last.operator === "=" && isState(last.left)) {
+            const rest = expressions.slice(0, -1);
+            const kept: Statement = { ...tail, expression: rest.length === 1 ? (rest[0] as Expression) : { ...tail.expression, expressions: rest } };
+            return { ok: true, statements: [...statements.slice(0, -1), kept], transition: last.right };
+        }
+    }
+    return { ok: true, statements, terminator: { kind: "goto", target: key } };
+};
+
+/** A case that neither ends nor breaks goes on into `following`, the case after it. */
+const fallThrough = (switchCase: SwitchCase, following: SwitchCase | undefined, states: States): TerminatorResult => {
+    if (following === undefined) return refuse("shape", "last case falls off the switch without setting the state", switchCase);
+    const nextKey = states.keyOf(following.test as Expression) as StateKey;
+    if (states.keys.get(nextKey) !== following) return refuse("shape", "case falls through into a case with a duplicate label", switchCase);
+    return { ok: true, terminator: { kind: "goto", target: nextKey } };
+};
+
+const caseBlock = (switchCase: SwitchCase, key: StateKey, following: SwitchCase | undefined, states: States): { readonly ok: true; readonly block: Block } | Refusal => {
+    const { isState } = states;
+    const all = switchCase.consequent.filter((statement) => statement.type !== "FunctionDeclaration");
+    const lastStatement = all.at(-1);
+    const endsWithBreak = lastStatement?.type === "BreakStatement" && lastStatement.label === null;
+    if (endsWithBreak) all.pop();
+    // Nothing after a case-level `return`/`throw` runs: not a transition, not a fall-through.
+    const end = all.findIndex((statement) => statement.type === "ReturnStatement" || statement.type === "ThrowStatement");
+    const live = end === -1 ? all : all.slice(0, end + 1);
+    const dead = end === -1 ? [] : all.slice(end + 1);
+    const jump = escapingJump(live);
+    if (jump) return refuse("escaping-jump", "case body jumps out of the switch early", jump);
+
+    const ending = stripTrailingTransition(live, endsWithBreak, key, switchCase, isState);
+    if (!ending.ok) return ending;
+    const next =
+        ending.transition !== undefined
+            ? terminatorOf(ending.transition, states)
+            : ending.terminator !== undefined
+              ? { ok: true as const, terminator: ending.terminator }
+              : fallThrough(switchCase, following, states);
+    if (!next.ok) return next;
+
+    const { statements } = ending;
+    for (const statement of statements) if (mentionsState(statement, isState)) return refuse("state-escapes", "state is used inside a case body", statement);
+    // Case-level function declarations aren't in `statements`, but they can still close over the state.
+    for (const statement of switchCase.consequent)
+        if (statement.type === "FunctionDeclaration" && mentionsState(statement, isState)) return refuse("state-escapes", "state is used inside a case body", statement);
+    return { ok: true, block: { key, statements, dead, terminator: next.terminator, origin: switchCase } };
 };
 
 /**
@@ -256,7 +377,8 @@ const terminatorOf = (value: Expression, isState: IsState, terminal: StateKey, k
  * `resolve` tells same-named variables apart; `stateKey` keys states the static evaluator can't (cyclic-array rows,
  * by identity). Declarations are judged in `declarations.ts`.
  */
-export const matchMachine = ({ loop, siblings, index, labeled }: MachineSite, resolve?: Resolve, stateKey?: KeyOf): MatchResult => {
+export const matchMachine = (site: MachineSite, resolve?: Resolve, stateKey?: KeyOf): MatchResult => {
+    const { loop, labeled } = site;
     const keyOf: KeyOf = (node) => constantKey(node) ?? stateKey?.(node);
     if (loop.update !== null) return refuse("not-a-machine", "loop has an update clause");
     const test = loop.test;
@@ -272,140 +394,37 @@ export const matchMachine = ({ loop, siblings, index, labeled }: MachineSite, re
     if (terminal === undefined) return refuse("non-constant-state", "end state is not a constant", terminalNode);
     if (labeled) return refuse("shape", "machine loop is labeled", loop);
     const isState = stateMatcher(state, resolve);
-
-    // Initial state: the loop's init clause, or the closest earlier sibling that assigns it. An init that doesn't
-    // touch the state (`for (c.l49(); ...)`) just runs first: it becomes the preamble.
-    let entryValue: Expression | undefined;
-    let initializer: Statement | null = null;
-    let preamble: Statement[] = [];
-    // Whether evaluating the initial state where the machine starts, after the preamble, keeps every effect in order.
-    let entryInPlace = false;
-    if (loop.init !== null) {
-        const found = initAssignment(loop.init, isState);
-        if (found !== undefined) {
-            const reordered = found.preamble.find((statement) => mentionsState(statement, isState));
-            if (reordered) return refuse("state-escapes", "loop init uses the state besides setting it", reordered);
-            entryValue = found.value;
-            preamble = found.preamble;
-            entryInPlace = found.last;
-        } else {
-            const init = loop.init;
-            const statement = init.type === "VariableDeclaration" ? init : at<Statement>({ type: "ExpressionStatement", expression: init }, init);
-            if (mentionsState(statement, isState)) return refuse("shape", "loop init doesn't set the state", init);
-            preamble = [statement];
-        }
-    }
-    if (entryValue === undefined) {
-        if (siblings === null || index === null) return refuse("shape", "machine is not in a statement list, can't find its initial state", loop);
-        for (let i = index - 1; i >= 0; i--) {
-            const sibling = siblings[i];
-            if (sibling === undefined) break;
-            const value = stateAssignment(sibling, isState);
-            if (value !== undefined) {
-                entryValue = value;
-                initializer = sibling;
-                entryInPlace = i === index - 1 && preamble.length === 0;
-                break;
-            }
-            if (mentionsState(sibling, isState)) return refuse("state-escapes", "state is used between its initialization and the loop", sibling);
-        }
-        if (entryValue === undefined) return refuse("shape", "no initial state before the loop", loop);
-    }
+    const initial = initialState(site, isState);
+    if (!initial.ok) return initial;
 
     const keys = new Map<StateKey, SwitchCase>();
-    const duplicates: SwitchCase[] = [];
     for (const switchCase of body.cases) {
         if (switchCase.test === null) return refuse("shape", "switch has a default case", switchCase);
         const key = keyOf(switchCase.test);
         if (key === undefined) return refuse("non-constant-state", "case label is not a constant", switchCase.test);
-        if (keys.has(key)) duplicates.push(switchCase);
-        else keys.set(key, switchCase);
+        if (!keys.has(key)) keys.set(key, switchCase);
     }
-    const known = (key: StateKey) => keys.has(key);
+    const states: States = { isState, keyOf, terminal, keys };
 
     // The initial state, like any transition: a constant, or a choice between constants (`c() ? T[43][5] : T[39][52]`).
-    const start = terminatorOf(entryValue, isState, terminal, known, keyOf);
+    const start = terminatorOf(initial.value, states);
     if (!start.ok) return refuse(start.code, `initial state: ${start.reason}`, start.node);
     const blocks = new Map<StateKey, Block>();
     let entry: StateKey | "exit";
     if (start.terminator.kind === "goto") entry = start.terminator.target;
     else {
         // Its tests run where the machine starts, so they must have run there, right before the loop, in the original.
-        if (!entryInPlace) return refuse("shape", "computed initial state isn't set right before the loop", entryValue);
+        if (!initial.inPlace) return refuse("shape", "computed initial state isn't set right before the loop", initial.value);
         entry = ENTRY;
         blocks.set(ENTRY, { key: ENTRY, statements: [], dead: [], terminator: start.terminator, origin: null });
     }
     for (const [caseIndex, switchCase] of body.cases.entries()) {
         const key = keyOf(switchCase.test as Expression) as StateKey;
         if (keys.get(key) !== switchCase) continue; // duplicate label, never reached
-
-        const all = switchCase.consequent.filter((statement) => statement.type !== "FunctionDeclaration");
-        const lastStatement = all.at(-1);
-        const endsWithBreak = lastStatement?.type === "BreakStatement" && lastStatement.label === null;
-        if (endsWithBreak) all.pop();
-        // Nothing after a case-level `return`/`throw` runs: not a transition, not a fall-through.
-        const end = all.findIndex((statement) => statement.type === "ReturnStatement" || statement.type === "ThrowStatement");
-        const statements = end === -1 ? all : all.slice(0, end + 1);
-        const dead = end === -1 ? [] : all.slice(end + 1);
-        const jump = escapingJump(statements);
-        if (jump) return refuse("escaping-jump", "case body jumps out of the switch early", jump);
-
-        let terminator: Terminator | undefined;
-        let transition: Expression | undefined;
-        const tail = statements.at(-1);
-        const value = stateAssignment(tail, isState);
-        if (tail?.type === "ReturnStatement" || tail?.type === "ThrowStatement") {
-            terminator = { kind: "end" };
-        } else if (value !== undefined) {
-            if (!endsWithBreak) return refuse("shape", "case sets the state and falls through", switchCase);
-            statements.pop();
-            transition = value;
-        } else if (
-            endsWithBreak &&
-            tail?.type === "VariableDeclaration" &&
-            tail.kind === "var" &&
-            tail.declarations.length > 1 &&
-            tail.declarations.at(-1)?.id.type === "Identifier" &&
-            isState(tail.declarations.at(-1)?.id as Node) &&
-            tail.declarations.at(-1)?.init
-        ) {
-            // `var c = f(), S = 4; break;` (minified): the last declarator is the transition, the rest stays.
-            const declarator = tail.declarations.at(-1) as NonNullable<(typeof tail.declarations)[number]>;
-            statements[statements.length - 1] = { ...tail, declarations: tail.declarations.slice(0, -1) };
-            transition = declarator.init as Expression;
-        } else if (tail?.type === "ExpressionStatement" && tail.expression.type === "SequenceExpression" && endsWithBreak) {
-            const expressions = tail.expression.expressions;
-            const lastExpression = expressions.at(-1);
-            const seqValue = lastExpression?.type === "AssignmentExpression" && lastExpression.operator === "=" && isState(lastExpression.left) ? lastExpression.right : undefined;
-            if (seqValue === undefined) {
-                terminator = { kind: "goto", target: key };
-            } else {
-                const rest = expressions.slice(0, -1);
-                statements[statements.length - 1] = { ...tail, expression: rest.length === 1 ? (rest[0] as Expression) : { ...tail.expression, expressions: rest } };
-                transition = seqValue;
-            }
-        } else if (endsWithBreak) {
-            terminator = { kind: "goto", target: key };
-        } else {
-            const next = body.cases[caseIndex + 1];
-            if (next === undefined) return refuse("shape", "last case falls off the switch without setting the state", switchCase);
-            const nextKey = keyOf(next.test as Expression) as StateKey;
-            if (keys.get(nextKey) !== next) return refuse("shape", "case falls through into a case with a duplicate label", switchCase);
-            terminator = { kind: "goto", target: nextKey };
-        }
-        if (transition !== undefined) {
-            const result = terminatorOf(transition, isState, terminal, known, keyOf);
-            if (!result.ok) return result;
-            terminator = result.terminator;
-        }
-        if (terminator === undefined) return refuse("shape", "case has no recognisable transition", switchCase);
-
-        for (const statement of statements) if (mentionsState(statement, isState)) return refuse("state-escapes", "state is used inside a case body", statement);
-        // Case-level function declarations aren't in `statements`, but they can still close over the state.
-        for (const statement of switchCase.consequent)
-            if (statement.type === "FunctionDeclaration" && mentionsState(statement, isState)) return refuse("state-escapes", "state is used inside a case body", statement);
-        blocks.set(key, { key, statements, dead, terminator, origin: switchCase });
+        const result = caseBlock(switchCase, key, body.cases[caseIndex + 1], states);
+        if (!result.ok) return result;
+        blocks.set(key, result.block);
     }
 
-    return { ok: true, machine: { state, entry, blocks, dispatch: body, duplicates, initializer, preamble } };
+    return { ok: true, machine: { state, entry, blocks, dispatch: body, initializer: initial.initializer, preamble: initial.preamble } };
 };

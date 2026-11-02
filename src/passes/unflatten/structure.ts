@@ -61,6 +61,55 @@ export const reachableOrder = (machine: Machine): NodeId[] => {
     return order.toReversed();
 };
 
+export interface Dominance {
+    /** Each node's immediate dominator; the entry's is itself. */
+    readonly idom: ReadonlyMap<NodeId, NodeId>;
+    readonly dominates: (a: NodeId, b: NodeId) => boolean;
+}
+
+/**
+ * Dominators of a graph's nodes `order`, in reverse postorder from `entry`: Cooper, Harvey & Kennedy, "A Simple,
+ * Fast Dominance Algorithm".
+ */
+export const dominance = (entry: NodeId, order: readonly NodeId[], successors: (id: NodeId) => readonly NodeId[]): Dominance => {
+    const rpo = new Map<NodeId, number>(order.map((id, index) => [id, index]));
+    const rank = (id: NodeId): number => rpo.get(id) ?? -1;
+    const predecessors = new Map<NodeId, NodeId[]>(order.map((id) => [id, []]));
+    for (const id of order) for (const s of successors(id)) predecessors.get(s)?.push(id);
+
+    const idom = new Map<NodeId, NodeId>([[entry, entry]]);
+    const intersect = (a: NodeId, b: NodeId): NodeId => {
+        let x = a;
+        let y = b;
+        while (x !== y) {
+            while (rank(x) > rank(y)) x = idom.get(x) as NodeId;
+            while (rank(y) > rank(x)) y = idom.get(y) as NodeId;
+        }
+        return x;
+    };
+    for (let changed = true; changed;) {
+        changed = false;
+        for (const id of order) {
+            if (id === entry) continue;
+            let candidate: NodeId | undefined;
+            for (const p of predecessors.get(id) ?? []) if (idom.has(p)) candidate = candidate === undefined ? p : intersect(p, candidate);
+            if (candidate !== undefined && idom.get(id) !== candidate) {
+                idom.set(id, candidate);
+                changed = true;
+            }
+        }
+    }
+    return {
+        idom,
+        dominates: (a, b) => {
+            for (let x = b; ; x = idom.get(x) as NodeId) {
+                if (x === a) return true;
+                if (x === entry) return false;
+            }
+        },
+    };
+};
+
 interface Labels {
     /** Must not clash with any label in the program. */
     next(prefix: string): string;
@@ -75,38 +124,7 @@ export const structure = (machine: Machine, order: readonly NodeId[], position: 
     const rpo = new Map<NodeId, number>(order.map((id, index) => [id, index]));
     const rank = (id: NodeId): number => rpo.get(id) ?? -1;
 
-    const predecessors = new Map<NodeId, NodeId[]>(order.map((id) => [id, []]));
-    for (const id of order) for (const s of edges(id)) predecessors.get(s)?.push(id);
-
-    // Dominators: Cooper, Harvey & Kennedy, "A Simple, Fast Dominance Algorithm".
-    const idom = new Map<NodeId, NodeId>([[machine.entry, machine.entry]]);
-    const intersect = (a: NodeId, b: NodeId): NodeId => {
-        let x = a;
-        let y = b;
-        while (x !== y) {
-            while (rank(x) > rank(y)) x = idom.get(x) as NodeId;
-            while (rank(y) > rank(x)) y = idom.get(y) as NodeId;
-        }
-        return x;
-    };
-    for (let changed = true; changed;) {
-        changed = false;
-        for (const id of order) {
-            if (id === machine.entry) continue;
-            let candidate: NodeId | undefined;
-            for (const p of predecessors.get(id) ?? []) if (idom.has(p)) candidate = candidate === undefined ? p : intersect(p, candidate);
-            if (candidate !== undefined && idom.get(id) !== candidate) {
-                idom.set(id, candidate);
-                changed = true;
-            }
-        }
-    }
-    const dominates = (a: NodeId, b: NodeId): boolean => {
-        for (let x = b; ; x = idom.get(x) as NodeId) {
-            if (x === a) return true;
-            if (x === machine.entry) return false;
-        }
-    };
+    const { idom, dominates } = dominance(machine.entry, order, edges);
 
     const isBackward = (from: NodeId, to: NodeId): boolean => rank(to) <= rank(from);
     const loopHeaders = new Set<NodeId>();

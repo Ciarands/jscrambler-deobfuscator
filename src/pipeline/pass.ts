@@ -21,6 +21,11 @@ export interface PassResult {
      * doesn't know resolve to nothing, as for any node made since the last refresh. Defaults to true.
      */
     readonly bindingsChanged?: boolean;
+    /**
+     * With changes: running the pass again right away, on the program it leaves (scope analysis refreshed), would
+     * change nothing, so a fixpoint group skips it until another pass changes something.
+     */
+    readonly settled?: boolean;
     readonly stats?: Readonly<Record<string, number>>;
 }
 

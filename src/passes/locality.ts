@@ -1,8 +1,8 @@
-import type { ArrowFunctionExpression, Function as FunctionNode, Node } from "../core/ast.js";
-import { propertyKey } from "../core/ast.js";
+import type { FunctionLike, Node } from "../core/ast.js";
+import { keyName, propertyKey } from "../core/ast.js";
 import type { Scope, ScopeInfo, Variable } from "../core/scope.js";
 import type { Slot } from "./emulate/builders.js";
-import { sameSlot, slotOf, slotsOnly } from "./emulate/builders.js";
+import { sameSlot, slotArray, slotOf } from "./emulate/builders.js";
 
 export interface Effect {
     readonly reason: string;
@@ -107,7 +107,7 @@ const unknownKey = (key: Kinds): boolean => (key.bits & (STRING | SYMBOL | BUILT
 
 const mayBe = (key: Kinds, name: string): boolean => unknownKey(key) || key.strings?.has(name) === true;
 
-const mayName = (key: Kinds, names: ReadonlySet<string>): boolean => unknownKey(key) || (key.strings !== undefined && [...key.strings].some((name) => names.has(name)));
+const mayBeOneOf = (key: Kinds, names: ReadonlySet<string>): boolean => unknownKey(key) || (key.strings !== undefined && [...key.strings].some((name) => names.has(name)));
 
 /** The key a number, boolean, null or undefined converts to (`"1.5"`, `"true"`): all share one bucket. */
 const isPrimitiveKey = (key: string): boolean => key === "true" || key === "false" || key === "null" || key === "undefined" || String(Number(key)) === key;
@@ -214,13 +214,8 @@ const isAnonymousFunction = (node: Node, scopes: ScopeInfo): boolean => {
     if (node.type === "ArrowFunctionExpression") return true;
     if (node.type !== "FunctionExpression") return false;
     if (node.id === null) return true;
-    return (scopes.variableOf(node.id)?.references.length ?? 1) === 0;
-};
-
-const literalKey = (key: Node): string | undefined => {
-    if (key.type === "Identifier") return key.name;
-    if (key.type === "Literal" && (typeof key.value === "string" || typeof key.value === "number")) return String(key.value);
-    return undefined;
+    const name = scopes.variableOf(node.id);
+    return name !== undefined && scopes.staticReferences(name).length === 0;
 };
 
 const insideWith = (scope: Scope | null): boolean => {
@@ -378,12 +373,15 @@ class Analysis {
         const variable = this.#scopes.staticVariableOf(node);
         if (variable === undefined) return undefined;
         if (!this.#slots.has(variable)) {
-            const [def] = variable.defs;
-            const declarator = def?.node as unknown as Node | undefined;
-            const init = declarator?.type === "VariableDeclarator" && declarator.init?.type === "ArrayExpression" ? declarator.init : undefined;
-            const isSlotArray = def?.type === "Variable" && init !== undefined && this.#isWithin(variable.scope) && slotsOnly(variable, this.#parents);
-            this.#slots.set(variable, isSlotArray ? new Map() : undefined);
-            if (isSlotArray) {
+            const declarator = variable.defs[0]?.node as unknown as Node | undefined;
+            const literal = declarator?.type === "VariableDeclarator" && declarator.init?.type === "ArrayExpression" ? declarator.init : undefined;
+            // `array`: its slots start as the literal's elements; a spread there is refused when compiling the declaration.
+            const init =
+                this.#isWithin(variable.scope) && slotArray(variable, this.#scopes.staticReferences(variable), this.#parents, { init: "array", placement: "anywhere", uses: "index" })
+                    ? literal
+                    : undefined;
+            this.#slots.set(variable, init === undefined ? undefined : new Map());
+            if (init !== undefined) {
                 this.#slotSites.set(init, variable);
                 this.#slotInits.set(variable, init);
             }
@@ -413,8 +411,8 @@ class Analysis {
         const out = new Kinds();
         if ((receiver.bits & OUTSIDE) !== 0) out.addBits(OUTSIDE);
         if ((receiver.bits & BUILTIN) !== 0) out.addBits(OTHER | STRING | BUILTIN | SYMBOL);
-        const namesFunction = mayName(key, INTRINSIC_FUNCTIONS);
-        const namesValue = mayName(key, INTRINSIC_VALUES);
+        const namesFunction = mayBeOneOf(key, INTRINSIC_FUNCTIONS);
+        const namesValue = mayBeOneOf(key, INTRINSIC_VALUES);
         // A string's properties are characters and its length; other primitives have only their prototype's (an
         // accessor there, like a symbol's `description`, gives a string).
         if ((receiver.bits & STRING) !== 0 || receiver.strings !== undefined) out.addBits(OTHER | STRING);
@@ -436,9 +434,9 @@ class Analysis {
     #collectFields(site: object, key: Kinds, out: Kinds, seen: Set<object>): void {
         if (seen.has(site)) return;
         seen.add(site);
-        const slotArray = this.#slotSites.get(site);
-        if (slotArray !== undefined) {
-            for (const slot of this.#slots.get(slotArray)?.values() ?? []) out.add(slot);
+        const array = this.#slotSites.get(site);
+        if (array !== undefined) {
+            for (const slot of this.#slots.get(array)?.values() ?? []) out.add(slot);
             return;
         }
         const buckets = this.#fields.get(site);
@@ -518,10 +516,10 @@ class Analysis {
         }
         if (target.type !== "MemberExpression") return refuse(`writes a ${target.type}`, target);
         if (this.#allowed !== undefined && sameSlot(this.#allowed, slotOf(target, this.#scopes))) return value;
-        const slotArray = this.#slotVariable(target.object);
+        const array = this.#slotVariable(target.object);
         const index = propertyKey(target);
-        if (slotArray !== undefined && index !== undefined) {
-            const location = this.#location(this.#slots.get(slotArray) as Map<string, Kinds>, index);
+        if (array !== undefined && index !== undefined) {
+            const location = this.#location(this.#slots.get(array) as Map<string, Kinds>, index);
             return () => {
                 const result = value();
                 this.#grow(location, result);
@@ -566,7 +564,7 @@ class Analysis {
         if ((self.bits & OUTSIDE) !== 0) refuse("calls a builtin method on an object from outside", node);
         if ((self.bits & BUILTIN) !== 0) refuse("calls a builtin method on a builtin object", node);
         if (foreign(args) !== 0) refuse("passes an object from outside or a builtin to a builtin method", node);
-        if (mayName(method, ACCESSOR_METHODS)) refuse("may define an accessor", node);
+        if (mayBeOneOf(method, ACCESSOR_METHODS)) refuse("may define an accessor", node);
         const name = !unknownKey(method) && (method.bits & OTHER) === 0 && method.strings?.size === 1 ? [...method.strings][0] : undefined;
         if (name !== undefined && STORING_METHODS.has(name) && self.args === undefined) {
             for (const site of self.sites ?? []) this.#store(site, OTHER_KINDS, args, node);
@@ -680,8 +678,8 @@ class Analysis {
             const value = this.#compile(callee);
             return () => this.#invoke(value(), OUTSIDE_KINDS, NOTHING, args(), node);
         }
-        const slotArray = this.#slotVariable(callee.object);
-        const init = slotArray === undefined ? undefined : this.#slotInits.get(slotArray);
+        const array = this.#slotVariable(callee.object);
+        const init = array === undefined ? undefined : this.#slotInits.get(array);
         const receiver = init !== undefined ? () => siteKinds(init) : this.#compile(callee.object);
         const value = this.#compileMember(callee);
         const key = this.#compileKey(callee);
@@ -719,10 +717,10 @@ class Analysis {
 
     #compileMember(node: Node & { type: "MemberExpression" }): Eval {
         if (node.property.type === "PrivateIdentifier") return refuse("uses a private name", node);
-        const slotArray = this.#slotVariable(node.object);
+        const array = this.#slotVariable(node.object);
         const index = propertyKey(node);
-        if (slotArray !== undefined && index !== undefined) {
-            const location = this.#location(this.#slots.get(slotArray) as Map<string, Kinds>, index);
+        if (array !== undefined && index !== undefined) {
+            const location = this.#location(this.#slots.get(array) as Map<string, Kinds>, index);
             return () => union([location, OTHER_KINDS]);
         }
         const receiver = this.#compile(node.object);
@@ -790,7 +788,7 @@ class Analysis {
         this.#returnOwner = returnOwner;
     }
 
-    #compileBody(node: FunctionNode | ArrowFunctionExpression): () => void {
+    #compileBody(node: FunctionLike): () => void {
         if (node.async || (node.type !== "ArrowFunctionExpression" && node.generator)) refuse("has an async or generator function", node);
         for (const param of node.params) if (param.type !== "Identifier") refuse("has a destructuring, default or rest parameter", param);
         const body = node.body;
@@ -810,7 +808,7 @@ class Analysis {
             if (property.kind !== "init") return refuse("defines an accessor", property);
             const value =
                 property.value.type === "FunctionExpression" || property.value.type === "ArrowFunctionExpression" ? this.#compileFunctionValue(property.value) : this.#compile(property.value);
-            const name = property.computed ? undefined : literalKey(property.key);
+            const name = property.computed ? undefined : keyName(property.key);
             const key = property.computed ? this.#compile(property.key) : () => exact(name ?? "");
             // `{ __proto__: v }` sets the prototype; a computed `["__proto__"]` defines a field.
             const setsPrototype = !property.computed && !property.shorthand && !property.method && name === "__proto__";

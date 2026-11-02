@@ -1,21 +1,15 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
 /** Runs in a healthy, undebugged page: no `require`/`process`, native `Date.now`, a `navigator`. */
-const observed = (source: string): string => {
-    const timers: (() => void)[] = [];
-    const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback), navigator: { userAgent: "test" } };
-    runInNewContext(source, context);
-    for (const callback of timers) callback();
-    return JSON.stringify(context.result);
-};
+const RUN: Run = { globals: () => ({ navigator: { userAgent: "test" } }), timers: true };
 
 const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "detectors", "simplify", "cleanup"] })).code;
 
 const sameBehaviour = async (program: string): Promise<string> => {
     const output = await run(program);
-    expect(observed(output)).toBe(observed(program));
+    expect(observe(output, RUN)).toBe(observe(program, RUN));
     return output;
 };
 
@@ -100,13 +94,7 @@ G.L = function () {
 setTimeout(function () { result = [G.L.d() ? "set" : "unset"]; });
 `;
 
-const withFeature = (code: string): string => {
-    const timers: (() => void)[] = [];
-    const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback), FEATURE: true };
-    runInNewContext(code, context);
-    for (const callback of timers) callback();
-    return JSON.stringify(context.result);
-};
+const WITH_FEATURE: Run = { globals: () => ({ FEATURE: true }), timers: true };
 
 describe("detectors", () => {
     it("answers every detector call whose builder ran alike with and without the host's globals", async () => {
@@ -181,7 +169,28 @@ G.V = function () {
         const program = lazy("if (globalThis.FEATURE) { S[4] = 1; }");
         const output = await sameBehaviour(program);
         expect(output).toContain("G.L.d()");
-        expect(withFeature(output)).toBe(withFeature(program));
+        expect(observe(output, WITH_FEATURE)).toBe(observe(program, WITH_FEATURE));
+    });
+
+    it("leaves a feature probe that shares its builder with a detector", async () => {
+        // Only the detector's own code shows a debugger sign; the probe can't borrow it from their builder.
+        const program = `
+function G() {}
+G.L = function () {
+  var S = [arguments];
+  return {
+    d: function () { var X = [arguments]; if (!S[4]) { P(); } return S[4]; },
+    e: function () { var X = [arguments]; if (!S[6]) { Q(); } return S[6]; }
+  };
+  function P() { if (typeof require === "function" && require("inspector").url()) { S[4] = "j-016-00033"; } }
+  function Q() { if (globalThis.FEATURE) { S[6] = true; } }
+}();
+setTimeout(function () { result = [G.L.d() ? "set" : "unset", G.L.e() ? "on" : "off"]; });
+`;
+        const output = await sameBehaviour(program);
+        expect(output).toContain("G.L.e()");
+        expect(output).not.toContain("G.L.d()");
+        expect(observe(output, WITH_FEATURE)).toBe(observe(program, WITH_FEATURE));
     });
 
     it("keeps a detector's builder that calls something outside it while it runs", async () => {
@@ -190,7 +199,7 @@ G.V = function () {
                 .replace("function G() {}", "function G() {}\nvar count = 0;\nfunction bump() { count++; }")
                 .replace('result = [G.L.d() ? "set" : "unset"];', 'result = [G.L.d() ? "set" : "unset", count];');
             const output = await sameBehaviour(program);
-            expect(observed(output), start).toContain(",1]");
+            expect(observe(output, RUN), start).toContain(",1]");
         }
     });
 });

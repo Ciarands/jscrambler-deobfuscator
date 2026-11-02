@@ -1,4 +1,4 @@
-import type { ArrowFunctionExpression, Function as FunctionNode } from "./ast.js";
+import type { FunctionLike } from "./ast.js";
 import type { Value } from "./evaluate.js";
 
 /**
@@ -13,7 +13,7 @@ import type { Value } from "./evaluate.js";
 /** A function of the interpreted code, closed over an interpreter environment (`null`: names it doesn't declare are outer). */
 export class Closure {
     constructor(
-        readonly node: FunctionNode | ArrowFunctionExpression,
+        readonly node: FunctionLike,
         readonly env: object | null
     ) {}
 }
@@ -102,7 +102,7 @@ const checked = <T>(result: T): T => {
 };
 
 /** An array index (`ToString(ToUint32(key)) === key`, below 2^32 - 1), or -1. */
-export const arrayIndex = (key: string): number => {
+const arrayIndex = (key: string): number => {
     const n = Number(key);
     return Number.isInteger(n) && n >= 0 && n < 4294967295 && String(n) === key ? n : -1;
 };
@@ -552,7 +552,7 @@ const ARRAY = namespace(
 // ---------------------------------------------------------------- Object
 
 /** Own enumerable string keys in the spec's order (array indices ascending, then insertion order). */
-export const ownKeys = (v: JsValue): string[] => {
+const ownKeys = (v: JsValue): string[] => {
     if (typeof v === "string") return Array.from({ length: v.length }, (_, i) => String(i));
     if (v instanceof ArrayObject) return Object.keys(v.items);
     if (v instanceof PlainObject) {

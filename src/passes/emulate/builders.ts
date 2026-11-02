@@ -1,6 +1,6 @@
 import type { Function as FunctionNode, Node, Statement } from "../../core/ast.js";
-import { isFunctionNode, isIndexKey, memberPath, propertyKey } from "../../core/ast.js";
-import type { ScopeInfo, Variable } from "../../core/scope.js";
+import { isFunctionNode, isIndexKey, keyName, memberPath, propertyKey } from "../../core/ast.js";
+import type { Reference, ScopeInfo, Variable } from "../../core/scope.js";
 import { traverse } from "../../core/traverse.js";
 import type { PropertyPath } from "./guest.js";
 import type { RuntimeModel } from "./model.js";
@@ -24,13 +24,6 @@ export interface Builder {
     readonly parents: ReadonlyMap<Node, Node>;
     readonly statements: readonly Statement[];
 }
-
-/** Of a non-computed object-literal key (`a`, `"a"`, `1`). */
-const keyName = (key: Node): string | undefined => {
-    if (key.type === "Identifier") return key.name;
-    if (key.type === "Literal" && (typeof key.value === "string" || typeof key.value === "number")) return String(key.value);
-    return undefined;
-};
 
 export const slotOf = (node: Node, scopes: ScopeInfo): Slot | undefined => {
     if (node.type !== "MemberExpression" || node.object.type !== "Identifier") return undefined;
@@ -67,15 +60,53 @@ export const parentsWithin = (root: Node): Map<Node, Node> => {
     return parents;
 };
 
-/** A local array declared once, used only as `S[index]`: its slots hold only what is written to them. */
-export const slotsOnly = (variable: Variable, parents: ReadonlyMap<Node, Node>): boolean =>
-    variable.defs.length === 1 &&
-    variable.references.every((reference) => {
+/** What `slotArray` asks of a local array; each knob goes from weakest to strictest. */
+export interface SlotArrayLevel {
+    /**
+     * Its one definition: anything (`any`), a declarator's array literal (`array`), one without spread
+     * (`spreadless`), or one of identifiers and literals only (`inert`: no hole or spread, nothing called).
+     */
+    readonly init: "any" | "array" | "spreadless" | "inert";
+    /** `first`: a `var` declaration that is the first statement of its function's (or the program's) body. */
+    readonly placement: "anywhere" | "first";
+    /** Every use is `S[index]` (`index`), or any member of it (`member`: the caller vets what each one does). */
+    readonly uses: "index" | "member";
+}
+
+/**
+ * A local array declared once and reached only through its members, so it is never handed on. `references` are its
+ * uses as the caller resolves names (`scopes.references`, or `scopes.staticReferences`); unknown ones refuse.
+ */
+export const slotArray = (variable: Variable, references: readonly Reference[] | undefined, parents: ReadonlyMap<Node, Node>, level: SlotArrayLevel): boolean => {
+    const [def] = variable.defs;
+    if (references === undefined || variable.defs.length !== 1 || def === undefined) return false;
+    if (level.init !== "any") {
+        const declarator = def.node as unknown as Node;
+        if (def.type !== "Variable" || declarator.type !== "VariableDeclarator" || declarator.init?.type !== "ArrayExpression") return false;
+        const elements = declarator.init.elements;
+        if (level.init === "spreadless" && elements.some((element) => element?.type === "SpreadElement")) return false;
+        if (level.init === "inert" && !elements.every((element) => element?.type === "Identifier" || element?.type === "Literal")) return false;
+    }
+    if (level.placement === "first") {
+        if (def.type !== "Variable" || def.parent.kind !== "var") return false;
+        const block = variable.scope.block as unknown as Node;
+        const body = block.type === "Program" ? block.body : bodyOf(block);
+        if (body[0] !== (def.parent as unknown as Node)) return false;
+    }
+    return references.every((reference) => {
         if (reference.init) return true;
         const identifier = reference.identifier as unknown as Node;
         const member = parents.get(identifier);
-        return member?.type === "MemberExpression" && member.object === identifier && isIndexKey(propertyKey(member) ?? "");
+        return member?.type === "MemberExpression" && member.object === identifier && (level.uses === "member" || isIndexKey(propertyKey(member) ?? ""));
     });
+};
+
+/**
+ * The weakest level: declared once, every use `S[index]`, so its slots hold only what is written to them. Callers
+ * vet the declaration themselves (a local of the builder, or of the function they analyse).
+ */
+export const slotsOnly = (variable: Variable, scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): boolean =>
+    slotArray(variable, scopes.references(variable), parents, { init: "any", placement: "anywhere", uses: "index" });
 
 /**
  * A builder function declaration, or a top-level `var f = function () {...}` before the returning statement, bound by
@@ -122,7 +153,7 @@ export const builderOf = (fn: FunctionNode, scopes: ScopeInfo): Builder | string
     }
 
     const holder = slotOf(result, scopes);
-    if (holder === undefined || !slotsOnly(holder.variable, parents)) return "the builder doesn't return an object literal or a slot of a local array it keeps to itself";
+    if (holder === undefined || !slotsOnly(holder.variable, scopes, parents)) return "the builder doesn't return an object literal or a slot of a local array it keeps to itself";
     const assigned = new Map<string, { fn: FunctionNode | undefined; count: number }>();
     const literals: Node[] = [];
     let holderWrites = 0;

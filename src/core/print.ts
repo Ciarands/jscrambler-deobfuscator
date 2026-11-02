@@ -1,4 +1,4 @@
-import type { Expression, Function as FunctionNode, Node, Program, Statement, TemplateElement } from "./ast.js";
+import type { Expression, ExpressionStatement, Function as FunctionNode, Node, Program, Statement, TemplateElement } from "./ast.js";
 import { isStackOverflow, NestingError } from "./traverse.js";
 
 /*
@@ -141,9 +141,15 @@ const DOUBLE_SPECIAL = /[^\x20-\x7e]|["\\]/g;
 const SINGLE_SPECIAL = /[^\x20-\x7e]|['\\]/g;
 const TEMPLATE_SPECIAL = /[^\x20-\x7e]|[`$\\]/g;
 
-export const quoteString = (value: string): string => {
-    const doubles = value.split('"').length - 1;
-    const quote = doubles > 0 && doubles > value.split("'").length - 1 ? "'" : '"';
+const quoteString = (value: string): string => {
+    let doubles = 0;
+    let singles = 0;
+    for (let i = 0; i < value.length; i++) {
+        const code = value.charCodeAt(i);
+        if (code === 0x22) doubles++;
+        else if (code === 0x27) singles++;
+    }
+    const quote = doubles > singles ? "'" : '"';
     if (SIMPLE_STRING.test(value) && !value.includes(quote) && !value.includes("\\")) return quote + value + quote;
     const quoteCode = quote.charCodeAt(0);
     return quote + escapeText(value, quote === '"' ? DOUBLE_SPECIAL : SINGLE_SPECIAL, (code) => (code === quoteCode ? `\\${quote}` : undefined)) + quote;
@@ -181,7 +187,7 @@ const unicodeEscape = (code: number, braces: boolean): string => {
  * for the same character: `\<c>` (an identity escape) is replaced whole. In a string, `\` before a line terminator is
  * a line continuation, which stands for nothing.
  */
-export const escapeUnsafeSource = (text: string, braces: boolean, inString: boolean): string => {
+const escapeUnsafeSource = (text: string, braces: boolean, inString: boolean): string => {
     if (!hasUnsafe(text)) return text;
     let out = "";
     let from = 0;
@@ -209,7 +215,20 @@ const formatNumber = (value: number): string => {
     return plus === -1 ? text : text.slice(0, plus + 1) + text.slice(plus + 2);
 };
 
-const isNegativeNumber = (node: Node): boolean => node.type === "Literal" && typeof node.value === "number" && (node.value < 0 || Object.is(node.value, -0));
+/** `-0` too: it prints with its sign. */
+const isNegative = (value: number): boolean => value < 0 || Object.is(value, -0);
+
+const isNegativeNumber = (node: Node): boolean => node.type === "Literal" && typeof node.value === "number" && isNegative(node.value);
+
+/**
+ * A directive still holding the literal it was parsed with. A pass may have replaced the literal (or copied it, raw text
+ * and all, with another value): then the statement prints as what it now holds.
+ */
+const isOriginalDirective = (statement: ExpressionStatement): statement is ExpressionStatement & { directive: string; expression: { raw: string } } => {
+    const { directive, expression } = statement;
+    if (typeof directive !== "string" || expression.type !== "Literal" || typeof expression.raw !== "string") return false;
+    return expression.raw.slice(1, -1) === directive && (directive.includes("\\") || expression.value === directive);
+};
 
 /** One switch for both precedence and context: the megamorphic type read is the costly part. */
 const needsParentheses = (node: Node, min: number, flags: number): boolean => {
@@ -223,7 +242,7 @@ const needsParentheses = (node: Node, min: number, flags: number): boolean => {
             return CALL < min || (flags & NO_CALL) !== 0;
         case "Literal":
             if (typeof node.value !== "number") return false;
-            if (node.value < 0 || Object.is(node.value, -0)) return UNARY < min;
+            if (isNegative(node.value)) return UNARY < min;
             // `(1).x`: a digit-only number before `.name` would take the dot as its decimal point.
             return (flags & MEMBER_OBJECT) !== 0 && /^\d+$/.test(formatNumber(node.value));
         case "SequenceExpression":
@@ -302,11 +321,19 @@ class Printer {
     readonly #display: boolean;
     readonly #warn: ((message: string) => void) | undefined;
     readonly #warned = new Set<Node>();
+    /** When set, where each function's text starts in the output (see `printStatement`). */
+    #functions: Map<number, Node> | undefined;
 
     constructor(layout: boolean, display: boolean, warn?: (message: string) => void) {
         this.#layout = layout;
         this.#display = display;
         this.#warn = warn;
+    }
+
+    /** Only without layout: a layout attempt that backs out would leave stale offsets. */
+    track(functions: Map<number, Node>): void {
+        if (this.#layout) throw new Error("print: functions are tracked without layout only");
+        this.#functions = functions;
     }
 
     get output(): string {
@@ -473,12 +500,8 @@ class Printer {
                 continue;
             }
             const expression = statement.expression;
-            // A pass may have replaced the directive's literal (or copied it, raw text and all, with another value): then
-            // the statement prints as what it now holds.
-            const directive = statement.directive;
-            const raw = expression.type === "Literal" ? expression.raw : undefined;
-            const value = expression.type === "Literal" ? expression.value : undefined;
-            if (typeof directive === "string" && typeof raw === "string" && raw.slice(1, -1) === directive && (directive.includes("\\") || value === directive)) {
+            if (isOriginalDirective(statement)) {
+                const raw = statement.expression.raw;
                 this.write(`${this.#display ? escapeUnsafeSource(raw, false, true) : raw};`);
                 continue;
             }
@@ -750,7 +773,13 @@ class Printer {
         this.list("{", "}", attributes, "attributes");
     }
 
+    /** Notes where `fn` starts (QuickJS's position of a function: its first token, or a method's). */
+    #start(fn: Node): void {
+        this.#functions?.set(this.#length, fn);
+    }
+
     function(node: FunctionNode): void {
+        this.#start(node);
         if (node.async) this.write("async ");
         this.write(node.generator ? "function*" : "function");
         this.write(node.id === null ? " " : ` ${node.id.name}`);
@@ -764,6 +793,7 @@ class Printer {
     }
 
     arrow(node: Extract<Node, { type: "ArrowFunctionExpression" }>, flags: number): void {
+        this.#start(node);
         if (node.async) this.write("async ");
         const only = node.params.length === 1 ? node.params[0] : undefined;
         if (only?.type === "Identifier") this.write(only.name);
@@ -842,6 +872,7 @@ class Printer {
 
     method(kind: "get" | "set" | "method", key: Node, computed: boolean, fn: Node): void {
         if (fn.type !== "FunctionExpression") throw new Error(`print: method value ${fn.type}`);
+        this.#start(fn);
         if (kind !== "method") this.write(`${kind} `);
         if (fn.async) this.write("async ");
         if (fn.generator) this.write("*");
@@ -1054,7 +1085,7 @@ class Printer {
         if (typeof value === "string") return this.write(quoteString(value));
         if (typeof value === "number") {
             if (Number.isNaN(value)) return this.write("(0 / 0)");
-            if (value < 0 || Object.is(value, -0)) return this.write(`-${formatNumber(-value)}`);
+            if (isNegative(value)) return this.write(`-${formatNumber(-value)}`);
             return this.write(formatNumber(value));
         }
         return this.write(String(value));
@@ -1100,9 +1131,17 @@ export const print = (program: Program, warn?: (message: string) => void): strin
     return printer.output;
 };
 
-/** Exact, without layout work (for running in the sandbox). */
-export const printStatement = (statement: Statement): string => {
+/** A statement's exact text, without layout work, and where each function in it starts (a UTF-16 offset). */
+export interface PrintedFunctions {
+    readonly source: string;
+    readonly functions: ReadonlyMap<number, Node>;
+}
+
+/** For running in the sandbox. Function starts are where QuickJS places a function: one it made is found by its `lineNumber`/`columnNumber`. */
+export const printStatement = (statement: Statement): PrintedFunctions => {
     const printer = new Printer(false, false);
+    const functions = new Map<number, Node>();
+    printer.track(functions);
     printer.statements([statement], true);
-    return printer.output;
+    return { source: printer.output, functions };
 };

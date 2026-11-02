@@ -1,14 +1,8 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
-const observed = (source: string): string => {
-    const timers: (() => void)[] = [];
-    const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };
-    runInNewContext(source, context);
-    for (const callback of timers) callback();
-    return JSON.stringify(context.result);
-};
+const RUN: Run = { timers: true };
 
 // The decoder finds its string function by trying permutations of a few characters until `G[name]` exists; it is
 // used later with a key no pass can resolve, so it and its probe stay.
@@ -45,7 +39,7 @@ describe("cleanup: computed reads in prelude-only code", () => {
     it("removes definitions that run after the probe", async () => {
         const program = runtime({ after: "G.late = function () { return 2; };" });
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).not.toContain("G.late");
         expect(output).toContain("G.Pq = ");
     });
@@ -53,7 +47,7 @@ describe("cleanup: computed reads in prelude-only code", () => {
     it("removes definitions before the probe whose key it can't name", async () => {
         const program = runtime({ before: "G.zz = function () { return 3; };" });
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).not.toContain("G.zz");
     });
 
@@ -61,14 +55,14 @@ describe("cleanup: computed reads in prelude-only code", () => {
         // Either permutation may be found first: both give a table.
         const program = runtime({ before: 'G.qP = function () { return "d,e,f"; };' });
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("G.qP = ");
     });
 
     it("keeps every definition before the probe when its keys can't be derived", async () => {
         const program = runtime({ before: "G.zz = function () { return 3; };", codes: 'JSON.parse("[79, 112]")', after: "G.late = function () { return 2; };" });
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("G.zz = ");
         expect(output).not.toContain("G.late");
     });
@@ -76,7 +70,7 @@ describe("cleanup: computed reads in prelude-only code", () => {
     it("keeps the runtime when a computed read may run after the prelude", async () => {
         const program = runtime({ after: "G.late = function () { return 2; };", later: 'var k = ["la", "te"].join(""); G[k];' });
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("G.late = ");
     });
 });

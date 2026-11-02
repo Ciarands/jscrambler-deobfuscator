@@ -35,6 +35,11 @@ export interface RuntimeModel {
     readonly root: Node;
     readonly globalKeys: ReadonlySet<string>;
     readonly aliases: readonly Alias[];
+    /**
+     * Names the program added to builtins that read like a builtin property through a getter not proven to answer so
+     * every time (`getters.ts`): not rewritten, so the setup call stays while the program names one.
+     */
+    readonly unprovenAliases: ReadonlySet<string>;
     readonly callAliases: ReadonlyMap<string, CallAlias>;
     /** `G.key()` is `globalThis[name]`; by key, the global property's name. */
     readonly globalReads: ReadonlyMap<string, string>;
@@ -61,8 +66,10 @@ export interface RuntimeModel {
      * (`Facts.replaced`); one split or removed loses it.
      */
     readonly setup: ReadonlySet<Node>;
-    /** Storage keys the setup calls installed (call-alias getters, probed or not); they don't use `G` as `this`. */
+    /** Storage keys the setup calls installed (call-alias getters, probed or not). */
     readonly setupKeys: ReadonlySet<string>;
+    /** Setup keys whose calls provably never use `G` as `this` (`GetterProofs.thisFree`). */
+    readonly thisFreeKeys: ReadonlySet<string>;
     /**
      * Global properties the setup calls added. The setup call stays while the program names one: app code reaches
      * them only by name (model 9), other scripts not at all (model 2).

@@ -1,13 +1,8 @@
-import { createContext, runInContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
-const observed = (source: string): string => {
-    const context = createContext({});
-    context.window = runInContext("this", context);
-    runInContext(source, context);
-    return JSON.stringify(context.result);
-};
+const RUN: Run = { window: true };
 
 const simplified = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["simplify"] })).code;
 
@@ -35,7 +30,7 @@ var G = function () {
 result = G();
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("log.push(3229 + k);");
     });
 
@@ -50,7 +45,7 @@ var G = function () {
 result = G();
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("log.push(7);");
         expect(output).toContain("log.push(-7);");
     });
@@ -67,13 +62,13 @@ result = G();
 result = G();
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("return 42;");
         expect(output).toContain("return typeof u;");
         // A definition inside the declaration itself: its earlier reads run first in each call.
         const inside = `var F = function () {\n  var k;\n  function g() {\n    var r = typeof k;\n    k = 5;\n    return r;\n  }\n  return [g(), g()];\n};\nresult = F();\n`;
         const kept = await simplified(inside);
-        expect(observed(kept)).toBe(observed(inside));
+        expect(observe(kept, RUN)).toBe(observe(inside, RUN));
         expect(kept).toContain("var r = typeof k;");
     });
 
@@ -92,7 +87,7 @@ var G = function () {
 result = G();
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("log.push(t);");
     });
 
@@ -112,7 +107,7 @@ result = G();
 result = G();
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("log.push(t);");
         expect(output).toContain("log.push(t + 1);");
     });
@@ -142,7 +137,7 @@ f(false, 2);
 result = log;
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("log.push(2738);");
         expect(output).toContain("return 2739;");
         expect(output).toContain('log.push("Nx");');
@@ -172,7 +167,7 @@ f(true);
 result = log;
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("log.push(a);");
         expect(output).toContain("log.push(b);");
         expect(output).toContain("log.push(c);");
@@ -197,7 +192,7 @@ describe("constants written once after a bare declaration", () => {
 result = [f(true), f(false)];
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("var log = [typeof a];");
         expect(output).toContain('log.push("k", 1);');
         expect(output).toContain("log.push(6);");
@@ -217,7 +212,7 @@ result = [f(true), f(false)];
 result = f();
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("var first = m;");
         expect(output).toContain("return [n, first, 2];");
     });
@@ -248,7 +243,7 @@ describe("constants written by several statements in one list", () => {
 result = f([]);
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain('log.push("abcd1", "AB", "xy", "AB", "disable");');
     });
 
@@ -266,7 +261,7 @@ result = f([]);
 result = f();
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("return s;");
         expect(output).toContain("log.push(early(), s);");
         expect(output).toContain("var later = () => s;");
@@ -298,7 +293,7 @@ result = f();
 result = [f(true), f(false)];
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("return [s, t, u, v, out];");
         expect(output).toContain("out.push(w);");
     });
@@ -318,7 +313,7 @@ describe("constant arrays", () => {
 a();
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`result = ["set", "get", 4, undefined, 3, log];`);
         expect(output).toContain(`T = [(log.push("built"), "get"), "set", , 3];`);
     });
@@ -340,7 +335,7 @@ function b(c) {
 result = [a(true), a(false)];
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`return ["set", 4, b(c)];`);
         expect(output).toContain(`return "get";`);
     });
@@ -355,7 +350,7 @@ result = [a(true), a(false)];
 result = f(1);
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`return ["x", "z"];`);
     });
 
@@ -371,7 +366,7 @@ result = f(1);
 result = [a(0), a(1), a(7), a("length")];
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`return [used, "set"];`);
     });
 
@@ -381,7 +376,7 @@ var T = [(log.push(1), log.length > 0 ? "a" : "b"), "c"];
 result = [T[0], T[1], T[2]];
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`result = [T[0], "c", T[2]];`);
     });
 
@@ -411,7 +406,7 @@ result = [T[0], T[1], T[2]];
         for (const [name, code] of Object.entries(cases)) {
             const program = name === "read before it is built" ? `${code}\nvar T = ["get", "set"];\n` : `var T = ["get", "set"];\n${code}\n`;
             const output = await simplified(program);
-            expect(observed(output), name).toBe(observed(program));
+            expect(observe(output, RUN), name).toBe(observe(program, RUN));
             expect(output, name).toContain("T[0]");
         }
     });
@@ -422,7 +417,7 @@ T[0]();
 result = T[1];
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("result = T[1];");
     });
 
@@ -432,7 +427,7 @@ var T = [...S, "b"];
 result = T[1];
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("result = T[1];");
     });
 
@@ -444,7 +439,7 @@ window[String.fromCharCode(100)] = 8;
 result = [c, d];
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain("result = [c, d];");
     });
 
@@ -452,12 +447,12 @@ result = [c, d];
         // `window[T[k]]` reaches `x` or `undefined`, never `T` itself: T stays constant.
         const safe = `var T = ["x", "beta"];\nvar x = 5;\nfunction pick(k) { return window[T[k]]; }\nresult = [pick(0), pick(7), T[1]];\n`;
         const output = await simplified(safe);
-        expect(observed(output)).toBe(observed(safe));
+        expect(observe(output, RUN)).toBe(observe(safe, RUN));
         expect(output).toContain('result = [pick(0), pick(7), "beta"];');
         // An element naming the array reaches it (spelled in two parts: no literal says its name).
         const named = `var TU = ["T" + "U", "beta"];\nfunction pick(k) { return window[TU[k]]; }\npick(0)[1] = "changed";\nresult = [TU[1]];\n`;
         const kept = await simplified(named);
-        expect(observed(kept)).toBe(observed(named));
+        expect(observe(kept, RUN)).toBe(observe(named, RUN));
         expect(kept).toContain("result = [TU[1]];");
     });
 
@@ -473,7 +468,7 @@ function a(flag) {
 result = [a(false), a(true)];
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`return [s[4][0], "get"];`);
     });
 
@@ -489,7 +484,7 @@ function a() {
 result = a();
 `;
         const output = await simplified(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`s[4][0]`);
         expect(output).toContain(`return [before, "set"];`);
     });

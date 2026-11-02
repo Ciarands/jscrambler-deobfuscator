@@ -1,11 +1,11 @@
 import { readFileSync } from "node:fs";
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import type { ExpressionStatement, IfStatement, Node, Program, Statement } from "../src/core/ast.js";
 import { valueToNode } from "../src/core/build.js";
 import { parse } from "../src/core/parse.js";
 import { print, printStatement } from "../src/core/print.js";
 import { flatten, generate, mulberry32, runTrace } from "./fuzz/programs.js";
+import { observe, serialize } from "./helpers.js";
 
 /** The AST without positions and source spellings: what a re-parse of the printed code must give back. */
 const shape = (node: unknown): unknown => {
@@ -23,7 +23,7 @@ const roundTrips = (code: string): void => {
     const program = parse(code);
     const printed = print(program);
     expect(shape(parse(printed))).toEqual(shape(program));
-    for (const statement of program.body) expect(shape(parse(printStatement(statement as Statement)).body)).toEqual(shape([statement]));
+    for (const statement of program.body) expect(shape(parse(printStatement(statement as Statement).source).body)).toEqual(shape([statement]));
 };
 
 /** Every construct whose printing needs care: precedence, statement-start ambiguities, literals, classes, modules. */
@@ -61,7 +61,7 @@ describe("print", () => {
         const array = ((program.body[0] as ExpressionStatement).expression as { right: { elements: Node[] } }).right;
         array.elements = [...strings, ...numbers].map((value) => valueToNode(value, [0, 0]));
         const printed = print(program);
-        expect(runInNewContext(`${printed}; x`)).toEqual([...strings, ...numbers]);
+        expect(observe(`${printed}; result = x;`)).toBe(serialize([...strings, ...numbers]));
         // Invisible and lone characters are escapes, so the file stays valid text that shows them.
         expect([...printed].filter((char) => !isShown(char.codePointAt(0) ?? 0))).toEqual([]);
         expect(printed).toContain("1000000");
@@ -74,16 +74,14 @@ describe("print", () => {
         const program = parse("if (a) { if (b) t(1); } else t(2);");
         const outer = program.body[0] as IfStatement;
         outer.consequent = (outer.consequent as { body: Statement[] }).body[0] as Statement;
-        const trace: number[] = [];
-        runInNewContext(print(program), { a: true, b: false, t: (x: number) => trace.push(x) });
-        expect(trace).toEqual([]);
+        expect(observe(print(program), { globals: () => ({ a: true, b: false }), trace: true })).toBe(serialize([[], undefined]));
     });
 
     it("parenthesizes a string statement where it would read as a directive", () => {
         const program = parse("function f() { x; return this; }");
         const body = (program.body[0] as { body: { body: Statement[] } }).body.body;
         body[0] = { type: "ExpressionStatement", expression: valueToNode("use strict", [0, 0]), start: 0, end: 0 } as unknown as Statement;
-        expect(runInNewContext(`${print(program)}; f() === undefined`)).toBe(false);
+        expect(observe(`${print(program)}; result = f() === undefined;`)).toBe("false");
     });
 
     it("keeps a built negative number apart from what precedes and follows it", () => {
@@ -92,7 +90,7 @@ describe("print", () => {
         subtract.right.right = { type: "Literal", value: -1, raw: null, start: 0, end: 0 } as unknown as Node;
         const member = (program.body[1] as ExpressionStatement).expression as { right: { object: Node } };
         member.right.object = { type: "Literal", value: -1.5, raw: null, start: 0, end: 0 } as unknown as Node;
-        expect(runInNewContext(`${print(program as Program)}; [x, y]`, { a: 5, b: 0 })).toEqual([6, undefined]);
+        expect(observe(`${print(program as Program)}; result = [x, y];`, { globals: () => ({ a: 5, b: 0 }) })).toBe(serialize([6, undefined]));
     });
 
     it("keeps short lists on one line and puts long ones one item per line", () => {

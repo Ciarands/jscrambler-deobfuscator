@@ -1,6 +1,6 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { machinesLeft, observe, type Run } from "./helpers.js";
 
 // Cyclic-array states: rows of a generated table that point at each other, compared by identity.
 const PROGRAM = `
@@ -47,16 +47,12 @@ function g(c) {
 result = [f(host.a), f(host.b), g(host.a), g(host.b)];
 `;
 
-const run = (code: string): string => {
-    const context: Record<string, unknown> = { host: { a: true, b: false } };
-    runInNewContext(code, context);
-    return JSON.stringify(context.result);
-};
+const RUN: Run = { globals: () => ({ host: { a: true, b: false } }) };
 
 describe("unflatten with runtime state keys", () => {
     it("unflattens machines whose states are table rows compared by identity", async () => {
         const { code } = await deobfuscate(PROGRAM, { passes: ["emulate", "unflatten"] });
-        expect(code).not.toContain("switch");
-        expect(run(code)).toBe(run(PROGRAM));
+        expect(machinesLeft(code)).toBe(0);
+        expect(observe(code, RUN)).toBe(observe(PROGRAM, RUN));
     });
 });

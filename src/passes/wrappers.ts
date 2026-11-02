@@ -2,14 +2,20 @@ import type { CallExpression, Node } from "../core/ast.js";
 import { propertyKey } from "../core/ast.js";
 import { callOf, memberChain } from "../core/build.js";
 import { evaluate } from "../core/evaluate.js";
+import { sameItems } from "../core/list.js";
 import { traverse } from "../core/traverse.js";
+import { factKey } from "../pipeline/facts.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
 import type { PropertyPath } from "./emulate/guest.js";
 import { RUNTIME } from "./emulate/model.js";
 import type { StorageEffects } from "./emulate/effects.js";
 import { storageAnalysis } from "./emulate/effects.js";
 
-const samePath = (a: PropertyPath, b: PropertyPath): boolean => a.length === b.length && a.every((key, i) => key === b[i]);
+/**
+ * How many wrappers runs rewrote calls. Wrappers is the one pass that makes wrapper call sites (direct calls of a
+ * wrapper's target) after resolve-calls walked the program: resolve-calls walks again when this changes.
+ */
+export const WRAPPER_REWRITES = factKey<number>("wrapper rewrites");
 
 /**
  * An argument whose evaluation runs no code of the program: no calls, assignments, getters (member reads) or
@@ -81,7 +87,7 @@ export const wrappers: Pass = {
                 continue;
             }
             const isFunction = info.type === "function";
-            if (isFunction && (wrapper.receiver === undefined || !samePath(wrapper.receiver, wrapper.target.slice(0, -1)))) {
+            if (isFunction && (wrapper.receiver === undefined || !sameItems(wrapper.receiver, wrapper.target.slice(0, -1)))) {
                 log.debug(`wrapper ${key}: applies ${name} with a different this, left`, wrapper.definition);
                 continue;
             }
@@ -117,6 +123,7 @@ export const wrappers: Pass = {
             },
         });
 
+        if (counts.inlined > 0) facts.set(WRAPPER_REWRITES, (facts.get(WRAPPER_REWRITES) ?? 0) + 1);
         log.info(
             `inlined ${counts.inlined} wrapper call(s) through ${kinds.size} wrapper(s); kept ${counts.stale} whose wrapper or target may change, ${counts.arguments} whose arguments could change the target first, ${counts.valueArguments} value target(s) called with arguments`
         );

@@ -15,6 +15,7 @@ import { shareStorageAnalysis, storageEffects } from "./emulate/effects.js";
 import type { LoggedCall, ResolveRequest } from "./emulate/guest.js";
 import { RUNTIME } from "./emulate/model.js";
 import { storageMatcher } from "./emulate/storage.js";
+import { WRAPPER_REWRITES } from "./wrappers.js";
 
 /** Identity of a call by key and argument values, matching how `emulate` reports calls it couldn't place. */
 const sameCall = (key: string, args: readonly unknown[], other: { key: string; args: readonly unknown[] }): boolean =>
@@ -48,8 +49,8 @@ interface Resolution {
      * direct call of it that runs only after that call's root statement can't drive a stage. Found by the first run.
      */
     readonly settlingSites: Map<string, Node>;
-    /** How many runs walked the whole program; after wrappers, no later pass makes new decoder calls. */
-    walks: number;
+    /** `WRAPPER_REWRITES` as of the last walk of the whole program: past it, wrapper call sites the walk didn't see. */
+    rewritesWalked: number;
 }
 
 /** A value in a request's identity: strings quoted, numbers keeping `-0` apart, other primitives by type. */
@@ -88,13 +89,15 @@ export const resolveCalls: Pass = {
         }
         const { guest, callResults, wrappers } = runtime;
         const earlier = facts.get(RESOLUTION);
-        // Later runs only look for settled decoders' calls whose arguments were waiting to become constant. Once a walk
-        // after wrappers found them (`walks`), until one of them has constant arguments, there is nothing to do.
+        // Later runs only look for settled decoders' calls whose arguments were waiting to become constant. Wrappers
+        // rewriting such calls since the last walk makes new sites of them; otherwise, until one has constant
+        // arguments, there is nothing to do.
         if (earlier !== undefined && earlier.waiting.size === 0) {
             log.info("no wrapper calls wait for constant arguments");
             return { changed: 0 };
         }
-        if (earlier !== undefined && earlier.walks >= 2) {
+        const rewrites = facts.get(WRAPPER_REWRITES) ?? 0;
+        if (earlier !== undefined && earlier.rewritesWalked === rewrites) {
             const env = constantEnv(scope(), log);
             const ready = [...earlier.waiting].some((call) => call.type === "CallExpression" && call.arguments.every((arg) => argumentValue(arg, env)?.ok === true));
             if (!ready) {
@@ -111,13 +114,12 @@ export const resolveCalls: Pass = {
             logged: new WeakSet(),
             proof: decoderLookups(runtime, matcher, scopes, log),
             settlingSites: new Map(),
-            walks: 0,
+            rewritesWalked: rewrites,
         };
-        resolution.walks++;
         if (earlier === undefined) {
             facts.set(RESOLUTION, resolution);
             facts.set(DECODER_PROOF, resolution.proof);
-        }
+        } else earlier.rewritesWalked = rewrites;
         const { decided, logged: loggedWaiting, proof } = resolution;
         const waiting = new Set<Node>();
         const unmappedByKey = new Map<string, LoggedCall[]>();
@@ -153,7 +155,7 @@ export const resolveCalls: Pass = {
         const candidates: Candidate[] = [];
         /** Wrapper keys by their target's path: a direct call of the target (what wrappers makes of a wrapper call) asks the same. */
         const wrapperOfTarget = new Map<string, string>();
-        for (const [key, wrapper] of wrappers) if (wrapper.target !== undefined) wrapperOfTarget.set(wrapper.target.join("\u0000"), key);
+        for (const [key, wrapper] of wrappers) wrapperOfTarget.set(wrapper.target.join("\u0000"), key);
         const targetOf = (key: string): string | undefined => wrappers.get(key)?.target.join("\u0000");
         traverse(program, {
             CallExpression(path) {

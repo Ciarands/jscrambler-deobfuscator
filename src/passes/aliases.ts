@@ -2,6 +2,7 @@ import type { Argument, CallExpression, Expression, MemberExpression, Node } fro
 import { isBindingName, propertyKey } from "../core/ast.js";
 import { callOf, identifier, member, memberChain } from "../core/build.js";
 import type { ScopeInfo } from "../core/scope.js";
+import { OWN_GLOBAL_OBJECT_NAMES } from "../core/scope.js";
 import { traverse } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
 import type { CallAlias } from "./emulate/model.js";
@@ -127,7 +128,7 @@ export const aliases: Pass = {
                 const node = path.node as MemberExpression;
                 const key = propertyKey(node);
                 const host = key === undefined ? undefined : runtime.hostAliases.get(key);
-                if (host !== undefined && node.object.type === "Identifier" && node.object.name === "globalThis" && scopes.isGlobalReference(node.object)) {
+                if (host !== undefined && node.object.type === "Identifier" && OWN_GLOBAL_OBJECT_NAMES[node.object.name] === true && scopes.isGlobalReference(node.object)) {
                     if (key !== undefined && tampered.has(key)) return refuse("the program deletes the alias or names it as a string (it may redefine it)", node);
                     if (isDeleted(path.parent)) return refuse("deleting the alias isn't deleting what it stands for", node);
                     path.replace(member(node.object, host, node));

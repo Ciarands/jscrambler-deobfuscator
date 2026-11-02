@@ -1,6 +1,6 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
 // Matrix: a prelude builder makes rows that point at each other; opaque predicates compare cells.
 const MATRIX = `
@@ -16,20 +16,14 @@ G.k = (function (n) {
 
 const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "storage-comparisons"] })).code;
 
-const observed = (source: string): string => {
-    const timers: (() => void)[] = [];
-    const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };
-    runInNewContext(source, context);
-    for (const callback of timers) callback();
-    return JSON.stringify(context.result);
-};
+const RUN: Run = { timers: true };
 
 describe("storage-comparisons", () => {
     it("folds equality tests between cells of a matrix nothing changes after the prelude", async () => {
         const program = `${MATRIX}setTimeout(function () { result = [G.k.m[1][2] != G.k.m[0][0], G.k.m[0][1] === G.k.m[2][2], G.k.v == G.k.v]; });\n`;
         const output = await run(program);
         expect(output).toContain("result = [true, false, true];");
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
     });
 
     it("keeps tests whose cells may change, or that would convert an object", async () => {
@@ -42,7 +36,7 @@ describe("storage-comparisons", () => {
         for (const { program, kept } of cases) {
             const output = await run(program);
             expect(output).toContain(kept);
-            expect(observed(output)).toBe(observed(program));
+            expect(observe(output, RUN)).toBe(observe(program, RUN));
         }
     });
 });

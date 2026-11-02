@@ -1,6 +1,6 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
 const PROGRAM = `
 var log = [];
@@ -27,11 +27,7 @@ t(beforeInit());
 result = log;
 `;
 
-const run = (code: string, globals: Record<string, unknown> = {}): string => {
-    const context: Record<string, unknown> = { host: { flag: false }, ...globals };
-    runInNewContext(code, context);
-    return JSON.stringify(context.result);
-};
+const RUN: Run = { globals: () => ({ host: { flag: false } }) };
 
 // Constants and `arguments` slots, judged in execution order (after unflattening), not source order.
 const ORDERED = `
@@ -133,7 +129,7 @@ const REFERENCES = [
 describe("simplify", () => {
     it("folds, decides branches and drops dead code without changing behaviour", async () => {
         const { code } = await deobfuscate(PROGRAM, { passes: ["simplify", "normalize"] });
-        expect(run(code)).toBe(run(PROGRAM));
+        expect(observe(code, RUN)).toBe(observe(PROGRAM, RUN));
         expect(code).not.toContain(`t("dead")`);
         expect(code).not.toContain(`t("else")`);
         expect(code).toContain(`t("effect");\n  t("effect2");\n  t("yes");`);
@@ -147,14 +143,15 @@ describe("simplify", () => {
         const program =
             'var out = [atob("bmF2aWdhdG9y"), atob("tNmJdQ=="), (function (atob) { return atob("eA=="); })(function (s) { return s + "!"; })];\ntry { out.push(atob("*")); } catch (e) { out.push(e.name); }\nvar hits = 0;\nout.push(atob("eA==", hits++), hits, String("eA=="));\nresult = out;\n';
         const { code } = await deobfuscate(program, { passes: ["simplify"] });
-        expect(run(code, { atob })).toBe(run(program, { atob }));
+        const run: Run = { globals: () => ({ host: { flag: false }, atob }) };
+        expect(observe(code, run)).toBe(observe(program, run));
         expect(code).toContain('"navigator"');
         for (const kept of ['atob("tNmJdQ==")', 'atob("eA==")', 'atob("*")']) expect(code).toContain(kept);
     });
 
     it("propagates constants and arguments slots only where they are already set", async () => {
         const { code } = await deobfuscate(ORDERED, { passes: ["unflatten", "simplify", "normalize"] });
-        expect(run(code)).toBe(run(ORDERED));
+        expect(observe(code, RUN)).toBe(observe(ORDERED, RUN));
         expect(code).toContain(`t("x");`);
         expect(code).toContain("t(5);");
         expect(code).toContain("t(7);");
@@ -168,7 +165,7 @@ describe("simplify", () => {
 
     it("keeps reference semantics: tags, writes, delete, eval, typeof, lexical scopes", async () => {
         const { code } = await deobfuscate(REFERENCES, { passes: ["simplify", "normalize"] });
-        expect(run(code)).toBe(run(REFERENCES));
+        expect(observe(code, RUN)).toBe(observe(REFERENCES, RUN));
         expect(code).toContain("tag`a${2}b`");
         expect(code).toContain("(0, eval)(");
         expect(code).toContain("let late, Gone;");
@@ -179,5 +176,53 @@ describe("simplify", () => {
         const { code } = await deobfuscate("const x = 5;\nexport { x };\nexport const y = x + 1;\n", { passes: ["simplify", "normalize"] });
         expect(code).toContain("export { x }");
         expect(code).toContain("export const y = 6");
+    });
+
+    it("keeps a dead block function's name function-wide only in sloppy code (Annex B), not in strict code", async () => {
+        const strict = [
+            '"use strict";\nvar result, r;\nif (false) { function f() { return 1; } }\ntry { r = f; } catch (e) { r = "threw " + e.name; }\nresult = r;\n',
+            '"use strict";\nvar result, r;\nwhile (false) { function f() { return 1; } }\ntry { r = f; } catch (e) { r = "threw " + e.name; }\nresult = r;\n',
+            'globalThis.f = "global";\nfunction g() { "use strict"; function h() { return f; } return h(); { function f() {} } }\nresult = g();\n',
+        ];
+        for (const program of strict) {
+            const { code } = await deobfuscate(program, { passes: ["simplify"] });
+            expect(observe(code)).toBe(observe(program));
+            expect(code).not.toContain("var f");
+        }
+        const sloppy = [
+            "function g() { if (false) { function f() {} } return typeof f; }\nresult = g();\n",
+            'globalThis.f = "global";\nfunction g() { function h() { return f; } return h(); { function f() {} } }\nresult = g();\n',
+        ];
+        for (const program of sloppy) {
+            const { code } = await deobfuscate(program, { passes: ["simplify"] });
+            expect(observe(code)).toBe(observe(program));
+            expect(code).toContain("var f;");
+        }
+    });
+
+    it("keeps a decided if's function in a block of its own, and a dead labelled function hoisted", async () => {
+        const programs = [
+            // An `if` clause's function binds in a block of its own (Annex B): not hoisted in the block around the `if`.
+            "function g() { { try { f(); } catch (e) { return e.name; } if (1) function f() {} } }\nresult = g();\n",
+            "function g() { { try { f(); } catch (e) { return e.name; } if (0); else function f() {} } }\nresult = g();\n",
+            // A labelled function in a block is that block's.
+            "function g() { { try { f(); } catch (e) { return e.name; } if (1) { l: function f() {} } } return typeof f; }\nresult = g();\n",
+            // A labelled function is hoisted as a plain one is, also after a return.
+            "function g() { var r = typeof f; return r; l: m: function f() {} }\nresult = g();\n",
+        ];
+        for (const program of programs) {
+            const { code } = await deobfuscate(program, { passes: ["simplify"] });
+            expect(observe(code), program).toBe(observe(program));
+        }
+    });
+
+    it("leaves a dead class static block's vars to the block", async () => {
+        const shapes = ['if (0) { class K { static { var x = "inner"; } } }', 'while (0) try { class K { static { var x = "inner"; } } } finally {}'];
+        for (const dead of shapes) {
+            const program = `var x = "outer";\nfunction h() { x = "changed"; }\nfunction g() { var r = x; ${dead} r += "/" + x; result = r; }\nh();\ng();\n`;
+            const { code } = await deobfuscate(program, { passes: ["simplify"] });
+            expect(observe(code), program).toBe(observe(program));
+            expect(code).not.toContain("var x;");
+        }
     });
 });

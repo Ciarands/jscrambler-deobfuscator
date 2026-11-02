@@ -7,12 +7,13 @@ import { valueToNode } from "../core/build.js";
 import type { Primitive } from "../core/build.js";
 import { pushAll } from "../core/list.js";
 import type { ScopeInfo, Variable } from "../core/scope.js";
+import { OWN_GLOBAL_OBJECT_NAMES, scopeWithin } from "../core/scope.js";
 import { traverse } from "../core/traverse.js";
 import type { Facts } from "../pipeline/facts.js";
 import { factKey } from "../pipeline/facts.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
-import type { CallSite } from "./code-locks.js";
-import { rewriteCalls, survey } from "./code-locks.js";
+import type { CallSite } from "./storage-usage.js";
+import { rewriteCalls, survey } from "./storage-usage.js";
 import type { Builder, Closure, Slot } from "./emulate/builders.js";
 import { bodyOf, builderOf, definitionOf, returnsOf, sameSlot, slotOf, slotsOnly } from "./emulate/builders.js";
 import { storageAnalysis } from "./emulate/effects.js";
@@ -20,6 +21,7 @@ import type { PropertyPath } from "./emulate/guest.js";
 import { RUNTIME } from "./emulate/model.js";
 import type { RuntimeModel } from "./emulate/model.js";
 import type { StorageMatcher } from "./emulate/storage.js";
+import { assignedPaths, storageMatcher } from "./emulate/storage.js";
 
 /** Builders `G.k = (function () {...})()` holding only anti-debug detectors: cleanup may remove them (model 5). */
 export const DETECTOR_BUILDERS = factKey<Set<Node>>("detector builders");
@@ -90,8 +92,13 @@ const slotStore = (statement: Node | undefined, scopes: ScopeInfo): { slot: Slot
     return slot === undefined ? undefined : { slot, target, value: statement.expression.right };
 };
 
-const slotWrites = (root: Node, scopes: ScopeInfo): { slot: Slot; node: Node }[] => {
-    const writes: { slot: Slot; node: Node }[] = [];
+interface SlotWrite {
+    readonly slot: Slot;
+    readonly node: Node;
+}
+
+const slotWrites = (root: Node, scopes: ScopeInfo): SlotWrite[] => {
+    const writes: SlotWrite[] = [];
     traverse(root, {
         MemberExpression(path) {
             if (!path.isWriteTarget()) return;
@@ -108,8 +115,8 @@ const functionAround = (node: Node, parents: ReadonlyMap<Node, Node>): Node | un
 };
 
 /** A slot of an array `owner` declares and keeps to itself, starting unset (past the initializer's elements). */
-const ownSlot = (slot: Slot, owner: Node, parents: ReadonlyMap<Node, Node>): boolean => {
-    if ((slot.variable.scope.block as unknown as Node) !== owner || !slotsOnly(slot.variable, parents)) return false;
+const ownSlot = (slot: Slot, owner: Node, scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): boolean => {
+    if ((slot.variable.scope.block as unknown as Node) !== owner || !slotsOnly(slot.variable, scopes, parents)) return false;
     const declarator = slot.variable.defs[0]?.node as unknown as Node | undefined;
     return declarator?.type === "VariableDeclarator" && declarator.init?.type === "ArrayExpression" && Number(slot.index) >= declarator.init.elements.length;
 };
@@ -141,11 +148,11 @@ const lazyDetector = (fn: FunctionNode, iife: FunctionNode, scopes: ScopeInfo, p
         variable.defs.length !== 1 ||
         declaration?.type !== "FunctionDeclaration" ||
         !(bodyOf(iife) as readonly Node[]).includes(declaration) ||
-        variable.references.length !== 1
+        scopes.references(variable)?.length !== 1
     ) {
         return "its probe isn't a function the builder declares and only it calls";
     }
-    if (!ownSlot(read.slot, iife, parents)) return "its report isn't a slot of an array the builder keeps to itself";
+    if (!ownSlot(read.slot, iife, scopes, parents)) return "its report isn't a slot of an array the builder keeps to itself";
     return { report: read.slot, transform: read.transform, slowPaths: [declaration], fastPaths: [fn], cleared };
 };
 
@@ -163,14 +170,14 @@ const lazyDetector = (fn: FunctionNode, iife: FunctionNode, scopes: ScopeInfo, p
  * `X[d]` and `X[e]` are written only there, so the first call writes `X[d]` either way (`X[e]` starts unset) and
  * every call returns some call's check result.
  */
-const timedDetector = ({ iife: maker, fn }: Closure, iife: FunctionNode, scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): Omit<Detector, "answer"> | Refusal => {
+const timedDetector = ({ iife: maker, fn }: Closure, iife: FunctionNode, scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>, memo: BuilderMemo): Omit<Detector, "answer"> | Refusal => {
     const shape = "it isn't the timed check: `if (N) D = C(N); else { t = B(); if (!E || t - E > K) { E = t; D = C(); } } return D;`";
     const statements = effective(fn);
     const [branch, ret] = statements;
     if (fn.async || fn.generator || statements.length !== 2 || branch?.type !== "IfStatement" || branch.alternate === null || ret?.type !== "ReturnStatement" || ret.argument === null) return shape;
     const own = (node: Node | undefined): Slot | undefined => {
         const slot = node === undefined ? undefined : slotOf(node, scopes);
-        return slot !== undefined && ownSlot(slot, maker, parents) ? slot : undefined;
+        return slot !== undefined && ownSlot(slot, maker, scopes, parents) ? slot : undefined;
     };
     const result = own(ret.argument);
     const flag = own(branch.test);
@@ -212,7 +219,7 @@ const timedDetector = ({ iife: maker, fn }: Closure, iife: FunctionNode, scopes:
         return shape;
 
     // The result and the stamp are written only by the method; the check, flag and clock once, by the IIFE.
-    const writes = slotWrites(iife, scopes);
+    const writes = memo.slotWrites(iife);
     const count = (slot: Slot): number => writes.filter((write) => sameSlot(slot, write.slot)).length;
     if (count(result) !== 2 || count(stamp) !== 1) return "its cached result or time stamp is written elsewhere";
     const definitions = bodyOf(maker).map((statement) => slotStore(statement, scopes));
@@ -230,7 +237,7 @@ const timedDetector = ({ iife: maker, fn }: Closure, iife: FunctionNode, scopes:
     const reads = returnsOf(checkFn).map((r) => (r.type === "ReturnStatement" ? reportRead(r.argument, scopes) : undefined));
     const [read] = reads;
     if (read === undefined || reads.some((other) => other === undefined || !sameSlot(read.slot, other.slot) || other.transform !== read.transform)) return "its check doesn't always return the report";
-    if (!ownSlot(read.slot, iife, parents)) return "its report isn't a slot of an array the builder keeps to itself";
+    if (!ownSlot(read.slot, iife, scopes, parents)) return "its report isn't a slot of an array the builder keeps to itself";
     return { report: read.slot, transform: read.transform, slowPaths: [checkFn], fastPaths: [maker, fn], cleared: undefined };
 };
 
@@ -262,11 +269,12 @@ const isDetection = (write: Node, value: Node | undefined, slowPaths: readonly N
  * `!R` answers `true`, `!!R` `false`; `R` answers exactly its falsy start when every detection stores a truthy
  * literal, some falsy value otherwise.
  */
-const answerOf = (shape: Omit<Detector, "answer">, builder: Builder, iife: FunctionNode, scopes: ScopeInfo): Answer | Refusal => {
-    let start: Primitive;
+const answerOf = (shape: Omit<Detector, "answer">, builder: Builder, iife: FunctionNode, writes: readonly SlotWrite[]): Answer | Refusal => {
+    // A report slot the builder never writes reads `undefined`.
+    let start: Primitive = undefined;
     let reports = 0;
     let literal = true;
-    for (const { slot, node } of slotWrites(iife, scopes)) {
+    for (const { slot, node } of writes) {
         if (!sameSlot(shape.report, slot) || node === shape.cleared) continue;
         const assignment = builder.parents.get(node);
         const value = assignment?.type === "AssignmentExpression" && assignment.operator === "=" && assignment.left === node ? assignment.right : undefined;
@@ -307,21 +315,16 @@ const COMPUTING_GLOBALS: ReadonlySet<string> = new Set([
 ]);
 /** Builtin methods that only read their receiver (`f.toString()`, `f.bind(x)`): harmless on any global value (model 7). */
 const READING_METHODS: ReadonlySet<string> = new Set(["toString", "bind"]);
-const GLOBAL_OBJECT_NAMES: ReadonlySet<string> = new Set(["globalThis", "window", "self"]);
 
 const isObjectBuiltin = (node: Node, scopes: ScopeInfo): boolean =>
-    (node.type === "Identifier" && node.name === "Object" && isGlobalName(node, scopes)) ||
-    (node.type === "MemberExpression" && propertyKey(node) === "Object" && node.object.type === "Identifier" && GLOBAL_OBJECT_NAMES.has(node.object.name) && isGlobalName(node.object, scopes));
+    (node.type === "Identifier" && node.name === "Object" && scopes.namesGlobal(node)) ||
+    (node.type === "MemberExpression" && propertyKey(node) === "Object" && node.object.type === "Identifier" && OWN_GLOBAL_OBJECT_NAMES[node.object.name] === true && scopes.namesGlobal(node.object));
 
 const rootOf = (node: Node): Node => {
     let root: Node = node;
     while (root.type === "MemberExpression") root = root.object;
     return root;
 };
-/** A global reference, or an identifier a pass added since the analysis that no scope declares. */
-const isGlobalName = (node: Node, scopes: ScopeInfo): boolean =>
-    node.type === "Identifier" &&
-    (scopes.isGlobalReference(node) || (scopes.referenceOf(node) === undefined && !scopes.manager.scopes.some((scope) => scope.type !== "global" && scope.set.has(node.name))));
 
 const fromComputingBuiltin = (node: Node, scopes: ScopeInfo): boolean => {
     let first: Node | undefined;
@@ -330,9 +333,9 @@ const fromComputingBuiltin = (node: Node, scopes: ScopeInfo): boolean => {
         first = root;
         root = root.object;
     }
-    if (root.type !== "Identifier" || !isGlobalName(root, scopes)) return false;
+    if (root.type !== "Identifier" || !scopes.namesGlobal(root)) return false;
     if (COMPUTING_GLOBALS.has(root.name)) return true;
-    return GLOBAL_OBJECT_NAMES.has(root.name) && first?.type === "MemberExpression" && COMPUTING_GLOBALS.has(propertyKey(first) ?? "");
+    return OWN_GLOBAL_OBJECT_NAMES[root.name] === true && first?.type === "MemberExpression" && COMPUTING_GLOBALS.has(propertyKey(first) ?? "");
 };
 
 /** `x["toString"]` too: normalize may not have run. */
@@ -347,9 +350,7 @@ const selfContained = (iife: FunctionNode, slowPaths: readonly FunctionNode[], p
     const ownRoot = (node: Node): boolean => {
         const root = rootOf(node);
         const variable = root.type === "Identifier" ? scopes.variableOf(root) : undefined;
-        let scope = variable?.scope ?? null;
-        while (scope !== null && (scope.block as unknown as Node) !== iife) scope = scope.upper;
-        return scope !== null;
+        return scopeWithin(variable?.scope ?? null, iife);
     };
     const ownValue = (node: Node): Node | undefined => {
         const variable = node.type === "Identifier" && ownRoot(node) ? scopes.variableOf(node) : undefined;
@@ -357,12 +358,13 @@ const selfContained = (iife: FunctionNode, slowPaths: readonly FunctionNode[], p
         if (variable === undefined || def === undefined || variable.defs.length !== 1) return undefined;
         if (def.type === "FunctionName") return def.node as unknown as Node;
         const init = def.type === "Variable" ? (def.node as unknown as { init: Node | null }).init : null;
-        return init === null || variable.references.some((reference) => reference.isWrite() && !reference.init) ? undefined : init;
+        const references = scopes.references(variable);
+        return init === null || references === undefined || references.some((reference) => reference.isWrite() && !reference.init) ? undefined : init;
     };
     const globalValue = (node: Node, visiting: ReadonlySet<Node> = new Set()): boolean => {
         const root = rootOf(node);
         if (root.type !== "Identifier") return false;
-        if (isGlobalName(root, scopes)) return true;
+        if (scopes.namesGlobal(root)) return true;
         const value = ownValue(root);
         return value !== undefined && !visiting.has(value) && globalValue(value, new Set([...visiting, value]));
     };
@@ -390,7 +392,7 @@ const selfContained = (iife: FunctionNode, slowPaths: readonly FunctionNode[], p
         }
         if (node.type === "CallExpression" && node.callee.type === "MemberExpression" && propertyKey(node.callee) === "bind") return harmlessFunction(node.callee.object, visiting);
         const slot = ownRoot(node) ? slotOf(node, scopes) : undefined;
-        const values = slot === undefined || !slotsOnly(slot.variable, parents) ? undefined : slotValues.get(slot.variable)?.get(slot.index);
+        const values = slot === undefined || !slotsOnly(slot.variable, scopes, parents) ? undefined : slotValues.get(slot.variable)?.get(slot.index);
         return values !== undefined && values.length > 0 && values.every(follow);
     };
     const harmlessCall = (callee: Node, args: readonly Node[]): boolean => {
@@ -451,6 +453,62 @@ const probesDebugger = (iife: FunctionNode, scopes: ScopeInfo, env: EvaluateEnv)
     return found;
 };
 
+/** Per run: a builder's detector methods share its definition and parse, and each function's slot writes and debugger signs. */
+class BuilderMemo {
+    readonly #runtime: RuntimeModel;
+    readonly #matcher: StorageMatcher;
+    readonly #scopes: ScopeInfo;
+    readonly #env: () => EvaluateEnv;
+    readonly #holders = new Map<string, { statement: Statement; iife: FunctionNode; builder: Builder } | undefined>();
+    readonly #writes = new Map<Node, readonly SlotWrite[]>();
+    readonly #probes = new Map<Node, boolean>();
+    readonly #detectors = new Map<string, DetectorAt>();
+
+    constructor(runtime: RuntimeModel, matcher: StorageMatcher, scopes: ScopeInfo, env: () => EvaluateEnv) {
+        this.#runtime = runtime;
+        this.#matcher = matcher;
+        this.#scopes = scopes;
+        this.#env = env;
+    }
+
+    /** The prelude statement building the holder `key`, and its builder, when it has a builder's shape. */
+    holder(key: string): { statement: Statement; iife: FunctionNode; builder: Builder } | undefined {
+        if (this.#holders.has(key)) return this.#holders.get(key);
+        const definition = definitionOf(this.#runtime, this.#matcher.isStorage, [key], true);
+        const builder = typeof definition === "string" ? definition : builderOf(definition.iife, this.#scopes);
+        const held = typeof definition === "string" || typeof builder === "string" ? undefined : { ...definition, builder };
+        this.#holders.set(key, held);
+        return held;
+    }
+
+    slotWrites(root: Node): readonly SlotWrite[] {
+        let writes = this.#writes.get(root);
+        if (writes === undefined) {
+            writes = slotWrites(root, this.#scopes);
+            this.#writes.set(root, writes);
+        }
+        return writes;
+    }
+
+    probesDebugger(root: FunctionNode): boolean {
+        let probes = this.#probes.get(root);
+        if (probes === undefined) {
+            probes = probesDebugger(root, this.#scopes, this.#env());
+            this.#probes.set(root, probes);
+        }
+        return probes;
+    }
+
+    /** What `detectorAt` makes of the method at `path`: the `shaped` pre-check and the main loop ask for the same paths. */
+    detector(path: PropertyPath): DetectorAt {
+        const id = JSON.stringify(path);
+        if (this.#detectors.has(id)) return this.#detectors.get(id);
+        const found = detectorAt(path, this, this.#scopes);
+        this.#detectors.set(id, found);
+        return found;
+    }
+}
+
 const builderFact = (facts: Facts): Set<Node> => {
     const known = facts.get(DETECTOR_BUILDERS);
     if (known !== undefined) return known;
@@ -464,28 +522,25 @@ const builderFact = (facts: Facts): Set<Node> => {
     return builders;
 };
 
-const detectorAt = (
-    path: PropertyPath,
-    runtime: RuntimeModel,
-    matcher: StorageMatcher,
-    scopes: ScopeInfo,
-    env: () => EvaluateEnv
-): { statement: Statement; iife: FunctionNode; builder: Builder; detector: Detector } | Refusal | undefined => {
-    const definition = definitionOf(runtime, matcher.isStorage, path.slice(0, 1), true);
-    if (typeof definition === "string") return undefined;
-    const builder = builderOf(definition.iife, scopes);
-    if (typeof builder === "string") return undefined;
+type DetectorAt = { statement: Statement; iife: FunctionNode; builder: Builder; detector: Detector } | Refusal | undefined;
+
+const detectorAt = (path: PropertyPath, memo: BuilderMemo, scopes: ScopeInfo): DetectorAt => {
+    const held = memo.holder(path[0] as string);
+    if (held === undefined) return undefined;
+    const { statement, iife, builder } = held;
     const name = path[1] as string;
     const method = builder.methods.get(name);
     const closure = builder.closures.get(name);
     if (method === undefined && closure === undefined) return undefined;
-    const shape = method !== undefined ? lazyDetector(method, definition.iife, scopes, builder.parents) : timedDetector(closure as Closure, definition.iife, scopes, builder.parents);
+    const shape = method !== undefined ? lazyDetector(method, iife, scopes, builder.parents) : timedDetector(closure as Closure, iife, scopes, builder.parents, memo);
     if (typeof shape === "string") return shape;
-    const searched = [definition.iife, ...(method === undefined ? [] : [method]), ...(closure === undefined ? [] : [closure.iife, closure.fn])];
-    if (!searched.some((root) => probesDebugger(root, scopes, env()))) return "its builder shows no debugger check (no detection code, no debugger interface): it may probe a feature";
-    const answer = answerOf(shape, builder, definition.iife, scopes);
+    // A builder holding more than this method may hold a feature probe next to it: then only the detector's own code
+    // may show the sign, not the builder's shared setup or a sibling's slow path.
+    const searched = builder.methods.size + builder.closures.size === 1 ? [iife] : [...shape.slowPaths, ...shape.fastPaths];
+    if (!searched.some((root) => memo.probesDebugger(root))) return "its code shows no debugger check (no detection code, no debugger interface): it may probe a feature";
+    const answer = answerOf(shape, builder, iife, memo.slotWrites(iife));
     if (typeof answer === "string") return answer;
-    return { statement: definition.statement, iife: definition.iife, builder, detector: { ...shape, answer } };
+    return { statement, iife, builder, detector: { ...shape, answer } };
 };
 
 /**
@@ -511,10 +566,24 @@ export const detectors: Pass = {
             return { changed: 0 };
         }
         const scopes = scope();
-        const { matcher, effects } = storageAnalysis(program, runtime, scopes, log);
-        const { calls } = survey(program, matcher, scopes);
+        const matcher = storageMatcher(program, runtime, scopes);
         let constants: EvaluateEnv | undefined;
         const env = (): EvaluateEnv => (constants ??= constantEnv(scopes, log));
+        const memo = new BuilderMemo(runtime, matcher, scopes, env);
+        const counts = { detectors: 0, answered: 0, removed: 0, kept: 0, builders: 0 };
+        // Every call below that qualifies targets a method `detectorAt` accepts of a holder a root statement builds:
+        // with no such method, none does, and neither the storage analysis nor the survey is needed.
+        const shaped = assignedPaths(runtime, matcher.isStorage).some((path) => {
+            const key = path[0] as string;
+            const held = path.length === 1 ? memo.holder(key) : undefined;
+            return held !== undefined && [...held.builder.methods.keys(), ...held.builder.closures.keys()].some((name) => typeof memo.detector([key, name]) === "object");
+        });
+        if (!shaped) {
+            log.info("no builder method has a detector's shape");
+            return { changed: 0, stats: counts };
+        }
+        const { effects } = storageAnalysis(program, runtime, scopes, log);
+        const { calls } = survey(program, runtime, matcher, scopes);
 
         const byTarget = new Map<string, { path: PropertyPath; sites: { site: CallSite; wrapper: string | undefined }[] }>();
         for (const { path, sites } of calls.values()) {
@@ -530,10 +599,9 @@ export const detectors: Pass = {
         const replacements = new Map<Node, Node>();
         const removals = new Set<Node>();
         const proven = new Map<Statement, { builder: Builder; iife: FunctionNode; names: Set<string>; slowPaths: FunctionNode[] }>();
-        const counts = { detectors: 0, answered: 0, removed: 0, kept: 0, builders: 0 };
         for (const { path, sites } of byTarget.values()) {
             const name = `${runtime.storage}.${path.join(".")}`;
-            const found = detectorAt(path, runtime, matcher, scopes, env);
+            const found = memo.detector(path);
             if (found === undefined) continue; // no builder method at all: say nothing
             if (typeof found === "string") {
                 log.debug(`${name} is no detector: ${found}`);

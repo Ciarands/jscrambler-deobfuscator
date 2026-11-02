@@ -1,16 +1,10 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { parse } from "../src/core/parse.js";
 import { traverse } from "../src/core/traverse.js";
 import { deobfuscate } from "../src/index.js";
+import { observe } from "./helpers.js";
 
 const normalize = async (code: string) => (await deobfuscate(code, { passes: ["normalize"] })).code;
-
-const trace = (code: string): unknown[] => {
-    const calls: unknown[] = [];
-    runInNewContext(code, { t: (x: unknown) => (calls.push(x), x) });
-    return calls;
-};
 
 const leftoverSequences = (code: string): number => {
     let count = 0;
@@ -33,19 +27,11 @@ describe("normalize", () => {
         `;
         const output = await normalize(input);
         expect(leftoverSequences(output)).toBe(0);
-        expect(trace(output)).toEqual(trace(input));
+        expect(observe(output, { trace: true })).toBe(observe(input, { trace: true }));
     });
 
     it("uses dot access only for identifier keys and folds !0/!1", async () => {
         const output = await normalize(`o["ok"] = o["not-ok"] + o["1x"] + o["$_"]; x = [!0, !1, !2];`);
         expect(output).toBe(`o.ok = o["not-ok"] + o["1x"] + o.$_;\nx = [true, false, !2];\n`);
-    });
-
-    it("merges a var whose literal value another literal replaces right away, not one any other value replaces", async () => {
-        const input = 'function read() { return g; } var a = ""; var a = "keyCode"; var b = ""; b = "href"; var e = "", e = "done", f = 1, f; var g = "old", g = read(); t([a, b, e, f, g]);';
-        const output = await normalize(input);
-        expect(trace(output)).toEqual(trace(input));
-        // `read()` sees the first value of `g`.
-        expect(output).toContain('var a = "keyCode";\nvar b = "href";\nvar e = "done", f = 1, f;\nvar g = "old", g = read();');
     });
 });

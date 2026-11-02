@@ -23,6 +23,7 @@ export class SourceMap {
 
     snippet(node: Node, max = 80): string {
         const [start, end] = node.range ?? [node.start, node.end];
+        // Whitespace runs collapse to one space, so read past `max` for the snippet to still fill, but not a whole big node.
         const text = this.#source.slice(start, Math.min(end, start + max * 4)).replace(/\s+/g, " ");
         return text.length > max ? `${text.slice(0, max - 3)}...` : text;
     }

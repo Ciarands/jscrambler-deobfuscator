@@ -1,24 +1,13 @@
-import type {
-    ArrowFunctionExpression,
-    Expression,
-    ForStatement,
-    Function as FunctionNode,
-    IdentifierReference,
-    IfStatement,
-    Node,
-    Statement,
-    VariableDeclaration,
-    WhileStatement,
-} from "../core/ast.js";
+import type { Expression, ForStatement, Function as FunctionNode, FunctionLike, IdentifierReference, IfStatement, Node, Statement, VariableDeclaration, WhileStatement } from "../core/ast.js";
 import { memberPath } from "../core/ast.js";
 import { at, valueToNode } from "../core/build.js";
 import type { EvaluateEnv, Evaluation, Value } from "../core/evaluate.js";
 import { evaluate, FAIL, value } from "../core/evaluate.js";
 import type { OuterBinding } from "../core/interpret.js";
 import { argumentsKey, Interpreter } from "../core/interpret.js";
-import { pushAll, spliceList } from "../core/list.js";
+import { pushAll, sameItems, spliceList } from "../core/list.js";
 import type { ScopeInfo, Variable } from "../core/scope.js";
-import { forEachChild, traverse } from "../core/traverse.js";
+import { forEachChild, traverse, walkSkippingFunctions } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
 import { builderOf, definitionOf } from "./emulate/builders.js";
 import type { StorageAnalysis } from "./emulate/effects.js";
@@ -27,8 +16,6 @@ import type { PropertyPath } from "./emulate/guest.js";
 import type { RuntimeModel } from "./emulate/model.js";
 import { RUNTIME } from "./emulate/model.js";
 import { PurityProver } from "./hash-purity.js";
-
-type FunctionLike = FunctionNode | ArrowFunctionExpression;
 
 const MAX_ITERATIONS = 10_000;
 
@@ -44,8 +31,6 @@ const COMPOUND: ReadonlyMap<string, string> = new Map(["+=", "-=", "*=", "/=", "
 type Predicate = IfStatement | ForStatement | WhileStatement;
 
 type Env = Map<Variable, Value>;
-
-const samePath = (a: PropertyPath, b: PropertyPath): boolean => a.length === b.length && a.every((key, i) => key === b[i]);
 
 const itemsOf = (expression: Expression): readonly Expression[] => (expression.type === "SequenceExpression" ? expression.expressions : [expression]);
 
@@ -79,11 +64,10 @@ const replaceAll = (env: Env, from: Env): void => {
 };
 
 const jumpsOut = (node: Node): boolean => {
-    if (node.type === "BreakStatement" || node.type === "ContinueStatement") return true;
-    if (node.type === "FunctionExpression" || node.type === "FunctionDeclaration" || node.type === "ArrowFunctionExpression") return false;
     let found = false;
-    forEachChild(node, (child) => {
-        found ||= jumpsOut(child);
+    walkSkippingFunctions(node, (child) => {
+        if (child.type === "BreakStatement" || child.type === "ContinueStatement") found = true;
+        return !found;
     });
     return found;
 };
@@ -236,7 +220,7 @@ class HashFunctions {
         const [first] = keys;
         const wrapper = keys.length === 1 && first !== undefined ? this.#runtime.wrappers.get(first) : undefined;
         const target = wrapper?.target ?? keys;
-        if (wrapper !== undefined && (wrapper.receiver === undefined || !samePath(wrapper.receiver, target.slice(0, -1)))) return "its wrapper applies it to another this";
+        if (wrapper !== undefined && (wrapper.receiver === undefined || !sameItems(wrapper.receiver, target.slice(0, -1)))) return "its wrapper applies it to another this";
         const name = target.at(-1);
         if (target.length < 2 || name === undefined) return "it isn't a method of a holder the prelude built";
         const definition = definitionOf(this.#runtime, this.#analysis.matcher.isStorage, target.slice(0, -1));

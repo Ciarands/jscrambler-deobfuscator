@@ -1,21 +1,15 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
 const run = async (code: string) => (await deobfuscate(code, { passes: ["emulate", "global-proxy"] })).code;
 
 /** Timers (code after the prelude) never fire in the emulator; here they run in order once the script finishes. */
-const observed = (source: string): string => {
-    const timers: (() => void)[] = [];
-    const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback) };
-    runInNewContext(source, context);
-    for (const callback of timers) callback();
-    return JSON.stringify(context.result);
-};
+const RUN: Run = { timers: true };
 
-const observe = async (code: string): Promise<[string, string, string]> => {
+const beforeAndAfter = async (code: string): Promise<[string, string, string]> => {
     const output = await run(code);
-    return [observed(code), observed(output), output];
+    return [observe(code, RUN), observe(output, RUN), output];
 };
 
 // The prelude's shape: the global object, found through a getter, parked on the storage function.
@@ -62,43 +56,43 @@ function g() { var s = G; s = other; return s[7]; }
 
     it("keeps reads that may see another value than the snapshot's", async () => {
         // Written again after the prelude.
-        const [laterBefore, laterAfter, laterOutput] = await observe(
+        const [laterBefore, laterAfter, laterOutput] = await beforeAndAfter(
             `${PRELUDE}\nfunction reset() { G[7] = { marker: 1 }; }\nfunction read() { return G[7].marker; }\nsetTimeout(function () { result = [read(), (reset(), read())]; });\n`
         );
         expect(laterAfter).toBe(laterBefore);
         expect(laterOutput).toContain("return G[7].marker;");
 
         // Read while the prelude hasn't set it up yet.
-        const [earlyBefore, earlyAfter] = await observe(`var early = typeof G[7];\n${PRELUDE}\nresult = early;\n`);
+        const [earlyBefore, earlyAfter] = await beforeAndAfter(`var early = typeof G[7];\n${PRELUDE}\nresult = early;\n`);
         expect(earlyAfter).toBe(earlyBefore);
 
         // Written through the name the prelude shares G under.
-        const [sharedBefore, sharedAfter] = await observe(
+        const [sharedBefore, sharedAfter] = await beforeAndAfter(
             `${PRELUDE}\nG[7].SHARE = G;\nfunction read() { return G[7].marker; }\nsetTimeout(function () { var first = read(); SHARE[7] = { marker: 2 }; result = [first, read()]; });\n`
         );
         expect(sharedAfter).toBe(sharedBefore);
     });
 
     it("keeps reads where globalThis is a local name", async () => {
-        const [before, after] = await observe(`${PRELUDE}\nfunction f(globalThis) { return G[7].marker; }\nsetTimeout(function () { result = f({ marker: 3 }); });\n`);
+        const [before, after] = await beforeAndAfter(`${PRELUDE}\nfunction f(globalThis) { return G[7].marker; }\nsetTimeout(function () { result = f({ marker: 3 }); });\n`);
         expect(after).toBe(before);
     });
 
     it("rewrites reads that see the snapshot's value, also inside the prelude's own functions", async () => {
-        const [before, after, output] = await observe(`${PRELUDE}\nG[7].SHARE = G;\nfunction read() { return typeof G[7].Math; }\nsetTimeout(function () { result = read(); });\n`);
+        const [before, after, output] = await beforeAndAfter(`${PRELUDE}\nG[7].SHARE = G;\nfunction read() { return typeof G[7].Math; }\nsetTimeout(function () { result = read(); });\n`);
         expect(after).toBe(before);
         expect(output).toContain("return typeof globalThis.Math;");
     });
 
     it("judges code by when it runs: never, only while the prelude runs, or later", async () => {
-        const [neverBefore, neverAfter, neverOutput] = await observe(
+        const [neverBefore, neverAfter, neverOutput] = await beforeAndAfter(
             `${PRELUDE}\nfunction unused() { G[7] = { marker: 1 }; }\nfunction read() { return typeof G[7].Math; }\nsetTimeout(function () { result = read(); });\n`
         );
         expect(neverAfter).toBe(neverBefore);
         expect(neverOutput).toContain("return typeof globalThis.Math;");
 
         // Only the prelude calls it: what its method call does with `this` (G) is in the snapshot.
-        const [preludeBefore, preludeAfter, preludeOutput] = await observe(
+        const [preludeBefore, preludeAfter, preludeOutput] = await beforeAndAfter(
             `${PRELUDE}\nG.m = function () { this.flag = 1; };\nfunction setup() { G.m(); }\nsetup();\nfunction read() { return typeof G[7].Math; }\nsetTimeout(function () { result = read(); });\n`
         );
         expect(preludeAfter).toBe(preludeBefore);

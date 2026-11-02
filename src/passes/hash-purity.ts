@@ -1,15 +1,14 @@
-import type { ArrowFunctionExpression, Function as FunctionNode, MemberExpression, Node, Statement } from "../core/ast.js";
+import type { Function as FunctionNode, FunctionLike, MemberExpression, Node, Statement } from "../core/ast.js";
 import { MATH_MEMBERS } from "../core/builtins.js";
-import type { Scope, ScopeInfo, Variable } from "../core/scope.js";
+import type { ScopeInfo, Variable } from "../core/scope.js";
+import { scopeWithin } from "../core/scope.js";
 import { traverse } from "../core/traverse.js";
 import { returnsOf } from "./emulate/builders.js";
-
-type FunctionLike = FunctionNode | ArrowFunctionExpression;
 
 const GLOBAL_VALUES: ReadonlySet<string> = new Set(["undefined", "NaN", "Infinity"]);
 
 /** Nothing that makes objects or functions, or runs code it doesn't show (`new`, computed getters, iteration, `with`). */
-const ALLOWED: ReadonlySet<string> = new Set([
+const HASH_PURITY_NODES: ReadonlySet<string> = new Set([
     "BlockStatement",
     "ExpressionStatement",
     "VariableDeclaration",
@@ -40,11 +39,6 @@ const ALLOWED: ReadonlySet<string> = new Set([
     "TemplateElement",
     "ParenthesizedExpression",
 ]);
-
-const isWithin = (scope: Scope | null, fn: Node): boolean => {
-    for (let current = scope; current !== null; current = current.upper) if ((current.block as unknown as Node) === fn) return true;
-    return false;
-};
 
 const contains = (outer: Node, inner: Node): boolean => {
     let found = false;
@@ -109,7 +103,7 @@ export class PurityProver {
                 const node = path.node;
                 if (accepted.has(node)) return;
                 if (node.type === "CallExpression") for (const part of this.#boundCharCodeAt(node.callee)) accepted.add(part);
-                if (!ALLOWED.has(node.type)) reason = `it uses ${node.type}`;
+                if (!HASH_PURITY_NODES.has(node.type)) reason = `it uses ${node.type}`;
                 else if (node.type === "Literal" && typeof node.value === "object" && node.value !== null) reason = "it makes an object (a regular expression)";
                 else if (node.type === "Literal" && typeof node.value === "bigint") reason = "it uses a bigint";
                 else if (node.type === "UnaryExpression" && node.operator === "delete") reason = "it deletes";
@@ -145,7 +139,7 @@ export class PurityProver {
         const reference = this.#scopes.referenceOf(node);
         if (reference === undefined) return this.#scopes.variableOf(node) === undefined ? `it names ${name}, which the analysis doesn't know` : undefined;
         const variable = this.#scopes.staticVariableOf(node);
-        if (variable !== undefined && isWithin(variable.scope, fn)) return undefined;
+        if (variable !== undefined && scopeWithin(variable.scope, fn)) return undefined;
         return variable === undefined ? globalImpurity(name, parent, key) : this.bound(variable, builder);
     }
 

@@ -1,4 +1,4 @@
-import type { Expression, MemberExpression, Node, Statement, VariableDeclaration, VariableDeclarator } from "../core/ast.js";
+import type { Expression, MemberExpression, Statement, VariableDeclarator } from "../core/ast.js";
 import { isIdentifierName } from "../core/ast.js";
 import { at } from "../core/build.js";
 import { pushAll, spliceList } from "../core/list.js";
@@ -74,42 +74,6 @@ const splitFully = (statement: Statement): Statement[] | undefined => {
 };
 
 /**
- * `var x = <literal>` followed by another literal write of `x`: the first is never seen. Only a literal: any other
- * value may run code that reads `x`.
- */
-const overwritten = (declarator: VariableDeclarator | undefined, name: string | undefined, value: Node | null): boolean =>
-    value?.type === "Literal" && declarator?.id.type === "Identifier" && declarator.id.name === name && (declarator.init === null || declarator.init.type === "Literal");
-
-const declarationOf = (node: VariableDeclaration, declarations: VariableDeclarator[]): VariableDeclaration =>
-    at<VariableDeclaration>({ type: "VariableDeclaration", kind: node.kind, declarations }, node);
-
-/**
- * Declarations whose literal value is replaced right away (`var a = "", a = "keyCode";`), when the second value
- * doesn't read `x`. Both are in one statement list, so they name one binding. What `first` (and `second`, when
- * `consumed` is 2) become, or `undefined`.
- */
-const mergeDeclaration = (first: Statement, second: Statement | undefined): { replacement: Statement[]; consumed: 1 | 2 } | undefined => {
-    if (first.type !== "VariableDeclaration" || first.kind !== "var") return undefined;
-    const kept = first.declarations.filter((declarator, i) => {
-        const next = first.declarations[i + 1];
-        return next === undefined || !overwritten(declarator, next.id.type === "Identifier" ? next.id.name : undefined, next.init);
-    });
-    if (kept.length < first.declarations.length) return { replacement: [declarationOf(first, kept)], consumed: 1 };
-    const last = first.declarations.at(-1);
-    if (second?.type === "VariableDeclaration" && second.kind === "var") {
-        const [next] = second.declarations;
-        if (next === undefined || !overwritten(last, next.id.type === "Identifier" ? next.id.name : undefined, next.init)) return undefined;
-        const rest = first.declarations.slice(0, -1);
-        return { replacement: rest.length === 0 ? [] : [declarationOf(first, rest)], consumed: 1 };
-    }
-    if (second?.type !== "ExpressionStatement" || second.expression.type !== "AssignmentExpression" || last === undefined) return undefined;
-    const assignment = second.expression;
-    if (assignment.operator !== "=" || assignment.left.type !== "Identifier" || !overwritten(last, assignment.left.name, assignment.right)) return undefined;
-    const merged = at<VariableDeclarator>({ ...last, init: assignment.right }, last);
-    return { replacement: [declarationOf(first, [...first.declarations.slice(0, -1), merged])], consumed: 2 };
-};
-
-/**
  * Normalize syntax so later passes only recognise one shape (comma statements split, `x["name"]` -> `x.name`,
  * `!0` -> `true`). Every rewrite is exact. Runs first: minified outputs hide the prelude in comma sequences.
  */
@@ -120,9 +84,8 @@ export const normalize: Pass = {
         let sequences = 0;
         let members = 0;
         let booleans = 0;
-        let declarations = 0;
 
-        /** Split the statements of a list in place, then merge declarations whose initial value is overwritten at once. */
+        /** Split the statements of a list in place. */
         const splitList = (list: Statement[]): void => {
             let out: Statement[] | undefined;
             for (let i = 0; i < list.length; i++) {
@@ -139,16 +102,6 @@ export const normalize: Pass = {
                 sequences++;
             }
             if (out !== undefined) spliceList(list, 0, list.length, out);
-            for (let i = 0; i < list.length; i++) {
-                const merged = mergeDeclaration(list[i] as Statement, list[i + 1]);
-                if (merged === undefined) continue;
-                const originals = list.slice(i, i + merged.consumed);
-                if (log.debugging) log.debug("merged a declaration whose value is overwritten at once", list[i] as Statement);
-                facts.replaced(originals, merged.replacement);
-                spliceList(list, i, merged.consumed, merged.replacement);
-                i = Math.max(-1, i - 2);
-                declarations++;
-            }
         };
 
         // Statements are split where they are listed (or held alone) before the walk goes into them, so whatever the
@@ -190,8 +143,8 @@ export const normalize: Pass = {
             },
         });
 
-        log.info(`split ${sequences} sequence statement(s), ${members} member access(es) to dot form, ${booleans} !0/!1, merged ${declarations} declaration(s)`);
-        // Splits keep every expression (and so every reference); merges drop a declaration of a name declared again.
-        return { changed: sequences + members + booleans + declarations, bindingsChanged: declarations > 0, stats: { sequences, members, booleans, declarations } };
+        log.info(`split ${sequences} sequence statement(s), ${members} member access(es) to dot form, ${booleans} !0/!1`);
+        // Splits keep every expression (and so every reference).
+        return { changed: sequences + members + booleans, bindingsChanged: false, stats: { sequences, members, booleans } };
     },
 };

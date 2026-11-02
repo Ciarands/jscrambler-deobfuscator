@@ -3,6 +3,8 @@ import { propertyKey } from "../core/ast.js";
 import type { Value } from "../core/evaluate.js";
 import { binary } from "../core/evaluate.js";
 import type { ScopeInfo, Variable } from "../core/scope.js";
+import { forEachChild } from "../core/traverse.js";
+import { slotArray } from "./emulate/builders.js";
 
 /** Keys a computed read may select: one of `strings`, or any string made only of `chars`. */
 export interface KeySet {
@@ -89,33 +91,50 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
     const sources = new Map<Node | Variable, ArraySource | undefined>();
     const pending = new Set<Variable>();
 
-    /** Whether `node` is the global `name`: an identifier a pass made since the analysis names it when no scope declares the name. */
-    const isGlobal = (node: Node, name: string): boolean =>
-        node.type === "Identifier" && node.name === name && !withScope && (scopes.isGlobalReference(node) || (scopes.referenceOf(node) === undefined && !scopes.declaresName(name)));
+    /** Whether `node` is the global `name` (`namesGlobal`), with no `with` to make it another. */
+    const isGlobal = (node: Node, name: string): boolean => node.type === "Identifier" && node.name === name && !withScope && scopes.namesGlobal(node);
 
     const parentOf = (id: Node): Node | undefined => parents.get(id);
+
+    /** Whether `node` comes after `earlier`, not inside it, in document order (both under `parents`' root). */
+    const follows = (node: Node, earlier: Node): boolean => {
+        const branches = new Map<Node, Node>();
+        for (let child = earlier, parent = parentOf(earlier); parent !== undefined; child = parent, parent = parentOf(parent)) branches.set(parent, child);
+        for (let child = node, parent = parentOf(node); parent !== undefined; child = parent, parent = parentOf(parent)) {
+            if (child === earlier) return false;
+            const branch = branches.get(parent);
+            if (branch === undefined) continue;
+            const order: Node[] = [];
+            forEachChild(parent, (c) => void order.push(c));
+            return order.indexOf(branch) < order.indexOf(child);
+        }
+        return false;
+    };
+
+    /**
+     * Whether a `try` statement inside `block` surrounds `node`, so an exception there may go on to code after it
+     * (code outside `parents`' root never counts as after: its reads are refused).
+     */
+    const insideTry = (node: Node, block: Node): boolean => {
+        for (let above = parentOf(node); above !== undefined && above !== block; above = parentOf(above)) if (above.type === "TryStatement") return true;
+        return false;
+    };
 
     /** A local array declared with a literal and used only in ways that leave its elements to the writes `V[k] = v`. */
     const arraySource = (variable: Variable): ArraySource | undefined => {
         if (sources.has(variable)) return sources.get(variable);
         let source: ArraySource | undefined;
-        const [def] = variable.defs;
-        const declarator = def?.node as unknown as Node | undefined;
-        if (variable.defs.length === 1 && def?.type === "Variable" && declarator?.type === "VariableDeclarator" && declarator.init?.type === "ArrayExpression") {
-            const elements: Expression[] = [];
+        // `spreadless`, `member`: its elements are the literal's and the writes below; `sort`/`join` leave them be.
+        if (slotArray(variable, scopes.staticReferences(variable), parents, { init: "spreadless", placement: "anywhere", uses: "member" })) {
+            const declarator = variable.defs[0]?.node as unknown as Node & { type: "VariableDeclarator" };
+            const elements = (declarator.init as Node & { type: "ArrayExpression" }).elements.filter((element): element is Expression => element !== null);
             let ok = true;
-            for (const element of declarator.init.elements) {
-                if (element?.type === "SpreadElement") ok = false;
-                else if (element !== null) elements.push(element);
-            }
             for (const reference of scopes.staticReferences(variable)) {
                 if (!ok) break;
                 if (reference.init) continue;
-                const id = reference.identifier as unknown as Node;
-                const member = parentOf(id);
-                const above = member === undefined ? undefined : parentOf(member);
-                if (member?.type !== "MemberExpression" || member.object !== id) ok = false;
-                else if (above?.type === "AssignmentExpression" && above.left === member) {
+                const member = parentOf(reference.identifier as unknown as Node) as Node & { type: "MemberExpression" };
+                const above = parentOf(member);
+                if (above?.type === "AssignmentExpression" && above.left === member) {
                     if (above.operator === "=") elements.push(above.right);
                     else ok = false;
                 } else if (above?.type === "CallExpression" && above.callee === member) ok = propertyKey(member) === "sort" || propertyKey(member) === "join";
@@ -163,19 +182,25 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
         if (variable.defs.length !== 1 || fn === undefined || (fn.type !== "FunctionExpression" && fn.type !== "FunctionDeclaration" && fn.type !== "ArrowFunctionExpression")) return undefined;
         const index = fn.params.findIndex((param) => param === (def?.name as unknown as Node));
         if (index < 0 || fn.params.slice(0, index).some((param) => param.type !== "Identifier")) return undefined;
-        if (fn.type !== "ArrowFunctionExpression" && (scopes.scopeOf(fn)?.set.get("arguments")?.references.length ?? 0) > 0) return undefined;
+        if (fn.type !== "ArrowFunctionExpression") {
+            const args = scopes.scopeOf(fn)?.set.get("arguments");
+            if (args !== undefined && scopes.staticReferences(args).length > 0) return undefined;
+        }
         // Every read of the function's bindings (its holder, and its own name inside a named function expression)
-        // must be a direct call, except reads after a later declarator of the same declaration replaced the holder
-        // (`var r = function (e) {...}, s = r(k), r = s;`): with no other read, `s` can't be the function.
+        // must be a direct call, except reads in its function after a later declarator of the same declaration
+        // replaced the holder (`var r = function (e) {...}, s = r(k), r = s;`): with no other read, `s` can't be the
+        // function. Unless an exception in the declaration can lead to them. A block function Annex B also puts in a
+        // function-wide binding may be called through that one.
         const parent = parentOf(fn);
         const holder = fn.type === "FunctionDeclaration" ? fn.id : parent?.type === "VariableDeclarator" && parent.init === fn ? parent.id : undefined;
         const binding = holder?.type === "Identifier" ? scopes.staticVariableOf(holder) : undefined;
-        if (binding === undefined || !binding.defs.every((d) => d.type === "Variable" || d.type === "FunctionName")) return undefined;
+        if (binding === undefined || scopes.annexBEscapes(binding) || !binding.defs.every((d) => d.type === "Variable" || d.type === "FunctionName")) return undefined;
         const ownName = fn.type === "FunctionExpression" && fn.id !== null ? scopes.variableOf(fn.id) : undefined;
-        const replacedFrom = Math.min(
-            Number.POSITIVE_INFINITY,
-            ...binding.defs.filter((d) => parent !== undefined && d.parent === parentOf(parent) && (d.node as unknown as Node).start > parent.start).map((d) => (d.node as unknown as Node).end)
-        );
+        const declaration = parent?.type === "VariableDeclarator" ? parentOf(parent) : undefined;
+        const replacing =
+            declaration?.type === "VariableDeclaration" && parent?.type === "VariableDeclarator" && !insideTry(declaration, binding.scope.variableScope.block as unknown as Node)
+                ? declaration.declarations.slice(declaration.declarations.indexOf(parent) + 1).find((d) => binding.defs.some((other) => (other.node as unknown as Node) === d))
+                : undefined;
         let result: Abstract | undefined = EMPTY;
         let hasArrays = false;
         const reads = [
@@ -186,7 +211,7 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
             if (reference.isWrite() && !reference.isRead()) continue;
             const id = reference.identifier as unknown as Node;
             const call = parentOf(id);
-            if (ofHolder && id.start >= replacedFrom && reference.from.variableScope === binding.scope.variableScope) continue;
+            if (ofHolder && replacing !== undefined && reference.from.variableScope === binding.scope.variableScope && follows(id, replacing)) continue;
             if (call?.type !== "CallExpression" || call.callee !== id) return undefined;
             const args = call.arguments;
             if (args.slice(0, index + 1).some((arg) => arg.type === "SpreadElement")) return undefined;

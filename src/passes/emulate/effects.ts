@@ -205,10 +205,13 @@ const timeline = (runtime: RuntimeModel, scopes: ScopeInfo, log: PassLog): { tim
     /** `var t = a.b` declarators, in document order (for `storageEffects`' static parts of `G`). */
     const memberDeclarators: VariableDeclarator[] = [];
     let reflective = false;
-    /** Bound once, by its definition alone (no write reference, or `var f = function`'s initializer only). */
+    /**
+     * Bound once, by its definition alone (no write reference, or `var f = function`'s initializer only), and reached
+     * only through that binding (not a block function a function-wide binding also gets, Annex B).
+     */
     const candidate = (fn: Node, id: Node): void => {
         const variable = scopes.staticVariableOf(id);
-        if (variable === undefined || variable.defs.length !== 1) return;
+        if (variable === undefined || variable.defs.length !== 1 || scopes.annexBEscapes(variable)) return;
         const references = scopes.staticReferences(variable);
         const definitionWrites = fn.type === "FunctionDeclaration" ? 0 : 1;
         if (references.filter((reference) => reference.isWrite()).length === definitionWrites) candidates.push({ fn, references });
@@ -477,10 +480,14 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
     const writes = later.filter((effect) => effect.kind === "write");
     type Verdict = { readonly thisFree: true; readonly passes: readonly KeyPattern[] } | { readonly thisFree: false };
     const verdicts = new Map<string, Verdict>();
+    // Paths whose verdict is being worked out: a wrapper whose target leads back to one of them (itself, or a
+    // cycle of wrappers) gets the answer that it may use `this`, which is right whatever the cycle does.
+    const pending = new Set<string>();
     const verdictOf = (callee: PropertyPath): Verdict => {
         const id = JSON.stringify(callee);
         const known = verdicts.get(id);
         if (known !== undefined) return known;
+        if (pending.has(id)) return { thisFree: false };
         const key = callee.length === 1 ? callee[0] : undefined;
         const wrapper = key === undefined ? undefined : runtime.wrappers.get(key);
         const assigned = preludeWriteCount.get(id) === 1 ? assignedFunctions.get(id) : undefined;
@@ -498,12 +505,14 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
         const prefixWrite = writes.some((write) => write.keys.length < callee.length && matches(write.keys, callee) && !builtThisFree(write));
         const ownWrites = writes.filter((write) => write.keys.length === callee.length && matches(write.keys, callee));
         if (prefixWrite || !ownWrites.every((write) => write.value !== undefined && valueKind(write.value) !== "unknown")) verdict = { thisFree: false };
-        // A call alias (or other setup getter) stands for a builtin called with the arguments, not on G.
-        else if (key !== undefined && (runtime.callAliases.has(key) || runtime.setupKeys.has(key))) verdict = { thisFree: true, passes: [] };
+        // A setup key whose getter and the functions it hands out provably never read `this` (`thisFreeKeys`).
+        else if (key !== undefined && runtime.thisFreeKeys.has(key)) verdict = { thisFree: true, passes: [] };
         // A wrapper hands its receiver on to a function target, unless the target doesn't use `this`.
         else if (wrapper !== undefined) {
             const appliesTarget = runtime.guest.inspect(wrapper.target)?.type === "function" || writes.some((write) => affects(write, wrapper.target));
+            pending.add(id);
             const target = appliesTarget ? verdictOf(wrapper.target) : undefined;
+            pending.delete(id);
             if (target === undefined) verdict = { thisFree: true, passes: [] };
             else if (target.thisFree) verdict = target;
             else verdict = { thisFree: true, passes: wrapper.receiver === undefined ? [] : [wrapper.receiver] };

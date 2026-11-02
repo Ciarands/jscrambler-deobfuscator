@@ -1,7 +1,7 @@
 import type { PipelineStep } from "../pipeline/pass.js";
 import { aliases } from "./aliases.js";
 import { argumentsArrays } from "./arguments-arrays.js";
-import { calculators, calculatorsBound } from "./calculators.js";
+import { calculators, calculatorsBound } from "./calculators/index.js";
 import { cleanup } from "./cleanup.js";
 import { codeLocks } from "./code-locks.js";
 import { detectors } from "./detectors.js";
@@ -25,9 +25,10 @@ import { wrappers } from "./wrappers.js";
  * - calculators next: removed lock and detector calls no longer stand between a selector call and its calculation.
  * - storage-comparisons once before the simplify group: its paths are static from the start.
  * - The simplify group repeats to a fixpoint; resolve-calls and pure-calls rerun there as arguments become constant.
- * - arguments-arrays leads the cleanup group (earlier passes read the slot shapes); resolve-calls, calculators,
- *   code-locks and domain-locks rerun after it on the plain locals; hash-predicates follows in both groups. Only
- *   calculators there binds arguments: before it, a slot argument may still become a local that goes in directly.
+ * - arguments-arrays leads the cleanup group (earlier passes read the slot shapes); resolve-calls, code-locks,
+ *   domain-locks and calculators-bound rerun after it on the plain locals, calculators-bound after the locks for the
+ *   reason above; hash-predicates follows in both groups. Only calculators-bound binds arguments: before it, a slot
+ *   argument may still become a local that goes in directly.
  * - Unminify last: it produces shapes the earlier passes don't expect.
  */
 export const PIPELINE: readonly PipelineStep[] = [

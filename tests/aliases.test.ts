@@ -1,6 +1,6 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
 // Both setup variants: aliases on the builtins, and storage getters handing out a function. Calls come static
 // (`Owner.name.apply(Owner, args)`), as receiver dispatch (`r[name](...rest)`), or as receiver apply.
@@ -50,12 +50,6 @@ out.push(local(1) === String);
 result = out;
 `;
 
-const run = (code: string): unknown => {
-    const context: Record<string, unknown> = {};
-    runInNewContext(code, context);
-    return JSON.stringify(context.result);
-};
-
 describe("aliases", () => {
     it("replaces every alias style with the builtin call it makes, and keeps behaviour", async () => {
         const { code } = await deobfuscate(PROGRAM, { passes: ["emulate", "global-proxy", "aliases"] });
@@ -67,7 +61,7 @@ describe("aliases", () => {
         expect(code).toContain("out.push(String.fromCharCode(65));");
         expect(code).toContain(`out.push(String(5) + "!");`);
         expect(code).toContain("out.push(Array.prototype.join === Array.prototype.join);");
-        expect(run(code)).toBe(run(PROGRAM));
+        expect(observe(code)).toBe(observe(PROGRAM));
     });
 
     it("keeps an alias where the builtin's name is shadowed", async () => {
@@ -83,17 +77,8 @@ const withHost = (
 setTimeout(function () { ${later} });
 `;
 
-const observed = (code: string, host: Record<string, unknown>): string => {
-    const timers: (() => void)[] = [];
-    const context: Record<string, unknown> = { ...host, setTimeout: (callback: () => void) => timers.push(callback) };
-    try {
-        runInNewContext(code, context);
-        for (const callback of timers) callback();
-    } catch (error) {
-        return `threw ${(error as Error).name}`;
-    }
-    return JSON.stringify(context.result);
-};
+/** Model 10: the page has the host objects the script uses. */
+const PAGE: Run = { globals: () => ({ hostDoc: { title: "page" } }), timers: true };
 
 /** `q7Un`, an accessor of the global `target`, read after the global `holder` got a value. */
 const withAliasOf = (target: string) =>
@@ -108,21 +93,31 @@ describe("aliases: host objects", () => {
         const { code } = await deobfuscate(program);
         expect(code).not.toContain("q6Hd");
         expect(code).toContain("hostDoc.title");
-        // Model 10: the page has the host objects the script uses.
-        const host = { hostDoc: { title: "page" } };
-        expect(observed(code, host)).toBe(observed(program, host));
+        expect(observe(code, PAGE)).toBe(observe(program, PAGE));
+    });
+
+    it("reads the host object through the global object's names", async () => {
+        const program = withHost("result = [globalThis.q6Hd.title, window.q6Hd.title];");
+        const { code } = await deobfuscate(program);
+        expect(code).not.toContain("q6Hd");
+        expect(code).toContain("result = [globalThis.hostDoc.title, window.hostDoc.title];");
+        const page: Run = { ...PAGE, window: true };
+        expect(observe(code, page)).toBe(observe(program, page));
     });
 
     it("calls a host function without a this, as the alias did", async () => {
         const program = withHost("result = [q6Hd()];");
         const { code } = await deobfuscate(program);
         expect(code).toContain("result = [hostDoc()];");
-        const host = {
-            hostDoc: function (this: unknown) {
-                return this === undefined ? "no this" : "this";
-            },
+        const run: Run = {
+            globals: () => ({
+                hostDoc: function (this: unknown) {
+                    return this === undefined ? "no this" : "this";
+                },
+            }),
+            timers: true,
         };
-        expect(observed(code, host)).toBe(observed(program, host));
+        expect(observe(code, run)).toBe(observe(program, run));
     });
 
     it("keeps an alias where the host's name is shadowed, and the setup with it", async () => {
@@ -130,8 +125,7 @@ describe("aliases: host objects", () => {
         const { code } = await deobfuscate(program);
         expect(code).toContain("q6Hd.title");
         expect(code).toContain('Object.defineProperty(g, "q6Hd"');
-        const host = { hostDoc: { title: "page" } };
-        expect(observed(code, host)).toBe(observed(program, host));
+        expect(observe(code, PAGE)).toBe(observe(program, PAGE));
     });
 
     it("leaves accessors that read a host object without forwarding it", async () => {
@@ -146,8 +140,7 @@ describe("aliases: host objects", () => {
             );
             const { code } = await deobfuscate(program);
             expect(code).toContain("q6Hd");
-            const host = { hostDoc: { title: "page" } };
-            expect(observed(code, host)).toBe(observed(program, host));
+            expect(observe(code, PAGE)).toBe(observe(program, PAGE));
         }
     });
 
@@ -156,7 +149,7 @@ describe("aliases: host objects", () => {
             const program = withAliasOf(target);
             const { code } = await deobfuscate(program);
             expect(code).toContain("q7Un");
-            expect(observed(code, {})).toBe(observed(program, {}));
+            expect(observe(code, { timers: true })).toBe(observe(program, { timers: true }));
         }
     });
 
@@ -165,8 +158,7 @@ describe("aliases: host objects", () => {
             const program = withHost(later);
             const { code } = await deobfuscate(program);
             expect(code).toContain("q6Hd");
-            const host = { hostDoc: { title: "page" } };
-            expect(observed(code, host)).toBe(observed(program, host));
+            expect(observe(code, PAGE)).toBe(observe(program, PAGE));
         }
     });
 });

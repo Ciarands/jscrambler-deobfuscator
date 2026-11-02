@@ -1,25 +1,23 @@
-import type { Expression, Function as FunctionNode, MemberExpression, Node, Statement } from "../core/ast.js";
-import { memberPath, propertyKey } from "../core/ast.js";
-import { at, valueToNode } from "../core/build.js";
+import type { Function as FunctionNode, MemberExpression, Node, Statement } from "../core/ast.js";
+import { valueToNode } from "../core/build.js";
 import type { Primitive } from "../core/build.js";
 import type { ScopeInfo } from "../core/scope.js";
-import type { Path } from "../core/traverse.js";
-import { replaceNodes, traverse } from "../core/traverse.js";
+import { traverse } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
 import { factKey } from "../pipeline/facts.js";
 import type { ResolveResult } from "./emulate/guest.js";
-import type { Slot } from "./emulate/builders.js";
-import { bodyOf, builderOf, definitionOf, parentsWithin, returnsOf, sameSlot, slotOf, slotsOnly } from "./emulate/builders.js";
+import type { Builder, Slot } from "./emulate/builders.js";
+import { bodyOf, builderOf, definitionOf, returnsOf, sameSlot, slotOf, slotsOnly } from "./emulate/builders.js";
 import { storageAnalysis } from "./emulate/effects.js";
 import type { Staleness, StorageEffects } from "./emulate/effects.js";
 import type { PropertyPath } from "./emulate/guest.js";
 import type { RuntimeModel } from "./emulate/model.js";
 import { RUNTIME } from "./emulate/model.js";
 import type { StorageMatcher } from "./emulate/storage.js";
-import { onlyTested, rootStatements, storageMatcher } from "./emulate/storage.js";
-import type { KeySet } from "./key-sets.js";
-import { keySets, mayName } from "./key-sets.js";
+import { assignedPaths, storageMatcher } from "./emulate/storage.js";
 import { localityOf } from "./locality.js";
+import type { CallSite } from "./storage-usage.js";
+import { HolderReach, isGlobalRead, rewriteCalls, survey } from "./storage-usage.js";
 
 type FastPath =
     | {
@@ -52,8 +50,7 @@ const isPrimitiveLiteral = (node: Node | null | undefined): node is Node & { typ
  * and truthy literals the method stores at its own top level), so every later call returns `L` and does nothing else.
  * The method's other returns are literals other than `L`: a call that answers `L` took the cached path.
  */
-const fastPathOf = (iife: FunctionNode, method: string, scopes: ScopeInfo): FastPath => {
-    const builder = builderOf(iife, scopes);
+const fastPathOf = (iife: FunctionNode, builder: Builder | string, method: string, scopes: ScopeInfo): FastPath => {
     if (typeof builder === "string") return refused(builder, iife);
     const fn = builder.methods.get(method);
     if (fn === undefined) return refused(`its builder gives it no plain function ${method}`, iife);
@@ -72,7 +69,7 @@ const fastPathOf = (iife: FunctionNode, method: string, scopes: ScopeInfo): Fast
     if (taken?.type !== "ReturnStatement" || !isPrimitiveLiteral(taken.argument)) return refused(`${method}'s cache check doesn't return a literal`, check);
     const answer = taken.argument.value;
     const cache = slotOf(check.test, scopes);
-    if (cache === undefined || (cache.variable.scope.block as unknown as Node) !== iife || !slotsOnly(cache.variable, builder.parents)) {
+    if (cache === undefined || (cache.variable.scope.block as unknown as Node) !== iife || !slotsOnly(cache.variable, scopes, builder.parents)) {
         return refused(`${method}'s cache isn't a slot of an array its builder keeps to itself`, check.test);
     }
 
@@ -102,130 +99,6 @@ const fastPathOf = (iife: FunctionNode, method: string, scopes: ScopeInfo): Fast
     return { ok: true, answer, method: fn, cache, parents: builder.parents, constant: false };
 };
 
-/** A no-argument call of a storage path `G.k.m` (or `G.w`). */
-export interface CallSite {
-    readonly call: Expression & { type: "CallExpression" };
-    readonly site: Node;
-    readonly statement: Statement | undefined;
-    readonly discarded: boolean;
-    readonly tested: boolean;
-}
-
-const onlyTruthiness = (path: Path): boolean => {
-    let operand = path;
-    while (operand.parent?.type === "LogicalExpression" && operand.parent.operator !== "??" && operand.parentPath !== null) operand = operand.parentPath;
-    const parent = operand.parent;
-    switch (parent?.type) {
-        case "IfStatement":
-        case "ConditionalExpression":
-        case "WhileStatement":
-        case "DoWhileStatement":
-        case "ForStatement":
-            return operand.key === "test";
-        case "UnaryExpression":
-            return parent.operator === "!";
-        default:
-            return false;
-    }
-};
-
-interface KeyReference {
-    readonly node: Node;
-    readonly root: Node | undefined;
-    readonly site: Node | undefined;
-}
-
-export interface Survey {
-    readonly calls: Map<string, { path: PropertyPath; sites: CallSite[] }>;
-    /** Uses of `G` as a value or with a computed key: any key may be read there. */
-    readonly dynamic: readonly { readonly node: Node; readonly site: Node }[];
-}
-
-export const survey = (program: Node, matcher: StorageMatcher, scopes: ScopeInfo): Survey => {
-    const calls = new Map<string, { path: PropertyPath; sites: CallSite[] }>();
-    const dynamic: { node: Node; site: Node }[] = [];
-    /** `var s = G` with `s` a real alias (cleanup's rule): `s` holds G under a name the matcher follows. */
-    const isAliasDeclarator = (node: Node | null): boolean => {
-        if (node?.type !== "VariableDeclarator" || node.id.type !== "Identifier") return false;
-        const variable = scopes.variableOf(node.id);
-        return variable !== undefined && matcher.aliases.has(variable);
-    };
-    traverse(program, {
-        CallExpression(path) {
-            const call = path.node;
-            if (call.arguments.length > 0 || call.callee.type !== "MemberExpression") return;
-            const target = memberPath(call.callee as MemberExpression);
-            if (target === undefined || target.keys.length === 0 || !matcher.isStorage(target.root)) return;
-            const id = JSON.stringify(target.keys);
-            const entry = calls.get(id) ?? { path: target.keys, sites: [] };
-            const parent = path.parent;
-            const statement = parent?.type === "ExpressionStatement" ? parent : undefined;
-            const discarded = statement !== undefined || (parent?.type === "SequenceExpression" && parent.expressions.at(-1) !== call);
-            entry.sites.push({ call, site: target.root, statement, discarded, tested: onlyTruthiness(path) });
-            calls.set(id, entry);
-        },
-        MemberExpression(path) {
-            const node = path.node;
-            if (matcher.isStorage(node.object) && propertyKey(node) === undefined) dynamic.push({ node, site: node.object });
-        },
-        Identifier(path) {
-            if (!matcher.isStorage(path.node)) return;
-            const parent = path.parent;
-            const asObject = parent?.type === "MemberExpression" && path.key === "object";
-            const asDeclaration = parent?.type === "FunctionDeclaration" && path.key === "id";
-            if (!asObject && !asDeclaration && !isAliasDeclarator(parent) && !path.isWriteTarget() && !onlyTested(path)) dynamic.push({ node: path.node, site: path.node });
-        },
-    });
-    return { calls, dynamic };
-};
-
-/** Every static member reference `x.k` with `k` in `keys`, whatever `x` is (an unfollowable alias still names the key). */
-const keyReferences = (program: Node, runtime: RuntimeModel, matcher: StorageMatcher, keys: ReadonlySet<string>): Map<string, KeyReference[]> => {
-    const references = new Map<string, KeyReference[]>();
-    const roots = new Set<Node>(rootStatements(runtime.root));
-    let root: Node | undefined;
-    traverse(program, {
-        enter(path) {
-            if (roots.has(path.node)) root = path.node;
-        },
-        exit(path) {
-            if (path.node === root) root = undefined;
-        },
-        MemberExpression(path) {
-            const node = path.node;
-            const key = propertyKey(node);
-            if (key === undefined || !keys.has(key)) return;
-            const reference = { node, root, site: matcher.isStorage(node.object) ? node.object : undefined };
-            const list = references.get(key);
-            if (list === undefined) references.set(key, [reference]);
-            else list.push(reference);
-        },
-    });
-    return references;
-};
-
-/**
- * Why a reference to the holder key `path[0]` may reach the lock `path` other than through calls whose callee objects
- * (`G.k`) are `callees`: it is none of them, isn't in the builder's own statement or the definition of a wrapper of
- * something under the holder that nothing uses, and may run once the builder has (before it, `G.k` isn't the lock yet).
- */
-export const strayReference = (
-    path: PropertyPath,
-    callees: ReadonlySet<Node>,
-    builder: Statement,
-    program: Node,
-    runtime: RuntimeModel,
-    matcher: StorageMatcher,
-    effects: StorageEffects
-): Node | undefined => {
-    const wrappers = [...runtime.wrappers.values()].filter((wrapper) => wrapper.target[0] === path[0]);
-    const references = keyReferences(program, runtime, matcher, new Set([path[0] as string, ...wrappers.map((wrapper) => wrapper.key)]));
-    const unused = new Set(wrappers.filter((wrapper) => (references.get(wrapper.key) ?? []).every((reference) => reference.root === wrapper.definition)).map((wrapper) => wrapper.definition));
-    return references
-        .get(path[0] as string)
-        ?.find(({ node, root, site }) => !callees.has(node) && root !== builder && (root === undefined || !unused.has(root)) && (site === undefined || !effects.runsBefore(site, builder)))?.node;
-};
-
 type Disposition = "remove" | "answer" | "keep";
 
 interface Lock {
@@ -237,14 +110,7 @@ interface Lock {
     readonly builder: Statement;
 }
 
-/** `G.key()` with `key` a global-read getter (emulate's fact) the program never replaces: a read of that global property. */
-export const isGlobalRead = (call: Node, runtime: RuntimeModel, matcher: StorageMatcher, effects: StorageEffects): boolean => {
-    if (call.type !== "CallExpression" || call.arguments.length > 0 || call.callee.type !== "MemberExpression") return false;
-    const key = propertyKey(call.callee);
-    return key !== undefined && runtime.globalReads.has(key) && matcher.isStorage(call.callee.object) && effects.staleAt(call.callee.object, [key]) === undefined;
-};
-
-type LockContext = { program: Node; runtime: RuntimeModel; scopes: ScopeInfo; matcher: StorageMatcher; effects: StorageEffects; uses: Survey };
+type LockContext = { runtime: RuntimeModel; scopes: ScopeInfo; matcher: StorageMatcher; effects: StorageEffects; reach: HolderReach };
 
 /** Why the lock's checks (its first call) may change more than objects they create and its cache, if they may. */
 const localityRefusal = (fast: FastPath & { ok: true }, context: LockContext): { reason: string; node: Node } | undefined => {
@@ -253,57 +119,20 @@ const localityRefusal = (fast: FastPath & { ok: true }, context: LockContext): {
     return effect === undefined ? undefined : { reason: `its checks may change more than their own objects: ${effect.reason}`, node: effect.node };
 };
 
-/**
- * The first use of `G` as a value or read with a computed key (`dynamic`) that may reach the holder key `key` once
- * `builder` has run: not done before it, not a store of `G` as a global the program never names (model 2), and not a
- * computed access whose key can't name `key` (`keySets`: the decoder's name probe tries permutations of a few
- * characters).
- */
-export const reachingDynamicUse = (dynamic: Survey["dynamic"], key: string, builder: Statement, runtime: RuntimeModel, scopes: ScopeInfo, effects: StorageEffects): Node | undefined => {
-    const roots = rootStatements(runtime.root);
-    const keysByRoot = new Map<Node, (key: Expression) => KeySet | undefined>();
-    return dynamic.find(({ node, site }) => {
-        if (effects.runsBefore(site, builder) || effects.keptAsGlobal(node)) return false;
-        if (node.type !== "MemberExpression" || !node.computed) return true;
-        const root = roots.find((statement) => statement.start <= node.start && node.end <= statement.end);
-        if (root === undefined) return true;
-        let keysOf = keysByRoot.get(root);
-        if (keysOf === undefined) {
-            keysOf = keySets(scopes, parentsWithin(root));
-            keysByRoot.set(root, keysOf);
-        }
-        const keys = keysOf(node.property as Expression);
-        return keys === undefined || mayName(keys, key);
-    })?.node;
-};
-
 const fullModeRefusal = (lock: Lock, context: LockContext): { reason: string; node: Node } | undefined => {
     const { path, sites, full, staleness, fast, builder } = lock;
-    const { program, runtime, matcher, effects, uses } = context;
+    const { runtime, reach } = context;
     if (path.length !== 2) return { reason: "its holder isn't a key of the storage object itself", node: builder };
     const local = localityRefusal(fast, context);
     if (local !== undefined) return local;
     const used = sites.findIndex(({ discarded }, i) => !discarded && full[i] !== "answer");
     if (used !== -1) return { reason: staleness[used]?.reason ?? "a call whose value is used runs in the prelude, where it may be the first call", node: (sites[used] as CallSite).call };
-    const dynamic = reachingDynamicUse(uses.dynamic, path[0] as string, builder, runtime, context.scopes, effects);
+    const dynamic = reach.reachingDynamicUse(path[0] as string, builder);
     if (dynamic !== undefined) return { reason: `${runtime.storage} is used as a value or read with a computed key once the lock is built, which may reach it`, node: dynamic };
     const callees = new Set(sites.map(({ call }) => (call.callee as MemberExpression).object as Node));
-    const stray = strayReference(path, callees, builder, program, runtime, matcher, effects);
+    const stray = reach.strayReference(path, callees, builder);
     if (stray !== undefined) return { reason: `${runtime.storage}.${path[0]} is used other than by its calls, its builder and unused wrappers`, node: stray };
     return undefined;
-};
-
-/** Removes call statements in `removals`, leaving an empty statement where one must stay. */
-export const rewriteCalls = (program: Node, replacements: ReadonlyMap<Node, Node>, removals: ReadonlySet<Node>): void => {
-    replaceNodes(program, replacements);
-    if (removals.size === 0) return;
-    traverse(program, {
-        ExpressionStatement(path) {
-            if (!removals.has(path.node)) return;
-            if (path.isInStatementList()) path.remove();
-            else path.replace(at<Statement>({ type: "EmptyStatement" }, path.node));
-        },
-    });
 };
 
 /** Each lock's first probe in the guest, by path: later runs (the cleanup group's) reuse it. */
@@ -334,22 +163,40 @@ export const codeLocks: Pass = {
             return { changed: 0 };
         }
         const scopes = scope();
-        // The storage effects (a walk of every function) only once a builder has a lock's shape.
         const matcher = storageMatcher(program, runtime, scopes);
-        let effects: StorageEffects | undefined;
-        const programSurvey = survey(program, matcher, scopes);
+        const builders = new Map<FunctionNode, Builder | string>();
+        const counts = { locks: 0, full: 0, removed: 0, answered: 0, kept: 0 };
+        // A call below is a lock's only when a root statement builds its holder with a method of that name that has a
+        // fast path: with no such method, no call is, and the survey (a walk of the whole program) is skipped.
+        const shaped = assignedPaths(runtime, matcher.isStorage).some((prefix) => {
+            const definition = definitionOf(runtime, matcher.isStorage, prefix);
+            if (typeof definition === "string") return false;
+            const builder = builders.get(definition.iife) ?? builderOf(definition.iife, scopes);
+            builders.set(definition.iife, builder);
+            return typeof builder !== "string" && [...builder.methods.keys()].some((method) => fastPathOf(definition.iife, builder, method, scopes).ok);
+        });
+        if (!shaped) {
+            log.info("no builder method has a code lock's shape");
+            return { changed: 0, stats: counts };
+        }
+        const programSurvey = survey(program, runtime, matcher, scopes);
+        // Full mode asks only about locks under a key of `G` itself.
+        const holders = new Set([...programSurvey.calls.values()].flatMap(({ path }) => (path.length === 2 ? [path[0] as string] : [])));
+        // The storage effects (a walk of every function) only once a builder has a lock's shape.
+        let context: LockContext | undefined;
         const probes = facts.get(LOCK_PROBES) ?? new Map<string, ResolveResult | undefined>();
         facts.set(LOCK_PROBES, probes);
 
         const replacements = new Map<Node, Node>();
         const removals = new Set<Node>();
-        const counts = { locks: 0, full: 0, removed: 0, answered: 0, kept: 0 };
         for (const { path, sites } of programSurvey.calls.values()) {
             if (path.length < 2) continue; // a wrapper: inlined by now when its target is a function
             const name = `${runtime.storage}.${path.join(".")}`;
             const definition = definitionOf(runtime, matcher.isStorage, path.slice(0, -1));
             if (typeof definition === "string") continue; // not a code lock's shape at all: say nothing
-            const fast = fastPathOf(definition.iife, path.at(-1) as string, scopes);
+            const builder = builders.get(definition.iife) ?? builderOf(definition.iife, scopes);
+            builders.set(definition.iife, builder);
+            const fast = fastPathOf(definition.iife, builder, path.at(-1) as string, scopes);
             if (!fast.ok) {
                 log.debug(`${name} is no code lock: ${fast.reason}`, fast.node);
                 continue;
@@ -373,8 +220,11 @@ export const codeLocks: Pass = {
                 fast.method
             );
 
-            effects ??= storageAnalysis(program, runtime, scopes, log).effects;
-            const known = effects;
+            if (context === undefined) {
+                const { effects } = storageAnalysis(program, runtime, scopes, log);
+                context = { runtime, scopes, matcher, effects, reach: new HolderReach(program, runtime, matcher, scopes, effects, programSurvey.dynamic, holders) };
+            }
+            const known = context.effects;
             const staleness = sites.map(({ site }) => known.staleAt(site, path));
             // A discarded call's answer is as good as no call; a used one may answer the cached value only after the prelude.
             const full = sites.map(({ statement, discarded, site }, i): Disposition =>
@@ -386,7 +236,6 @@ export const codeLocks: Pass = {
             );
             // A constant lock's calls answer whoever else may call it: callers the analysis can't see run the checks
             // themselves, which touch only their own objects.
-            const context = { program, runtime, scopes, matcher, effects: known, uses: programSurvey };
             const refusal = fast.constant ? localityRefusal(fast, context) : fullModeRefusal({ path, sites, full, staleness, fast, builder: definition.statement }, context);
             if (refusal === undefined) counts.full++;
             else log.debug(`${name}: ${fast.constant ? "kept" : "partial mode, the prelude's calls stay"}: ${refusal.reason}`, refusal.node);

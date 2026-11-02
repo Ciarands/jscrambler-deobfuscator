@@ -10,6 +10,22 @@ import { expandStatements, mergeElseIf, removeDeclarators, rewriteStatement, unl
 /** Each rewrite is one step (`!(1 === x)` -> `1 !== x` -> `x !== 1`); more than this means a loop. */
 const MAX_STEPS = 16;
 
+/** The statement list a node holds, and whether it is a function's body (a block may end it with a `return;`). */
+const statementList = (path: Path): { list: Statement[]; functionBody: boolean } | undefined => {
+    const node = path.node;
+    switch (node.type) {
+        case "Program":
+        case "StaticBlock":
+            return { list: node.body as Statement[], functionBody: false };
+        case "BlockStatement":
+            return { list: node.body, functionBody: isFunctionNode(path.parent) && path.key === "body" };
+        case "SwitchCase":
+            return { list: node.consequent, functionBody: false };
+        default:
+            return undefined;
+    }
+};
+
 /**
  * Exact readability rewrites webcrack's unminify makes that earlier passes don't, in one walk. Every refusal case
  * (`__proto__`, class `constructor`, NaN for inverted logic, maybe-undeclared `typeof`, tagged templates) lives with
@@ -25,6 +41,7 @@ export const unminify: Pass = {
     description: "Readability rewrites: blocks, if/else for &&/?:, split declarations, plain keys, natural comparisons",
     run({ program, log, scope }: PassContext): PassResult {
         const context = new UnminifyContext(scope(), log);
+        let stoppedEarly = 0;
 
         const rewrite = (path: Path): void => {
             for (let step = 0; step < MAX_STEPS; step++) {
@@ -34,46 +51,32 @@ export const unminify: Pass = {
                 if (replacement === undefined || replacement === path.node) return;
                 path.replace(replacement);
             }
-            log.warn(`stopped after ${MAX_STEPS} rewrites of one node`, path.node);
+            stoppedEarly = 1;
+            log.warn(`stopped after ${MAX_STEPS} rewrites of one node: this ${path.node.type} may still have rewrites left undone`, path.node);
         };
 
         traverse(program, {
             enter(path) {
-                const node = path.node;
-                switch (node.type) {
-                    case "Program":
-                    case "StaticBlock":
-                        expandStatements(node.body as Statement[], context);
-                        return;
-                    case "BlockStatement":
-                        expandStatements(node.body, context, isFunctionNode(path.parent) && path.key === "body");
-                        return;
-                    case "SwitchCase":
-                        expandStatements(node.consequent, context);
-                        return;
-                    default:
-                        break;
-                }
-                rewrite(path);
+                const statements = statementList(path);
+                if (statements === undefined) rewrite(path);
+                else expandStatements(statements.list, context, statements.functionBody);
             },
             exit(path) {
-                const node = path.node;
-                if (node.type === "Program" || node.type === "StaticBlock") unlabelStatements(node.body as Statement[], context);
-                else if (node.type === "BlockStatement") unlabelStatements(node.body, context, isFunctionNode(path.parent) && path.key === "body");
-                else if (node.type === "SwitchCase") unlabelStatements(node.consequent, context);
-                mergeElseIf(node, context);
+                const statements = statementList(path);
+                if (statements !== undefined) unlabelStatements(statements.list, context, statements.functionBody);
+                mergeElseIf(path.node, context);
             },
         });
         if (context.unusedDeclarators.size > 0) removeDeclarators(program, context.unusedDeclarators);
 
-        const stats = context.counts;
-        const changed = Object.values(stats).reduce((sum, count) => sum + count, 0);
+        const counts = context.counts;
+        const changed = Object.values(counts).reduce((sum, count) => sum + count, 0);
         log.info(
-            `${changed} rewrite(s): ${Object.entries(stats)
+            `${changed} rewrite(s): ${Object.entries(counts)
                 .filter(([, count]) => count > 0)
                 .map(([name, count]) => `${name}=${count}`)
                 .join(" ")}`
         );
-        return { changed, stats };
+        return { changed, stats: { ...counts, stoppedEarly } };
     },
 };

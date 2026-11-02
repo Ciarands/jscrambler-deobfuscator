@@ -1,19 +1,26 @@
 import type {
+    ArrowFunctionExpression,
     AssignmentExpression,
     BlockStatement,
+    ConditionalExpression,
     Expression,
+    ExpressionStatement,
     ForStatement,
     IfStatement,
     LabeledStatement,
+    LogicalExpression,
     Node,
     ObjectExpression,
+    ReturnStatement,
     Statement,
+    UnaryExpression,
     VariableDeclaration,
     VariableDeclarator,
 } from "../../core/ast.js";
-import { isFunctionNode, isJump } from "../../core/ast.js";
+import { isFunctionNode, isJump, isLoopNode } from "../../core/ast.js";
 import { at } from "../../core/build.js";
 import { deadRemainder, isPlaceholder } from "../../core/hoisting.js";
+import { hasPlainBreak, isBlockScoped, isJumpingIf, isJumpTo, labeledJumps, plainJumps, unlabelJumps } from "../../core/jumps.js";
 import { pushAll, spliceList } from "../../core/list.js";
 import { forEachChild, traverse } from "../../core/traverse.js";
 import type { Path } from "../../core/traverse.js";
@@ -74,26 +81,6 @@ const splitSequence = (expression: Expression | null | undefined, context: Unmin
     return { before: expression.expressions.slice(0, -1).map(expressionStatement), last };
 };
 
-/** Whether a `break`/`continue` under `node` names `label` (labels don't reach into functions). */
-const jumpsTo = (node: Node | null | undefined, label: string): boolean => {
-    if (node === null || node === undefined || isFunctionNode(node)) return false;
-    if ((node.type === "BreakStatement" || node.type === "ContinueStatement") && node.label?.name === label) return true;
-    let found = false;
-    forEachChild(node, (child) => {
-        found ||= jumpsTo(child, label);
-    });
-    return found;
-};
-
-const isBreakingIf = (statement: Statement, label: string): statement is IfStatement & { consequent: BlockStatement } => {
-    if (statement.type !== "IfStatement" || statement.alternate !== null || statement.consequent.type !== "BlockStatement") return false;
-    const last = statement.consequent.body.at(-1);
-    return last?.type === "BreakStatement" && last.label?.name === label;
-};
-
-const isLexical = (statement: Statement): boolean =>
-    (statement.type === "VariableDeclaration" && statement.kind !== "var") || statement.type === "ClassDeclaration" || statement.type === "FunctionDeclaration";
-
 /**
  * A statement list that ends where `label`'s block ends, without its breaks to `label`: `if (c) { x; break label; }
  * rest` -> `if (c) { x } else { rest }` (each break skips to the end of the block, which is what the `else` does; `x`
@@ -104,17 +91,17 @@ const isLexical = (statement: Statement): boolean =>
 const withoutTailBreaks = (list: readonly Statement[], label: string): Statement[] | undefined => {
     for (const [i, statement] of list.entries()) {
         const last = i === list.length - 1;
-        if (statement.type === "BreakStatement" && statement.label?.name === label) return last ? list.slice(0, i) : undefined;
-        if (isBreakingIf(statement, label)) {
+        if (isJumpTo(statement, label, "BreakStatement")) return last ? list.slice(0, i) : undefined;
+        if (isJumpingIf(statement, label, "BreakStatement")) {
             const rest = list.slice(i + 1);
-            const alternate = rest.some(isLexical) ? undefined : withoutTailBreaks(rest, label);
+            const alternate = rest.some(isBlockScoped) ? undefined : withoutTailBreaks(rest, label);
             const taken = withoutTailBreaks(statement.consequent.body.slice(0, -1), label);
             if (alternate === undefined || taken === undefined) return undefined;
             const consequent = block(taken, statement.consequent);
             const otherwise = alternate.length === 0 ? null : block(alternate, rest[0] as Statement);
             return [...list.slice(0, i), at<IfStatement>({ type: "IfStatement", test: statement.test, consequent, alternate: otherwise }, statement)];
         }
-        if (!jumpsTo(statement, label)) continue;
+        if (labeledJumps(statement, label).length === 0) continue;
         if (!last) return undefined;
         if (statement.type === "BlockStatement") {
             const body = withoutTailBreaks(statement.body, label);
@@ -144,11 +131,11 @@ const unlabelBlock = (statement: LabeledStatement, context: UnminifyContext): St
     if (statement.body.type !== "BlockStatement") return undefined;
     const label = statement.label.name;
     const last = statement.body.body.at(-1);
-    if (last !== undefined && LOOPS.has(last.type)) for (const jump of plainJumps(last, label, "same") ?? []) (jump as Statement & { label: unknown }).label = null;
+    if (isLoopNode(last)) unlabelJumps(plainJumps(last as Statement, label, "same") ?? []);
     const body = withoutTailBreaks(statement.body.body, label);
-    if (body === undefined || body.some((s) => jumpsTo(s, label))) return undefined;
+    if (body === undefined || labeledJumps(body, label).length > 0) return undefined;
     context.did("labeledBlocks", statement);
-    return body.some(isLexical) ? [block(body, statement)] : body;
+    return body.some(isBlockScoped) ? [block(body, statement)] : body;
 };
 
 /**
@@ -163,7 +150,7 @@ const forwardBreaks = (statement: LabeledStatement, next: Statement | undefined,
     const plainNext = (next.type === "BreakStatement" || next.type === "ContinueStatement") && next.label === null;
     if (next.type !== "BreakStatement" && next.type !== "ContinueStatement" && !(next.type === "ReturnStatement" && next.argument === null)) return undefined;
     const label = statement.label.name;
-    const breaks = plainNext ? plainJumps(statement.body, label, next.type) : allJumps(statement.body, label);
+    const breaks = plainNext ? plainJumps(statement.body, label, next.type) : labeledJumps(statement.body, label);
     if (breaks === undefined) return undefined;
     const copy = (origin: Node): Statement => {
         if (next.type === "ReturnStatement") return at<Statement>({ type: "ReturnStatement", argument: null }, origin);
@@ -173,18 +160,7 @@ const forwardBreaks = (statement: LabeledStatement, next: Statement | undefined,
     replaceJumps(statement.body, new Map(breaks.map((jump) => [jump as Node, copy(jump)])));
     context.did("labeledBlocks", statement);
     const body = statement.body.body;
-    return body.some(isLexical) ? [statement.body] : body;
-};
-
-const allJumps = (node: Node, label: string): Statement[] => {
-    const jumps: Statement[] = [];
-    const visit = (child: Node): void => {
-        if (isFunctionNode(child)) return;
-        if ((child.type === "BreakStatement" || child.type === "ContinueStatement") && child.label?.name === label) jumps.push(child);
-        else forEachChild(child, visit);
-    };
-    forEachChild(node, visit);
-    return jumps;
+    return body.some(isBlockScoped) ? [statement.body] : body;
 };
 
 const replaceJumps = (node: Node, replacements: ReadonlyMap<Node, Statement>): void => {
@@ -199,29 +175,6 @@ const replaceJumps = (node: Node, replacements: ReadonlyMap<Node, Statement>): v
     });
 };
 
-const LOOPS: ReadonlySet<string> = new Set(["WhileStatement", "DoWhileStatement", "ForStatement", "ForInStatement", "ForOfStatement"]);
-
-/**
- * The jumps to `label` under `node` (not in functions), when none is in a loop of `node`, nor in a `switch` of it
- * when it is (or becomes, `as`) a `break`: then the jump without its label, or the unlabeled jump it becomes, reaches
- * the loop around `node` (or `node`'s own, for its children). `undefined` otherwise.
- */
-const plainJumps = (node: Node, label: string, as: "same" | "BreakStatement" | "ContinueStatement"): Statement[] | undefined => {
-    const jumps: Statement[] = [];
-    let plain = true;
-    const visit = (child: Node, inLoop: boolean, inSwitch: boolean): void => {
-        if (!plain || isFunctionNode(child)) return;
-        if ((child.type === "BreakStatement" || child.type === "ContinueStatement") && child.label?.name === label) {
-            if (inLoop || ((as === "same" ? child.type : as) === "BreakStatement" && inSwitch)) plain = false;
-            else jumps.push(child);
-            return;
-        }
-        forEachChild(child, (grandchild) => visit(grandchild, inLoop || LOOPS.has(child.type), inSwitch || child.type === "SwitchStatement"));
-    };
-    forEachChild(node, (child) => visit(child, false, false));
-    return plain ? jumps : undefined;
-};
-
 /**
  * `label: while (c) { ... continue label; ... break label; }` -> the loop unlabeled, when each jump to the label is
  * in no inner loop (and a `break` in no `switch`) of it (`plainJumps`): the same jump without the label goes to the
@@ -229,10 +182,10 @@ const plainJumps = (node: Node, label: string, as: "same" | "BreakStatement" | "
  */
 const unlabelLoop = (statement: LabeledStatement, context: UnminifyContext): Statement[] | undefined => {
     const loop = statement.body;
-    if (!LOOPS.has(loop.type)) return undefined;
+    if (!isLoopNode(loop)) return undefined;
     const jumps = plainJumps(loop, statement.label.name, "same");
     if (jumps === undefined) return undefined;
-    for (const jump of jumps) (jump as Statement & { label: unknown }).label = null;
+    unlabelJumps(jumps);
     context.did("labeledLoops", statement);
     return [loop];
 };
@@ -307,8 +260,32 @@ const unlabel = (list: readonly Statement[], index: number, context: UnminifyCon
 const dropUnreachable = (list: Statement[], context: UnminifyContext): void => {
     const jump = list.findIndex(isJump);
     if (jump === -1 || jump === list.length - 1 || list.slice(jump + 1).every(isPlaceholder)) return;
+    const end = list[jump] as Statement;
+    const remainder = deadRemainder(list.slice(jump + 1), end, context.scopes);
+    if (remainder === undefined) {
+        context.refused("keeps unreachable code: a block function in it is newer than the scope analysis", end);
+        return;
+    }
     context.did("unreachable", list[jump + 1] as Statement);
-    pushAll(list, deadRemainder(list.splice(jump + 1), list[jump] as Statement));
+    list.splice(jump + 1);
+    pushAll(list, remainder);
+};
+
+/**
+ * Replaces each statement of `list` that `rewrite` (given its index) makes into others, and goes on from the first of
+ * those: rewrites repeat on what they made. `replaced` sees each replacement. Whether anything was replaced.
+ */
+const replaceEach = (list: Statement[], rewrite: (index: number) => Statement[] | undefined, replaced?: (statements: readonly Statement[]) => void): boolean => {
+    let changed = false;
+    for (let i = 0; i < list.length; i++) {
+        const statements = rewrite(i);
+        if (statements === undefined) continue;
+        spliceList(list, i, 1, statements);
+        changed = true;
+        replaced?.(statements);
+        i--;
+    }
+    return changed;
 };
 
 /**
@@ -316,12 +293,7 @@ const dropUnreachable = (list: Statement[], context: UnminifyContext): void => {
  * copy can put a literal under the name the stores use (`t = {...}; o = t; o.a = x;`), so the merge runs again.
  */
 export const expandStatements = (list: Statement[], context: UnminifyContext, functionBody = false): void => {
-    for (let i = 0; i < list.length; i++) {
-        const statements = expandStatement(list[i] as Statement, context) ?? unlabel(list, i, context, functionBody);
-        if (statements === undefined) continue;
-        spliceList(list, i, 1, statements);
-        i--;
-    }
+    replaceEach(list, (i) => expandStatement(list[i] as Statement, context) ?? unlabel(list, i, context, functionBody));
     dropUnreachable(list, context);
     mergeObjectAssignments(list, context);
     if (mergeCopies(list, context)) mergeObjectAssignments(list, context);
@@ -334,16 +306,10 @@ export const expandStatements = (list: Statement[], context: UnminifyContext, fu
  * `return;` ending a function body goes (the end returns undefined too).
  */
 export const unlabelStatements = (list: Statement[], context: UnminifyContext, functionBody = false): void => {
-    let changed = false;
-    for (let i = 0; i < list.length; i++) {
-        const statements = unlabel(list, i, context, functionBody);
-        if (statements === undefined) continue;
-        spliceList(list, i, 1, statements);
-        changed = true;
+    const mergeElseIfs = (statements: readonly Statement[]): void => {
         for (const statement of statements) traverse(statement, { exit: (path) => mergeElseIf(path.node, context) });
-        i--;
-    }
-    if (changed) dropUnreachable(list, context);
+    };
+    if (replaceEach(list, (i) => unlabel(list, i, context, functionBody), mergeElseIfs)) dropUnreachable(list, context);
     for (let i = 0; i < list.length; i++) {
         const statements = rebuildLoop(list[i] as Statement, context);
         if (statements === undefined) continue;
@@ -355,17 +321,6 @@ export const unlabelStatements = (list: Statement[], context: UnminifyContext, f
         context.did("returnVoid", last);
         list.pop();
     }
-};
-
-/** Plain `break`s under `node` (not in a function, loop or `switch` of it): they leave the loop `node` sits in. */
-const breaksOut = (node: Node): boolean => {
-    if (isFunctionNode(node) || LOOPS.has(node.type) || node.type === "SwitchStatement") return false;
-    if (node.type === "BreakStatement") return node.label === null;
-    let found = false;
-    forEachChild(node, (child) => {
-        found ||= breaksOut(child);
-    });
-    return found;
 };
 
 /** Conservative: false only for a jump, or a block or `if`/`else` all of whose ends are jumps. */
@@ -401,10 +356,10 @@ const thenBreak = (t: readonly Statement[], origin: Node): Statement[] | undefin
     const alternate = statementsOf(last.alternate);
     const keep = t.slice(0, -1);
     // `last` completes, so at most one branch is a jump.
-    if (!completes(last.alternate) && !alternate.some(isLexical)) {
+    if (!completes(last.alternate) && !alternate.some(isBlockScoped)) {
         return [...keep, at<IfStatement>({ ...last, consequent: block([...consequent, exit], last.consequent), alternate: null }, last), ...alternate];
     }
-    if (!completes(last.consequent) && !consequent.some(isLexical)) {
+    if (!completes(last.consequent) && !consequent.some(isBlockScoped)) {
         return [...keep, at<IfStatement>({ ...last, test: not(last.test, last.test), consequent: block([...alternate, exit], last.alternate), alternate: null }, last), ...consequent];
     }
     return undefined;
@@ -423,7 +378,7 @@ const thenBreak = (t: readonly Statement[], origin: Node): Statement[] | undefin
  * as before (`thenBreak` places that break). No plain `break` in `t` unless `jump` is one: it would skip `jump`.
  */
 const rebuildLoop = (statement: Statement, context: UnminifyContext): Statement[] | undefined => {
-    if (!LOOPS.has(statement.type)) return undefined;
+    if (!isLoopNode(statement)) return undefined;
     const loop = statement as Statement & { body: Statement };
     if (loop.body.type !== "BlockStatement") return undefined;
     const body = withoutTailContinue(loop.body.body, context);
@@ -443,7 +398,7 @@ const rebuildLoop = (statement: Statement, context: UnminifyContext): Statement[
     if (body.length === 2 && first?.type === "IfStatement" && first.alternate === null && isJump(jump) && !(jump?.type === "ContinueStatement" && jump.label === null)) {
         const leaves = jump?.type === "BreakStatement" && jump.label === null;
         const t = statementsOf(first.consequent);
-        const placed = leaves || !t.some(breaksOut) ? thenBreak(t, jump as Statement) : undefined;
+        const placed = leaves || !hasPlainBreak(t) ? thenBreak(t, jump as Statement) : undefined;
         if (placed !== undefined) {
             context.did("loops", statement);
             const rebuilt = at<Statement>({ type: "WhileStatement", test: first.test, body: block(withoutTailContinue(placed, context), first.consequent) }, statement);
@@ -476,8 +431,8 @@ const mergeCopies = (list: Statement[], context: UnminifyContext): boolean => {
         if (first === undefined || second === undefined || second.right.type !== "Identifier") continue;
         const temp = scopes.variableOf(first.left);
         if (temp === undefined || scopes.variableOf(second.right) !== temp || scopes.variableOf(second.left) === undefined) continue;
-        const references = temp.references.filter((reference) => !context.removedReferences.has(reference.identifier as unknown as Node));
-        if (!temp.defs.every((def) => (def.parent as { kind?: string } | null)?.kind === "var") || temp.scope.type === "global" || references.length !== 2) continue;
+        const references = scopes.references(temp)?.filter((reference) => !context.removedReferences.has(reference.identifier as unknown as Node));
+        if (!temp.defs.every((def) => (def.parent as { kind?: string } | null)?.kind === "var") || temp.scope.type === "global" || references?.length !== 2) continue;
         context.did("copies", list[i] as Statement);
         first.left = second.left;
         list.splice(i + 1, 1);
@@ -574,8 +529,9 @@ const mergeObjectAssignments = (list: Statement[], context: UnminifyContext): vo
 const unobservedDuring = (last: number, id: Node, context: UnminifyContext, createdAt: (identifier: Node) => number): boolean => {
     const variable = context.scopes.variableOf(id);
     const own = context.scopes.referenceOf(id)?.from.variableScope ?? variable?.scope.variableScope ?? null;
-    if (variable === undefined || own === null) return false;
-    return variable.references.every((reference) => reference.from.variableScope === own || createdAt(reference.identifier as unknown as Node) > last);
+    const references = variable === undefined ? undefined : context.scopes.references(variable);
+    if (references === undefined || own === null) return false;
+    return references.every((reference) => reference.from.variableScope === own || createdAt(reference.identifier as unknown as Node) > last);
 };
 
 const BODY_SLOTS: Readonly<Record<string, readonly string[]>> = {
@@ -618,9 +574,83 @@ const inlineNestedIife = (node: Node, context: UnminifyContext): void => {
     const arrow = call.callee;
     if (arrow.type !== "ArrowFunctionExpression" || arrow.async || arrow.params.length > 0 || arrow.body.type !== "BlockStatement") return;
     if (arrow.body.body.some((statement) => statement.type === "ExpressionStatement" && "directive" in statement && typeof statement.directive === "string")) return;
-    if (context.scopes.scopeOf(arrow)?.set.has("arguments") !== false) return;
+    const own = context.scopes.scopeOf(arrow);
+    // A block function named `arguments` gives the arrow one of its own once it runs (Annex B).
+    if (own === null || context.scopes.bindsName(own, "arguments")) return;
     context.did("nestedIife", node);
     node.body.body = arrow.body.body;
+};
+
+/** `void x;`, `!x;`, `typeof x;` -> `x;`; `null` when the statement was removed. */
+const discardUnary = (path: Path, node: ExpressionStatement, expression: UnaryExpression, context: UnminifyContext): Node | null | undefined => {
+    const argument = expression.argument;
+    // `typeof x` doesn't throw for an undeclared global `x`; `x` does.
+    if (expression.operator === "typeof" && argument.type === "Identifier" && context.scopes.variableOf(argument) === undefined) {
+        context.refused("keeps `typeof` of a name that may be undeclared", node);
+        return undefined;
+    }
+    context.did("unaryStatements", node);
+    // What's left of `void 0;` does nothing at all.
+    if (argument.type === "Literal" && path.isInStatementList()) {
+        path.remove();
+        return null;
+    }
+    return at<Statement>({ type: "ExpressionStatement", expression: argument }, node);
+};
+
+const logicalToIf = (node: ExpressionStatement, expression: LogicalExpression, context: UnminifyContext): Statement | undefined => {
+    if (expression.operator === "??") {
+        context.refused("keeps `a ?? b;`: no plain `if` for it", node);
+        return undefined;
+    }
+    context.did("logicalToIf", node);
+    const test = expression.operator === "&&" ? expression.left : not(expression.left, expression.left);
+    return at<Statement>({ type: "IfStatement", test, consequent: block([expressionStatement(expression.right)], expression.right), alternate: null }, node);
+};
+
+const ternaryToIf = (node: ExpressionStatement, expression: ConditionalExpression, context: UnminifyContext): Statement => {
+    context.did("ternaryToIf", node);
+    return at<Statement>(
+        {
+            type: "IfStatement",
+            test: expression.test,
+            consequent: block([expressionStatement(expression.consequent)], expression.consequent),
+            alternate: block([expressionStatement(expression.alternate)], expression.alternate),
+        },
+        node
+    );
+};
+
+const returnTernaryToIf = (node: ReturnStatement, context: UnminifyContext): Statement | undefined => {
+    const argument = node.argument;
+    if (argument?.type !== "ConditionalExpression") return undefined;
+    context.did("ternaryToIf", node);
+    return at<Statement>({ type: "IfStatement", test: argument.test, consequent: returning(argument.consequent), alternate: returning(argument.alternate) }, node);
+};
+
+/** `if (c) {} else { b }` -> `if (!c) { b }`: c runs either way and b exactly when c is falsy. */
+const invertEmptyThen = (node: IfStatement, context: UnminifyContext): Statement | undefined => {
+    const empty = node.consequent.type === "EmptyStatement" || (node.consequent.type === "BlockStatement" && node.consequent.body.length === 0);
+    if (!empty || node.alternate === null) return undefined;
+    context.did("emptyBranches", node);
+    return at<Statement>({ type: "IfStatement", test: not(node.test, node.test), consequent: node.alternate, alternate: null }, node);
+};
+
+const forToWhile = (node: ForStatement, context: UnminifyContext): Statement | undefined => {
+    if (node.init !== null || node.update !== null) return undefined;
+    context.did("forToWhile", node);
+    return at<Statement>({ type: "WhileStatement", test: node.test ?? at<Expression>({ type: "Literal", value: true, raw: "true" }, node), body: node.body }, node);
+};
+
+/** `() => (a, b)` -> `() => { a; return b; }`, in place. */
+const arrowSequenceBody = (node: ArrowFunctionExpression, context: UnminifyContext): void => {
+    const body = node.body;
+    if (body.type !== "SequenceExpression") return;
+    context.did("blockStatements", body);
+    const last = body.expressions.at(-1) as Expression;
+    const statements = [...body.expressions.slice(0, -1).map(expressionStatement), at<Statement>({ type: "ReturnStatement", argument: last }, last)];
+    node.body = block(statements, body) as typeof node.body;
+    node.expression = false;
 };
 
 /** One step; the caller repeats on the result. `null` when the statement was removed. Bodies are put in blocks in place. */
@@ -629,74 +659,29 @@ export const rewriteStatement = (path: Path, context: UnminifyContext): Node | n
     switch (node.type) {
         case "ExpressionStatement": {
             const expression = node.expression;
-            if (expression.type === "UnaryExpression" && DISCARDABLE_UNARY.has(expression.operator)) {
-                const argument = expression.argument;
-                // `typeof x` doesn't throw for an undeclared global `x`; `x` does.
-                if (expression.operator === "typeof" && argument.type === "Identifier" && context.scopes.variableOf(argument) === undefined) {
-                    context.refused("keeps `typeof` of a name that may be undeclared", node);
-                    return undefined;
-                }
-                context.did("unaryStatements", node);
-                // What's left of `void 0;` does nothing at all.
-                if (argument.type === "Literal" && path.isInStatementList()) {
-                    path.remove();
-                    return null;
-                }
-                return at<Statement>({ type: "ExpressionStatement", expression: argument }, node);
-            }
-            if (expression.type === "LogicalExpression") {
-                if (expression.operator === "??") {
-                    context.refused("keeps `a ?? b;`: no plain `if` for it", node);
-                    return undefined;
-                }
-                context.did("logicalToIf", node);
-                const test = expression.operator === "&&" ? expression.left : not(expression.left, expression.left);
-                return at<Statement>({ type: "IfStatement", test, consequent: block([expressionStatement(expression.right)], expression.right), alternate: null }, node);
-            }
-            if (expression.type === "ConditionalExpression") {
-                context.did("ternaryToIf", node);
-                return at<Statement>(
-                    {
-                        type: "IfStatement",
-                        test: expression.test,
-                        consequent: block([expressionStatement(expression.consequent)], expression.consequent),
-                        alternate: block([expressionStatement(expression.alternate)], expression.alternate),
-                    },
-                    node
-                );
-            }
+            if (expression.type === "UnaryExpression" && DISCARDABLE_UNARY.has(expression.operator)) return discardUnary(path, node, expression, context);
+            if (expression.type === "LogicalExpression") return logicalToIf(node, expression, context);
+            if (expression.type === "ConditionalExpression") return ternaryToIf(node, expression, context);
             return undefined;
         }
-        case "IfStatement": {
-            // `if (c) {} else { b }` -> `if (!c) { b }`: c runs either way and b exactly when c is falsy.
-            const empty = node.consequent.type === "EmptyStatement" || (node.consequent.type === "BlockStatement" && node.consequent.body.length === 0);
-            if (!empty || node.alternate === null) break;
-            context.did("emptyBranches", node);
-            return at<Statement>({ type: "IfStatement", test: not(node.test, node.test), consequent: node.alternate, alternate: null }, node);
-        }
-        case "ReturnStatement": {
-            const argument = node.argument;
-            if (argument?.type !== "ConditionalExpression") return undefined;
-            context.did("ternaryToIf", node);
-            return at<Statement>({ type: "IfStatement", test: argument.test, consequent: returning(argument.consequent), alternate: returning(argument.alternate) }, node);
-        }
-        case "ForStatement":
-            if (node.init !== null || node.update !== null) break;
-            context.did("forToWhile", node);
-            return at<Statement>({ type: "WhileStatement", test: node.test ?? at<Expression>({ type: "Literal", value: true, raw: "true" }, node), body: node.body }, node);
+        case "ReturnStatement":
+            return returnTernaryToIf(node, context);
         case "FunctionExpression":
         case "FunctionDeclaration":
             inlineNestedIife(node, context);
             return undefined;
-        case "ArrowFunctionExpression": {
-            const body = node.body;
-            if (body.type !== "SequenceExpression") return undefined;
-            context.did("blockStatements", body);
-            const last = body.expressions.at(-1) as Expression;
-            const statements = [...body.expressions.slice(0, -1).map(expressionStatement), at<Statement>({ type: "ReturnStatement", argument: last }, last)];
-            node.body = block(statements, body) as typeof node.body;
-            node.expression = false;
+        case "ArrowFunctionExpression":
+            arrowSequenceBody(node, context);
             return undefined;
+        case "IfStatement": {
+            const inverted = invertEmptyThen(node, context);
+            if (inverted !== undefined) return inverted;
+            break;
+        }
+        case "ForStatement": {
+            const loop = forToWhile(node, context);
+            if (loop !== undefined) return loop;
+            break;
         }
         default:
             break;

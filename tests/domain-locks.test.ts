@@ -1,15 +1,11 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
 const LICENSED = "licensed.example";
 
-/** What a script leaves in `result` on the host it was licensed for. */
-const observed = (source: string): string => {
-    const context: Record<string, unknown> = { location: { hostname: LICENSED } };
-    runInNewContext(source, context);
-    return JSON.stringify(context.result);
-};
+/** On the host the script was licensed for. */
+const RUN: Run = { globals: () => ({ location: { hostname: LICENSED } }) };
 
 const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "domain-locks"] })).code;
 
@@ -53,8 +49,8 @@ describe("domain-locks", () => {
     it("answers tests of a host hash against literals as the licensed host passes them", async () => {
         const program = `${runtime()}${gate()}`;
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
-        expect(observed(program)).toBe('"licensed"');
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
+        expect(observe(program, RUN)).toBe('"licensed"');
         expect(output).toContain("if (true) {");
         expect(output).not.toContain("G.H.h(");
     });
@@ -67,7 +63,7 @@ describe("domain-locks", () => {
         ] as const) {
             const program = `${runtime()}if (${test}) {\n  result = "locked";\n} else {\n  result = "licensed";\n}\n`;
             const output = await run(program);
-            expect(observed(output)).toBe(observed(program));
+            expect(observe(output, RUN)).toBe(observe(program, RUN));
             expect(output).toContain(`if (${value}) {`);
         }
     });
@@ -75,22 +71,22 @@ describe("domain-locks", () => {
     it("keeps a conjunction of equalities, which the licensed host can pass", async () => {
         const program = `${runtime()}if (G.H.h(0, false, 5) === ${hash(LICENSED, 5)} && G.H.h(0, false, 9) === ${hash(LICENSED, 9)}) {\n  result = "licensed";\n} else {\n  result = "locked";\n}\n`;
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
-        expect(observed(program)).toBe('"licensed"');
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
+        expect(observe(program, RUN)).toBe('"licensed"');
     });
 
     it("keeps a comparison with a regular expression literal, which no hash equals", async () => {
         const program = `${runtime()}if (G.H.h(0, false, 5) === /x/) {\n  result = "licensed";\n} else {\n  result = "locked";\n}\n`;
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
-        expect(observed(program)).toBe('"locked"');
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
+        expect(observe(program, RUN)).toBe('"locked"');
     });
 
     it("keeps tests when the lock is used outside them, or the storage object is read with a computed key", async () => {
         for (const use of ["var seen = G.H.h(0, false, 3);", 'var key = "H";\nvar seen = G[key].h(0, false, 3);']) {
             const program = `${runtime()}${gate()}${use}\n`;
             const output = await run(program);
-            expect(observed(output)).toBe(observed(program));
+            expect(observe(output, RUN)).toBe(observe(program, RUN));
             expect(output).toContain(`if (G.H.h(0, false, 5) === ${hash(LICENSED, 5)} ||`);
         }
     });
@@ -100,48 +96,48 @@ describe("domain-locks", () => {
         const wrapper = 'G.W = function () { return typeof G.H.g === "function" ? G.H.g.apply(G.H, arguments) : G.H.g; };\n';
         const unused = `${builder}${wrapper}${gate()}`;
         const answered = await run(unused);
-        expect(observed(answered)).toBe(observed(unused));
+        expect(observe(answered, RUN)).toBe(observe(unused, RUN));
         expect(answered).toContain("if (true) {");
         const called = `${builder}${wrapper}${gate()}var seen = G.W();\n`;
         const kept = await run(called);
-        expect(observed(kept)).toBe(observed(called));
+        expect(observe(kept, RUN)).toBe(observe(called, RUN));
         expect(kept).toContain(`if (G.H.h(0, false, 5) === ${hash(LICENSED, 5)} ||`);
     });
 
     it("keeps tests whose hash reads nothing of the host", async () => {
         const program = `${runtime('"fixed text"')}${gate()}`;
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
         expect(output).toContain(`if (G.H.h(0, false, 5) === ${hash(LICENSED, 5)} ||`);
     });
 
     it("keeps tests whose hash reads a local that shadows a global object name", async () => {
         const program = `${runtime('(function (window) { return window.location.hostname; })({ location: { hostname: "fixed.example" } })')}${gate()}`;
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
-        expect(observed(program)).toBe('"locked"');
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
+        expect(observe(program, RUN)).toBe('"locked"');
     });
 
     it("keeps tests that also call a lock whose hash reads nothing of the host", async () => {
         const other = `G.J = function () {\n  return { h: function () { return 1; } };\n}();\n`;
         const program = `${runtime()}${other}${gate(`G.H.h(0, false, 5) === 1 || G.J.h(0) === 2`)}`;
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
-        expect(observed(program)).toBe('"locked"');
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
+        expect(observe(program, RUN)).toBe('"locked"');
     });
 
     it("keeps tests calling a method the builder doesn't give", async () => {
         const program = `${runtime()}try {\n${gate("G.H.missing(0, false, 5) === 1")}} catch (error) {\n  result = "threw";\n}\n`;
         const output = await run(program);
-        expect(observed(output)).toBe(observed(program));
-        expect(observed(program)).toBe('"threw"');
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
+        expect(observe(program, RUN)).toBe('"threw"');
     });
 
     it("keeps tests with a comparison that isn't a lock call with literal arguments", async () => {
         for (const first of ["G.H.h(0, false, seed) === 1", "G.H.h(0, false, 5) === other", "other === 1"]) {
             const program = `var seed = 5, other = 1;\n${runtime()}${gate(first)}`;
             const output = await run(program);
-            expect(observed(output)).toBe(observed(program));
+            expect(observe(output, RUN)).toBe(observe(program, RUN));
             expect(output).toContain(`if (${first} ||`);
         }
     });

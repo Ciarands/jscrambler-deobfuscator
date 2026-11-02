@@ -1,4 +1,3 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import type { IdentifierReference, Node } from "../src/core/ast.js";
 import type { Value } from "../src/core/evaluate.js";
@@ -6,6 +5,7 @@ import type { Answer, OuterBinding } from "../src/core/interpret.js";
 import { Interpreter } from "../src/core/interpret.js";
 import { parse } from "../src/core/parse.js";
 import { ScopeInfo } from "../src/core/scope.js";
+import { observe, serialize } from "./helpers.js";
 
 /** Top-level functions and literal constants of `source` are the outer bindings; unbound names are globals. */
 const interpreterFor = (source: string, aliases?: ReadonlyMap<string, ReadonlyMap<string, string>>) => {
@@ -33,8 +33,7 @@ const interpreterFor = (source: string, aliases?: ReadonlyMap<string, ReadonlyMa
 const agrees = (source: string, name: string, ...args: Value[]): Value => {
     const answer = interpreterFor(source)(name, args);
     if (!answer.ok) throw new Error(`no answer: ${answer.reason}`);
-    const expected: unknown = runInNewContext(`${source}\n${name}(...args)`, { args });
-    expect(Object.is(answer.value, expected), `${String(answer.value)} vs ${String(expected)}`).toBe(true);
+    expect(serialize(answer.value)).toBe(observe(`${source}\nresult = ${name}(...args);`, { globals: () => ({ args, result: undefined }) }));
     return answer.value;
 };
 

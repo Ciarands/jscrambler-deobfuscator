@@ -1,30 +1,20 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import type { Node } from "../src/core/ast.js";
 import { parse } from "../src/core/parse.js";
 import { traverse } from "../src/core/traverse.js";
 import { deobfuscate } from "../src/index.js";
 import { flatten, generate, mulberry32, runTrace } from "./fuzz/programs.js";
+import { observe, type Run } from "./helpers.js";
 
 const unminify = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["unminify"] })).code;
 
-const run = (code: string): unknown[] => {
-    const trace: unknown[] = [];
-    const context: Record<string, unknown> = { t: (x: unknown) => (trace.push(x), x) };
-    try {
-        runInNewContext(code, context, { timeout: 1000 });
-        trace.push(["result", context["result"]]);
-    } catch (error) {
-        trace.push(["threw", error instanceof Error ? error.constructor.name : String(error)]);
-    }
-    return trace;
-};
+const RUN: Run = { trace: true, timeout: 1000 };
 
 const sameBehaviour = async (input: string): Promise<string> => {
     const output = await unminify(input);
-    const expected = run(input);
-    expect(expected.at(-1)).not.toEqual(["threw", "SyntaxError"]);
-    expect(run(output)).toEqual(expected);
+    const expected = observe(input, RUN);
+    expect(expected).not.toContain("threw SyntaxError");
+    expect(observe(output, RUN)).toBe(expected);
     return output;
 };
 
@@ -351,11 +341,13 @@ describe("unminify", () => {
                 'var c = (function () { return (() => { "use strict"; return this; })(); })();',
                 // The arrow's `arguments` is its own variable, not the function's arguments object.
                 "var d = (function () { return (() => { var r = typeof arguments; var arguments = 3; return r; })(); })();",
-                "result = [a, b, typeof c, d];",
+                // A block function named `arguments` gives the arrow one of its own once it runs (Annex B).
+                "var e = (function () { return (() => { var r = typeof arguments; { function arguments() {} } return [r, typeof arguments]; })(); })();",
+                "result = [a, b, typeof c, d, e];",
             ].join("\n")
         );
         expect(output).toContain("var a = function () {\n  var x = t(1);");
-        expect(count(output, (node) => node.type === "ArrowFunctionExpression")).toBe(3);
+        expect(count(output, (node) => node.type === "ArrowFunctionExpression")).toBe(4);
     });
 
     it("turns a block left with `break label` from ifs into an if/else chain, not when other jumps name the label", async () => {
@@ -393,6 +385,16 @@ describe("unminify", () => {
                 "function forwarded(c, out) { out.push(typeof y); scoped: { let y = t(1); for (var j = 0; j < 2; j++) { if (j === c) break scoped; } out.push(y); } }",
                 "var log = [];\nforwarded(0, log);\nforwarded(5, log);",
                 "result = [chain(0), chain(1), log];",
+            ].join("\n")
+        );
+    });
+
+    it("keeps a labelled function of a removed label's block in a block of its own", async () => {
+        await sameBehaviour(
+            [
+                "function g() { var out = typeof f; l: { m: function f() { return 1; } var s = t(10); break l; } return [out, typeof f, s]; }",
+                "function h(c) { var out = typeof f; l: { m: function f() { return 1; } if (c) break l; out += t(2); } return [out, typeof f]; }",
+                "result = [g(), h(0), h(1)];",
             ].join("\n")
         );
     });
@@ -487,6 +489,14 @@ describe("unminify", () => {
         expect(output).toContain("    if (!(t(list[i]) > 3)) {\n      found = i;\n      break;\n    }\n    i += 1;\n  }");
         expect(output).toContain("while (n > c) {\n    c += t(1);\n  }\n  return c;");
         expect(output).toContain("if (n-- < 0) {\n        break outer;");
+    });
+
+    it("drops unreachable block functions with a function-wide placeholder only in sloppy code", async () => {
+        const body = "function h() { return t(f); } return h(); { function f() {} }";
+        const strict = await sameBehaviour(`globalThis.f = "global";\nfunction g() { "use strict"; ${body} }\nresult = g();`);
+        expect(strict).not.toContain("var f");
+        const sloppy = await sameBehaviour(`globalThis.f = "global";\nfunction g() { ${body} }\nresult = g();`);
+        expect(sloppy).toContain("var f;");
     });
 
     it("keeps random control flow behaving the same", async () => {

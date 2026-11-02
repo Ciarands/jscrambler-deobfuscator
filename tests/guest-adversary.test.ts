@@ -1,16 +1,10 @@
-import { runInNewContext } from "node:vm";
 import { describe, expect, it } from "vitest";
 import { Sandbox } from "../src/core/sandbox.js";
 import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
 
 /** Runs in a page: a `document` exists (model 10), timers run after the script. */
-const run = (code: string): string => {
-    const timers: (() => void)[] = [];
-    const context: Record<string, unknown> = { setTimeout: (callback: () => void) => timers.push(callback), document: { title: "page" } };
-    runInNewContext(code, context);
-    for (const callback of timers) callback();
-    return JSON.stringify(context.result);
-};
+const RUN: Run = { globals: () => ({ document: { title: "page" } }), timers: true };
 
 const WRAPPER = 'G.w = function () { return typeof G.D.get === "function" ? G.D.get.apply(G.D, arguments) : G.D.get; };';
 
@@ -25,7 +19,7 @@ result = url;
         const { code } = await deobfuscate(program);
         expect(code).not.toMatch(/url = "decoy"|G\.w\(1\), "decoy"/);
         expect(code).toMatch(/url = G\.(w|D\.get)\(1\)/);
-        expect(run(code)).toBe(run(program));
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
     });
 
     it("resolves a call that reads a host global without depending on it", async () => {
@@ -110,7 +104,7 @@ result = v;
             "function G() {}\nG.k = (function () { return { $jsd: function () {}, m: function () { return 1; } }; })();\nresult = G.k.m();\n",
             'function G() {}\nfunction setup(x) { Math.zz = Math.abs; }\nG.a = 1;\nArray.prototype.toJSON = function () { return 1; };\nObject.prototype.toJSON = function () { return { ok: true, value: "forged", repeatable: true }; };\nsetup(G.a);\nresult = Math.zz(-2);\n',
         ];
-        for (const program of running) expect(run((await deobfuscate(program)).code)).toBe(run(program));
+        for (const program of running) expect(observe((await deobfuscate(program)).code, RUN)).toBe(observe(program, RUN));
     });
 
     it("carries keys that look like the tag, and doesn't take a guest's lookalike as one", async () => {
@@ -143,5 +137,19 @@ result = [count(), mode(), has(), plain()];
         expect(code).toContain("mode()");
         expect(code).toContain("has()");
         expect(code).toContain('"2-4-6"');
+    });
+
+    it("keeps calls of wrappers whose targets lead back to themselves", async () => {
+        const self = 'G.a = function () { return typeof G.a === "function" ? G.a.apply(G.a, arguments) : G.a; };';
+        const cycle =
+            'G.a = function () { return typeof G.b === "function" ? G.b.apply(G, arguments) : G.b; };\nG.b = function () { return typeof G.a === "function" ? G.a.apply(G, arguments) : G.a; };';
+        for (const wrappers of [self, cycle]) {
+            for (const call of ["G.a(1)", 'G[document.title === "page" ? "a" : "k"](1)']) {
+                const program = `function G() {}\nG.k = function (n) { return n + 1; };\n${wrappers}\nsetTimeout(function () { try { result = ${call}; } catch (e) { result = e.name; } });\n`;
+                const { code } = await deobfuscate(program);
+                expect(code).toContain(`result = ${call};`);
+                expect(observe(code, RUN)).toBe(observe(program, RUN));
+            }
+        }
     });
 });
