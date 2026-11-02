@@ -8,12 +8,11 @@ import type { ScopeInfo, Variable } from "../../core/scope.js";
 import { traverse } from "../../core/traverse.js";
 import type { Path } from "../../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../../pipeline/pass.js";
-import { parentsWithin } from "../emulate/builders.js";
-import type { StorageEffects } from "../emulate/effects.js";
-import { storageAnalysis } from "../emulate/effects.js";
-import type { PropertyPath } from "../emulate/guest.js";
-import type { RuntimeModel } from "../emulate/model.js";
-import { RUNTIME } from "../emulate/model.js";
+import { parentsWithin } from "../runtime/builders.js";
+import type { StorageEffects } from "../runtime/effects.js";
+import { storageAnalysis } from "../runtime/effects.js";
+import type { PropertyPath, RuntimeModel } from "../runtime/model.js";
+import { RUNTIME } from "../runtime/model.js";
 import { LocalReads } from "./locals.js";
 import { EvaluationOrder } from "./order.js";
 import { recognize } from "./recognize.js";
@@ -53,8 +52,8 @@ const calculatorsPass = (bindArguments: boolean): Pass => ({
         : "Replace calculations of the runtime's calculator objects with the selected case's expression",
     run({ program, log, facts, scope }: PassContext): PassResult {
         const runtime = facts.get(RUNTIME);
-        if (runtime === undefined || runtime.guest.broken !== undefined) {
-            log.info("no usable runtime, nothing to do");
+        if (runtime === undefined) {
+            log.info("no runtime, nothing to do");
             return { changed: 0 };
         }
         const scopes = scope();
@@ -195,8 +194,8 @@ class CalculatorRewrite {
             if (calculator === undefined || receiver === undefined || receiver.length !== calculator.path.length || !startsWith(receiver, calculator.path)) continue;
             // The call reads `G.w` (a data property holding the wrapper), and the wrapper applies its target to `G.k`
             // through `Function.prototype.apply` (relies on model 7: builtins intact).
-            const info = this.runtime.guest.inspect([key]);
-            if (info?.data !== true || info.type !== "function") continue;
+            const info = this.effects.snapshot.typeAt([key]);
+            if (typeof info === "string" || info.type !== "function") continue;
             wrapperOf.set(key, { calculator, method: wrapper.target.at(-1) as string });
             wrapperDefinitions.set(wrapper.definition, calculator);
         }

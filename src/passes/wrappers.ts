@@ -6,10 +6,10 @@ import { sameItems } from "../core/list.js";
 import { traverse } from "../core/traverse.js";
 import { factKey } from "../pipeline/facts.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
-import type { PropertyPath } from "./emulate/guest.js";
-import { RUNTIME } from "./emulate/model.js";
-import type { StorageEffects } from "./emulate/effects.js";
-import { storageAnalysis } from "./emulate/effects.js";
+import type { PropertyPath } from "./runtime/model.js";
+import { RUNTIME } from "./runtime/model.js";
+import type { StorageEffects } from "./runtime/effects.js";
+import { storageAnalysis } from "./runtime/effects.js";
 
 /**
  * How many wrappers runs rewrote calls. Wrappers is the one pass that makes wrapper call sites (direct calls of a
@@ -58,8 +58,8 @@ const reorderingRisk = (call: CallExpression, target: PropertyPath, site: Node, 
  *   the same only when reading T runs no code and the arguments can't change T (`reorderingRisk`).
  * - Value targets: only `G.w()` -> `T`.
  *
- * The kind is the snapshot's, so only where nothing writes `G.w`, T or a prefix after the prelude. The site's own
- * storage reference roots the inlined path, so no shadowable name is introduced.
+ * The kind is `Snapshot`'s (every value the builder's code may put at T), so only where nothing writes `G.w`, T or a
+ * prefix after the prelude. The site's own storage reference roots the inlined path, so no shadowable name is introduced.
  */
 export const wrappers: Pass = {
     name: "wrappers",
@@ -70,20 +70,16 @@ export const wrappers: Pass = {
             log.info("no wrappers known, nothing to do");
             return { changed: 0 };
         }
-        const { guest, storage } = runtime;
+        const { storage } = runtime;
         const scopes = scope();
         const { matcher, effects } = storageAnalysis(program, runtime, scopes, log);
 
         const kinds = new Map<string, { kind: "function" | "value"; target: PropertyPath }>();
         for (const [key, wrapper] of runtime.wrappers) {
             const name = `${storage}.${wrapper.target.join(".")}`;
-            const info = guest.inspect(wrapper.target);
-            if (info === undefined) {
-                log.debug(`wrapper ${key}: can't read ${name}, left`, wrapper.definition);
-                continue;
-            }
-            if (!info.data) {
-                log.debug(`wrapper ${key}: ${name} is reached through an accessor, left`, wrapper.definition);
+            const info = effects.snapshot.typeAt(wrapper.target);
+            if (typeof info === "string") {
+                log.debug(`wrapper ${key}: what ${name} holds can't be told (${info}), left`, wrapper.definition);
                 continue;
             }
             const isFunction = info.type === "function";

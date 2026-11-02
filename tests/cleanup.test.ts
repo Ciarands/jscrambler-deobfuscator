@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
+import { createLogger } from "../src/logger.js";
 import { observe, type Run } from "./helpers.js";
 
 // Miniature runtime: a decoder whose stage calls shuffle the table until a non-stage call freezes it, a wrapper, and
@@ -55,8 +56,9 @@ describe("cleanup", () => {
     });
 
     it("removes stores of the runtime as a global the program never names, and keeps one it reads back", async () => {
-        // Also a definition made through the store: `(globalThis.P = G).k = v`.
-        const program = `${RUNTIME}globalThis.Kept = G;\n(globalThis.Chained = G).x = function () { return G.D; };\nf(host);\nresult = out;\n`;
+        // Also a definition made through the store: `(globalThis.P = G).k = v` (one that doesn't hand out the decoder's
+        // holder, which would leave the decoder unproven).
+        const program = `${RUNTIME}globalThis.Kept = G;\n(globalThis.Chained = G).x = function () { return 2; };\nf(host);\nresult = out;\n`;
         const { code } = await deobfuscate(program);
         expect(observe(code, RUN)).toBe(observe(program, RUN));
         expect(code).not.toMatch(/\bG\b|Kept|Chained/);
@@ -68,6 +70,39 @@ describe("cleanup", () => {
             const kept = await deobfuscate(readBack);
             expect(observe(kept.code, RUN)).toBe(observe(readBack, RUN));
         }
+    });
+
+    it("removes a templated decoder's builder that only its build on the host shows changes nothing outside it", async () => {
+        // `f(...)` calls String.fromCharCode through a local: the locality analysis can't tell it, the interpreter can.
+        const program = `
+function G() {}
+G.D = (function () {
+  var Q = {
+    m: (function (key) {
+      var T = "";
+      var f = String.fromCharCode;
+      T += "a,b,c,d,e,f" + f(44, 103);
+      T = T.split(",");
+      var R = 0;
+      var S = function (x) {
+        if (R === 0 && x === 2) { R += 1; T.unshift.apply(T, T.splice(-2, 2).splice(0, 1)); }
+        else if (R === 1 && x === 4) { R += 1; T.unshift.apply(T, T.splice(-3, 3).splice(0, 2)); }
+        else { Q.m = L; return L(x); }
+        return R;
+      };
+      var L = function (y) { return T[y]; };
+      return S;
+    })("k")
+  };
+  return Q;
+})();
+G.w = function () { return typeof G.D.m === "function" ? G.D.m.apply(G.D, arguments) : G.D.m; };
+var flag = G.w(2) === 1 && G.w(4) === 2;
+setTimeout(function () { result = [flag, G.w(3)]; });
+`;
+        const { code } = await deobfuscate(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).not.toMatch(/\bG\b/);
     });
 });
 
@@ -92,7 +127,7 @@ describe("cleanup: aliases of the storage object", () => {
         ];
         for (const body of bodies) {
             const program = withAliases(body);
-            const { code } = await deobfuscate(program, { passes: ["emulate", "cleanup"] });
+            const { code } = await deobfuscate(program, { passes: ["runtime", "cleanup"] });
             expect(observe(code, RUN)).toBe(observe(program, RUN));
             expect(code).not.toMatch(/\b[st]\b|\bp\.k\b/);
         }
@@ -114,7 +149,7 @@ describe("cleanup: aliases of the storage object", () => {
         };
         for (const [name, body] of Object.entries(cases)) {
             const program = withAliases(body);
-            const { code } = await deobfuscate(program, { passes: ["emulate", "cleanup"] });
+            const { code } = await deobfuscate(program, { passes: ["runtime", "cleanup"] });
             expect(observe(code, RUN), name).toBe(observe(program, RUN));
             expect(code, name).toMatch(/\b[st] = /);
         }
@@ -122,7 +157,7 @@ describe("cleanup: aliases of the storage object", () => {
 
     it("keeps every alias when the storage function is reassigned", async () => {
         const program = withAliases(`function f() { var s = G; G = { k: "other" }; return s.k; }`);
-        const { code } = await deobfuscate(program, { passes: ["emulate", "cleanup"] });
+        const { code } = await deobfuscate(program, { passes: ["runtime", "cleanup"] });
         expect(observe(code, RUN)).toBe(observe(program, RUN));
         expect(code).toContain("return s.k;");
     });
@@ -141,14 +176,22 @@ const withBranch = (branch: string) => `
 })();
 `;
 
-const rewrite = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "simplify", "cleanup"] })).code;
+const rewrite = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["runtime", "simplify", "cleanup"] })).code;
 
 describe("cleanup: statement facts across rewrites", () => {
-    it("removes a definition whose statement was seen pure and replaced by one equivalent statement", async () => {
-        const input = withBranch("G.k = (put(), delete String.x, 1);");
+    it("removes a definition a rewrite replaced, once the new statement shows no effect outside objects it makes", async () => {
+        const input = withBranch("G.k = (function () { var o = {}; o.x = 42; delete o.x; return 1; })();");
         const code = await rewrite(input);
         expect(observe(code, RUN)).toBe(observe(input, RUN));
         expect(code).not.toContain("G.k");
+    });
+
+    it("keeps a definition whose effects on a builtin cancel out only where the property didn't exist before", async () => {
+        // Writing String.x and deleting it again changes nothing only if nothing had defined String.x: the host may have.
+        const input = withBranch("G.k = (put(), delete String.x, 1);");
+        const code = await rewrite(input);
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
+        expect(code).toContain("G.k = (put(), delete String.x, 1);");
     });
 
     it("doesn't take a statement split in parts for pure part by part", async () => {
@@ -186,7 +229,7 @@ describe("cleanup: stage calls", () => {
     it("removes stage calls whose function changes only its builder's state", async () => {
         for (const method of ["n += x;", "T.push(x); n = T.length;"]) {
             const program = withStage({ method });
-            const { code } = await deobfuscate(program, { passes: ["emulate", "cleanup"] });
+            const { code } = await deobfuscate(program, { passes: ["runtime", "cleanup"] });
             expect(observe(code, RUN), method).toBe(observe(program, RUN));
             expect(code, method).not.toMatch(/G\.k|G\.w/);
         }
@@ -212,7 +255,7 @@ describe("cleanup: stage calls", () => {
         };
         for (const [name, options] of Object.entries(cases)) {
             const program = withStage(options);
-            const { code } = await deobfuscate(program, { passes: ["emulate", "cleanup"] });
+            const { code } = await deobfuscate(program, { passes: ["runtime", "cleanup"] });
             expect(observe(code, RUN), name).toBe(observe(program, RUN));
             expect(code, name).toContain("G.w(4);");
         }
@@ -446,3 +489,106 @@ describe("cleanup: dead stores", () => {
         expect(code).toContain('var a = "keyCode";\nvar b = "href";\nvar e = "done", f = 1, f;\nvar g = "old", g = read();\nvar h = 0;\nresult');
     });
 });
+
+// A builder probing the page: host functions it binds or prints, a fresh error with accessors, a guarded `require`.
+const probing = (body: string) => `
+function G() {}
+var count = 0;
+G.k = (function () {
+${body}
+  return { n: 1 };
+})();
+G.n = 2;
+setTimeout(function () { result = [G.n, count]; });
+`;
+
+const PAGE: Run = { globals: () => ({ bump: () => 1 }), timers: true };
+
+describe("cleanup: builders on a web page (models 7, 10)", () => {
+    it("removes a builder that only binds and prints host functions and defines accessors on a fresh error", async () => {
+        const program = probing(`  var later = globalThis.setTimeout.bind(globalThis);
+  var native = globalThis.setTimeout.toString().indexOf("native") !== -1;
+  var reads = 0;
+  var make = globalThis.Error;
+  var error = Object.defineProperties((1, make)(), { message: { get: function () { reads++; return ""; } } });
+  var push = Array.prototype.push;
+  var list = [];
+  push.call(list, native, error);`);
+        const { code } = await deobfuscate(program, { passes: ["runtime", "cleanup"] });
+        expect(observe(code, PAGE)).toBe(observe(program, PAGE));
+        expect(code).not.toContain("G.k");
+    });
+
+    it("removes a builder whose require calls a try or a typeof test keeps from running (a page has no require)", async () => {
+        const program = probing(`  var inspector;
+  try { inspector = require("inspector"); } catch (e) { inspector = globalThis; }
+  var open = typeof require === "function" && require("inspector").url();`);
+        const { code } = await deobfuscate(program, { passes: ["runtime", "cleanup"] });
+        expect(observe(code, PAGE)).toBe(observe(program, PAGE));
+        expect(code).not.toContain("G.k");
+    });
+
+    it("removes it too when the program's own objects get keys no copy can put on the global object", async () => {
+        // `k` comes from a callback's parameter: key-sets can't tell it, but `grid[1]` is a fresh array (model 7).
+        for (const own of [
+            'var own = [];\nown[["req", "uire"].join("")] = function () { count++; };\nown.forEach(function () {});\nObject.assign({}, { a: 1 });',
+            'var grid = Array(2).fill().map(function () { return Array(2).fill(0); });\n[["req", "uire"].join("")].forEach(function (k) { grid[1][k] = function () { count++; }; });\nvar sum = grid[0][0] + grid[1][1];',
+        ]) {
+            const program = requiring(own);
+            const { code } = await deobfuscate(program, { passes: ["runtime", "cleanup"] });
+            expect(observe(code, PAGE), own).toBe(observe(program, PAGE));
+            expect(code, own).not.toContain("G.k");
+        }
+    });
+
+    it("keeps a builder whose guarded require may call one the program made a global", async () => {
+        const maker = "function (x) { count++; return { url: function () {} }; }";
+        const grid = (made: string, after = "") => `var grid = ${made};\n${after}[["req", "uire"].join("")].forEach(function (k) { grid[0][k] = ${maker}; });`;
+        const cases: readonly (readonly [string, string])[] = [
+            [`globalThis.require = ${maker};`, "it names require as a property"],
+            [`require = ${maker};`, "it writes the global require"],
+            [`var name = "req" + "uire";\nglobalThis[name] = ${maker};`, "a computed key that may be require"],
+            [`Object.defineProperty(globalThis, ["req", "uire"].join(""), { value: ${maker}, configurable: true, writable: true });`, "a computed key that may be require"],
+            [`Object["define" + "Property"](globalThis, ["req", "uire"].join(""), { value: ${maker}, configurable: true, writable: true });`, "a computed key that may be require"],
+            [`var how = [function () { return "set"; }][0]();\nReflect[how](globalThis, "req" + "uire", ${maker});`, "a call by a computed name may be a property-defining builtin's"],
+            [`var own = {};\nown[["req", "uire"].join("")] = ${maker};\nObject.assign(globalThis, own);`, "a computed key that may be require"],
+            [`Object.defineProperty.call(null, globalThis, ["req", "uire"].join(""), { value: ${maker}, configurable: true, writable: true });`, "a computed key that may be require"],
+            [
+                `Object.defineProperty.apply(null, [globalThis, ["req", "uire"].join(""), { value: ${maker}, configurable: true, writable: true }]);`,
+                "a property-defining call's arguments can't be told",
+            ],
+            [`var own = {};\nown[["req", "uire"].join("")] = ${maker};\nObject.setPrototypeOf(globalThis, [own][0]);`, "a copy takes keys from a value it can't tell"],
+            [`Object.assign(globalThis, Object.fromEntries([[["req", "uire"].join(""), ${maker}]]));`, "a copy takes keys from a value it can't tell"],
+            [`var own = {};\nown[["req", "uire"].join("")] = ${maker};\nvar copy = { a: 1, ...own };\nObject.assign(globalThis, copy);`, "a computed key that may be require"],
+            [`var own = {};\nown[["req", "uire"].join("")] = ${maker};\nglobalThis.__proto__ = own;`, "a computed key that may be require"],
+            [`var own = {};\nown[["req", "uire"].join("")] = ${maker};\nglobalThis["__pro" + "to__"] = own;`, "a computed key that may be __proto__"],
+            [grid("Array(1).fill().map(function () { return []; })", "grid[0] = globalThis;\n"), "a computed key that may be require"],
+            [grid("Array(1).fill().map(function () { return globalThis; })"), "a computed key that may be require"],
+            [grid("Array(globalThis)"), "a computed key that may be require"],
+            [grid("[{}]", "Object.setPrototypeOf(globalThis, (0, grid[0]));\n"), "a copy takes keys from a value it can't tell"],
+        ];
+        for (const [make, reason] of cases) {
+            const program = requiring(make);
+            const lines: string[] = [];
+            const { code } = await deobfuscate(program, { passes: ["runtime", "cleanup"], logger: createLogger("debug", (line) => lines.push(line)) });
+            expect(observe(code, PAGE), make).toBe(observe(program, PAGE));
+            expect(code, make).toContain("G.k = ");
+            expect(
+                lines.some((line) => line.includes(`calls require, which the program may make a global: ${reason}`)),
+                make
+            ).toBe(true);
+        }
+    });
+
+    it("keeps a builder calling a global it can't tell", async () => {
+        const program = probing("  count = bump();");
+        const { code } = await deobfuscate(program, { passes: ["runtime", "cleanup"] });
+        expect(observe(code, PAGE)).toBe(observe(program, PAGE));
+        expect(code).toContain("G.k = ");
+    });
+});
+
+/** `probing` with a guarded `require` in the builder, and `make` before it. */
+const requiring = (make: string): string =>
+    probing(`  try { require("inspector"); } catch (e) {}
+  var open = typeof require === "function" && require("inspector").url();`).replace("var count = 0;", `var count = 0;\n${make}`);

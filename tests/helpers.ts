@@ -6,7 +6,7 @@ import { traverse } from "../src/core/traverse.js";
 export interface Run {
     /** Host values the program sees as globals, made afresh for each run so no run sees what another left. */
     readonly globals?: () => Record<string, unknown>;
-    /** Code run first in the program's own realm, for stand-ins that must be guest objects. */
+    /** Code run first in the program's own realm, for stand-ins that must be that realm's objects. */
     readonly prelude?: string;
     /** `window` is the global object, as in a page. */
     readonly window?: boolean;

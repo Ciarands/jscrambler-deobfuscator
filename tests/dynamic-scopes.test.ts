@@ -89,7 +89,7 @@ setTimeout(function () {
   result = [S[1], early, grab(3, 1)];
 });
 `;
-        expect(await sameBehaviour(program, { passes: ["emulate", "calculators", "calculators-bound"] })).toContain("G.s(0);");
+        expect(await sameBehaviour(program, { passes: ["runtime", "calculators", "calculators-bound"] })).toContain("G.s(0);");
     });
 
     it("code-locks leave a lock whose holder array a function calling eval hands on", async () => {
@@ -113,6 +113,6 @@ G.L = function () {
 G.L.check();
 setTimeout(function () { tamper(); log.push(G.L.check()); result = log; });
 `;
-        expect(await sameBehaviour(program, { passes: ["emulate", "code-locks"] })).toContain("log.push(G.L.check());");
+        expect(await sameBehaviour(program, { passes: ["runtime", "code-locks"] })).toContain("log.push(G.L.check());");
     });
 });

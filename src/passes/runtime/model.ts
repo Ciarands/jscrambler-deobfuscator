@@ -1,7 +1,10 @@
 import type { Node } from "../../core/ast.js";
-import type { Value } from "../../core/evaluate.js";
 import { factKey } from "../../pipeline/facts.js";
-import type { BuiltIdentities, CallStyle, Guest, LoggedCall, PropertyPath } from "./guest.js";
+
+/** From the global object for builtins (`[]` is the global object), from the storage object for the runtime. */
+export type PropertyPath = readonly string[];
+
+export const pathName = (path: PropertyPath): string => (path.length === 0 ? "globalThis" : path.join("."));
 
 /** A property the obfuscator's setup function added to a builtin, standing in for an existing one. */
 export interface Alias {
@@ -11,12 +14,23 @@ export interface Alias {
     readonly original: string;
 }
 
+/**
+ * `"static"`: `G.alias(a)` is `Owner.original(a)`; `"method"`: `G.alias(x, a)` is `x.original(a)`; `"call"`:
+ * `G.alias(x, a)` is `Owner.original.call(x, a)`.
+ */
+export type CallStyle = "static" | "method" | "call";
+
 /** A storage getter handing out a builtin: `G.alias()` is the builtin; arguments are passed on per `style`. */
 export interface CallAlias {
     readonly key: string;
     readonly owner: PropertyPath;
     readonly original: string;
     readonly style: CallStyle;
+    /**
+     * `"method"` with `x` `null` or `undefined`: the call may go on (to another builtin) where `x.original(a)` throws,
+     * so it stands for that only where `x` is neither.
+     */
+    readonly nullishCalls: boolean;
 }
 
 /** `G.name = function () { return typeof T === "function" ? T.apply(O, arguments) : T; }`, with T and O as storage paths. */
@@ -24,7 +38,11 @@ export interface Wrapper {
     readonly key: string;
     readonly target: PropertyPath;
     readonly receiver: PropertyPath | undefined;
-    /** For log lines. */
+    /**
+     * The root statement assigning the wrapper's function, as the analyses use it: ordered against other statements
+     * (`decoder.ts`), its function read for the receiver (`effects.ts`), kept or removed with the wrapper (`cleanup.ts`,
+     * `storage-usage.ts`, calculators).
+     */
     readonly definition: Node;
 }
 
@@ -33,6 +51,7 @@ export interface RuntimeModel {
     readonly storage: string;
     /** The program, or the lone top-level IIFE, whose scope declares the storage binding. */
     readonly root: Node;
+    /** Storage keys holding the global object after the prelude (`getters.ts`'s slots, `index.ts`'s `globalKeysOf`). */
     readonly globalKeys: ReadonlySet<string>;
     readonly aliases: readonly Alias[];
     /**
@@ -44,40 +63,35 @@ export interface RuntimeModel {
     /** `G.key()` is `globalThis[name]`; by key, the global property's name. */
     readonly globalReads: ReadonlyMap<string, string>;
     /**
-     * Setup globals forwarding to a host global the guest lacks (`document`): reads/writes go to `globalThis[name]`
-     * (model 7 covers the host's own properties). By alias name.
+     * Setup globals forwarding to a host global the builtins lack (`document`): reads/writes go to `globalThis[name]`
+     * (model 10: the host's globals exist). By alias name.
      */
     readonly hostAliases: ReadonlyMap<string, string>;
     readonly wrappers: ReadonlyMap<string, Wrapper>;
-    /** Keyed by node: a site a later pass replaces loses its result (resolve-calls logs how many). */
-    readonly callResults: ReadonlyMap<Node, Value>;
-    /** Calls whose sites are ambiguous. */
-    readonly unmappedCalls: readonly LoggedCall[];
-    /** The logged call behind each site in `callResults` (and sites whose result wasn't a primitive), by node like it. */
-    readonly siteCalls: ReadonlyMap<Node, LoggedCall>;
-    /** Wrapper calls made while the guest still matched a real run, in order: the runtime's real state evolution. */
-    readonly preludeCalls: readonly LoggedCall[];
-    /** Identities of what root `G.k = (function () {...})()` statements stored, and of its methods. By node, as `setup`. */
-    readonly built: ReadonlyMap<Node, BuiltIdentities>;
-    /** Root statements that changed nothing outside the storage object. By node, as `setup`. */
-    readonly pure: ReadonlySet<Node>;
     /**
-     * Root call statements that defined aliases. A statement replaced by one equivalent statement keeps it
-     * (`Facts.replaced`); one split or removed loses it.
+     * Root `G.k = ...` statements whose right side changes no builtin, global or storage property (`getters.ts`'s
+     * evaluator). By node, as `setup`.
+     */
+    readonly local: ReadonlySet<Node>;
+    /**
+     * Root call statements that defined aliases or storage properties. A statement replaced by one equivalent statement
+     * keeps it (`Facts.replaced`); one split or removed loses it.
      */
     readonly setup: ReadonlySet<Node>;
-    /** Storage keys the setup calls installed (call-alias getters, probed or not). */
+    /** Storage keys the setup calls define, whatever the property (call-alias getters, proven or not, and data properties). */
     readonly setupKeys: ReadonlySet<string>;
-    /** Setup keys whose calls provably never use `G` as `this` (`GetterProofs.thisFree`). */
+    /**
+     * Names the setup calls add to what `G`, a function, inherits (`Function.prototype`, `Object.prototype`), whatever
+     * the property: aliases, or not.
+     */
+    readonly inheritedKeys: ReadonlySet<string>;
+    /** Setup keys whose calls provably never use `G` as `this` (`getters.ts`). */
     readonly thisFreeKeys: ReadonlySet<string>;
     /**
      * Global properties the setup calls added. The setup call stays while the program names one: app code reaches
      * them only by name (model 9), other scripts not at all (model 2).
      */
     readonly setupGlobals: ReadonlySet<string>;
-    /** Root statements the guest ran to completion (including their `Facts.replaced` replacements). */
-    readonly executed: ReadonlySet<Node>;
-    readonly guest: Guest;
 }
 
 export const RUNTIME = factKey<RuntimeModel>("runtime");

@@ -3,9 +3,9 @@ import { identifier } from "../core/build.js";
 import type { PassLog } from "../core/log.js";
 import type { Reference, ScopeInfo, Variable } from "../core/scope.js";
 import { traverse } from "../core/traverse.js";
-import type { RuntimeModel } from "./emulate/model.js";
-import type { StorageMatcher } from "./emulate/storage.js";
-import { rootStatements } from "./emulate/storage.js";
+import type { RuntimeModel } from "./runtime/model.js";
+import type { StorageMatcher } from "./runtime/storage.js";
+import { rootStatements } from "./runtime/storage.js";
 
 const asFunction = (node: Node): FunctionLike | undefined => (node.type === "FunctionExpression" || node.type === "FunctionDeclaration" || node.type === "ArrowFunctionExpression" ? node : undefined);
 

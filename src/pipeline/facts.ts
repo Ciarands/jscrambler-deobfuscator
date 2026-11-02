@@ -14,7 +14,6 @@ export type ReplacementListener = (originals: readonly Node[], replacements: rea
 
 export class Facts {
     readonly #values = new Map<string, unknown>();
-    readonly #cleanups: (() => void)[] = [];
     readonly #replacementListeners: ReplacementListener[] = [];
 
     get<T>(key: FactKey<T>): T | undefined {
@@ -23,10 +22,6 @@ export class Facts {
 
     set<T>(key: FactKey<T>, value: T): void {
         this.#values.set(key.name, value);
-    }
-
-    onDispose(cleanup: () => void): void {
-        this.#cleanups.push(cleanup);
     }
 
     /**
@@ -39,9 +34,5 @@ export class Facts {
 
     onReplace(listener: ReplacementListener): void {
         this.#replacementListeners.push(listener);
-    }
-
-    dispose(): void {
-        for (const cleanup of this.#cleanups.splice(0)) cleanup();
     }
 }

@@ -4,7 +4,7 @@ import { observe, type Run } from "./helpers.js";
 
 const RUN: Run = { timers: true };
 
-const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "code-locks"] })).code;
+const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["runtime", "code-locks"] })).code;
 
 // A builder returns an object whose method runs its checks once, then answers from a cache.
 const lock = ({ extra = "", slowAnswer = 91, firstCall = "G.L.check();", setCache = "c[6] = 15;" } = {}) => `
@@ -56,7 +56,7 @@ describe("code-locks", () => {
     });
 });
 
-const runWithCleanup = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "code-locks", "cleanup"] })).code;
+const runWithCleanup = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["runtime", "code-locks", "cleanup"] })).code;
 
 // A lock whose checks touch only objects they create; the failing path is a scoring loop that hangs.
 const localLock = ({ checks = "", before = "", prelude = "G.L.check();" } = {}) => `

@@ -58,7 +58,7 @@ G.D = (function () {
 G.w = function () { return typeof G.D.m === "function" ? G.D.m.apply(G.D, arguments) : G.D.m; };
 G.v = function () { return typeof G.D.m === "function" ? G.D.m.apply(G.D, arguments) : G.D.m; };
 `;
-const deobfuscated = async (program: string): Promise<string> => (await deobfuscate(program, { passes: ["emulate", "resolve-calls"] })).code;
+const deobfuscated = async (program: string): Promise<string> => (await deobfuscate(program, { passes: ["runtime", "resolve-calls"] })).code;
 const prelude = "var flag = G.w(2) === 1 && G.v(4) === 2;\nvar first = G.w(1);\n";
 // What a run sees, including whether the decoder still froze (G.D.m is L) and the table's order at runtime.
 const later = "setTimeout(function () { result = [flag, first, second, G.w(host.k), G.v(5), G.D.m.name, hits]; });\n";
@@ -116,9 +116,9 @@ describe("resolve-calls", () => {
         }
     });
 
-    it("keeps later calls of targets not proven free of effects, whatever the sandbox answers", async () => {
-        const { code } = await deobfuscate(PROGRAM, { passes: ["emulate", "resolve-calls"] });
-        expect(code).toContain("var flag = (G.w(7), 1) === 1;");
+    it("keeps calls of targets not proven free of effects, prelude ones too", async () => {
+        const { code } = await deobfuscate(PROGRAM, { passes: ["runtime", "resolve-calls"] });
+        expect(code).toContain("var flag = G.w(7) === 1;");
         expect(code).toContain("out.push(G.w(i), G.w(1), G.w(k), G.n());");
         expect(observe(code, RUN)).toBe(observe(PROGRAM, RUN));
         // A settled decoder the prelude replaced afterwards: its replacement's calls give the same twice, and count.
@@ -135,8 +135,8 @@ describe("resolve-calls", () => {
         expect(code).toContain("result = G.v(0);");
     });
 
-    it("records no results after a runtime statement fails partway: the guest may no longer match a real run", async () => {
-        // The guest lacks `host`: `G.k = ...` throws after `G.s` is set, where a real run sets `G.k` to 2.
+    it("keeps a call of a target whose state a runtime statement reading a host global changes", async () => {
+        // `G.k = ...` sets `G.s`, then reads `host`, which a real run has and the deobfuscator doesn't model.
         const program = `function G() {}
 G.D = { m: function () { return "v" + G.s + G.k; } };
 G.w = function () { return typeof G.D.m === "function" ? G.D.m.apply(G.D, arguments) : G.D.m; };
@@ -188,7 +188,7 @@ result = [v];
         expect(code).toMatch(/var second = \(G\.v\(0\), "[a-f]"\);/);
     });
 
-    it("keeps prelude calls when the decoder doesn't follow the template", async () => {
+    it("leaves calls alone when the decoder doesn't follow the template", async () => {
         const shapes = [
             { lookup: "hits++; return T[y];" },
             // The table leaks out of the decoder: code holding it can change it.
@@ -198,32 +198,33 @@ result = [v];
             const program = `${decoder(shape)}${prelude}var second = G.v(0);\n${later.replace("hits]", "hits, G.leak && G.leak().reverse(), G.v(5)]")}`;
             const code = await deobfuscated(program);
             expect(observe(code, RUN)).toBe(observe(program, RUN));
-            expect(code).toMatch(/var second = \(G\.v\(0\), "[a-f]"\);/);
+            expect(code).toContain("var flag = G.w(2) === 1 && G.v(4) === 2;");
+            expect(code).toContain("var second = G.v(0);");
         }
     });
 
-    it("keeps prelude calls that found another function or holder than the decoder's", async () => {
+    it("settles no decoder whose holder or method the prelude replaces or hands on, keeping the calls it ordered", async () => {
         const replacements = [
             'G.D.m = function (y) { hits++; return "z"; };\n',
-            // Another holder for the stage function: the freeze writes the old holder, which the guest doesn't watch.
+            // Another holder for the stage function: the freeze writes the old holder.
             "var old;\n(function () { old = G.D; G.D = { m: old.m }; })();\n",
         ];
         for (const replacement of replacements) {
             const program = `${decoder()}var flag = G.w(2) === 1 && G.v(4) === 2;\n${replacement}var first = G.w(1);\nvar second = G.v(0);\nsetTimeout(function () { result = [first, second, G.w(host.k), G.D.m.name, typeof old === "object" && old.m.name, hits]; });\n`;
             const code = await deobfuscated(program);
             expect(observe(code, RUN)).toBe(observe(program, RUN));
-            expect(code).toMatch(/var first = \(G\.w\(1\), "[a-z]"\);/);
+            expect(code).toContain("var flag = (G.w(2), 1) === 1 && (G.v(4), 2) === 2;");
+            expect(code).toContain("var first = G.w(1);");
         }
     });
 
-    it("resolves sites of prelude calls it couldn't place only when each was a lookup on the settled decoder", async () => {
-        // The calls inside `map` callbacks don't line up with call sites: the guest saw them, but not where they are.
+    it("resolves no call of a decoder the prelude may call where its order can't be told", async () => {
+        // The calls inside `map` callbacks run in a builtin: the walk stops there, before the decoder settles.
         const program = `${decoder()}var flag = [2].map(function (i) { return G.w(i); })[0] === 1 && G.v(4) === 2;\nvar first = G.w(1);\nvar list = [3, 5].map(function (i) { return G.w(i); });\nsetTimeout(function () { result = [flag, first, list, G.w(3), G.w(2), G.v(4), G.w(host.k)]; });\n`;
         const code = await deobfuscated(program);
         expect(observe(code, RUN)).toBe(observe(program, RUN));
-        // G.w(3) was made only as a lookup; G.w(2) and G.v(4) were stage calls: their sites may be those calls.
-        expect(code).toMatch(/result = \[flag, first, list, "[a-f]", G\.w\(2\), G\.v\(4\), G\.w\(host\.k\)\]/);
-        expect(code).toContain("=== 1 && G.v(4) === 2;");
+        expect(code).toContain("result = [flag, first, list, G.w(3), G.w(2), G.v(4), G.w(host.k)]");
+        expect(code).toContain("var first = G.w(1);");
     });
 
     it("resolves calls of a settled decoder whose arguments only become constant in the simplify group", async () => {

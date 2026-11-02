@@ -14,7 +14,7 @@ import { scopeWithin } from "../core/scope.js";
 import { replaceNodes, traverse } from "../core/traverse.js";
 import { factKey } from "../pipeline/facts.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
-import { RUNTIME } from "./emulate/model.js";
+import { RUNTIME } from "./runtime/model.js";
 
 /** A pass may have created these since the scope analysis (`valueToNode`). */
 const VALUE_NAMES: ReadonlySet<string> = new Set(["undefined", "NaN", "Infinity"]);

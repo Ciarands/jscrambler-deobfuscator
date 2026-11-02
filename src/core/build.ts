@@ -52,7 +52,7 @@ export const valueToNode = (value: Primitive, position: At, names?: DeclaredName
         return { type: "Literal", value, raw: null, ...pos } as Expression;
     }
     if (value === null) return { type: "Literal", value: null, raw: "null", ...pos } as Expression;
-    // The type says primitive; a value that got here untyped (a prototype lookup, a guest object) would print as `null`.
+    // The type says primitive; a value that got here untyped (a prototype lookup, an interpreter object) would print as `null`.
     if (typeof value !== "string" && typeof value !== "boolean") throw new TypeError(`valueToNode: not a primitive (${typeof value})`);
     return { type: "Literal", value, raw: null, ...pos } as Expression;
 };

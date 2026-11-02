@@ -4,12 +4,11 @@ import { at } from "../core/build.js";
 import type { ScopeInfo } from "../core/scope.js";
 import type { Path } from "../core/traverse.js";
 import { replaceNodes, traverse } from "../core/traverse.js";
-import { parentsWithin } from "./emulate/builders.js";
-import type { StorageEffects } from "./emulate/effects.js";
-import type { PropertyPath } from "./emulate/guest.js";
-import type { RuntimeModel } from "./emulate/model.js";
-import type { StorageMatcher } from "./emulate/storage.js";
-import { rootStatements } from "./emulate/storage.js";
+import { parentsWithin } from "./runtime/builders.js";
+import type { StorageEffects } from "./runtime/effects.js";
+import type { PropertyPath, RuntimeModel } from "./runtime/model.js";
+import type { StorageMatcher } from "./runtime/storage.js";
+import { rootStatements } from "./runtime/storage.js";
 import type { KeySet } from "./key-sets.js";
 import { keySets, mayName } from "./key-sets.js";
 
@@ -242,7 +241,7 @@ export class HolderReach {
     }
 }
 
-/** `G.key()` with `key` a global-read getter (emulate's fact) the program never replaces: a read of that global property. */
+/** `G.key()` with `key` a global-read getter (the runtime fact) the program never replaces: a read of that global property. */
 export const isGlobalRead = (call: Node, runtime: RuntimeModel, matcher: StorageMatcher, effects: StorageEffects): boolean => {
     if (call.type !== "CallExpression" || call.arguments.length > 0 || call.callee.type !== "MemberExpression") return false;
     const key = propertyKey(call.callee);

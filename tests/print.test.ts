@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { ExpressionStatement, IfStatement, Node, Program, Statement } from "../src/core/ast.js";
 import { valueToNode } from "../src/core/build.js";
 import { parse } from "../src/core/parse.js";
-import { print, printStatement } from "../src/core/print.js";
+import { print } from "../src/core/print.js";
 import { flatten, generate, mulberry32, runTrace } from "./fuzz/programs.js";
 import { observe, serialize } from "./helpers.js";
 
@@ -23,7 +23,6 @@ const roundTrips = (code: string): void => {
     const program = parse(code);
     const printed = print(program);
     expect(shape(parse(printed))).toEqual(shape(program));
-    for (const statement of program.body) expect(shape(parse(printStatement(statement as Statement).source).body)).toEqual(shape([statement]));
 };
 
 /** Every construct whose printing needs care: precedence, statement-start ambiguities, literals, classes, modules. */

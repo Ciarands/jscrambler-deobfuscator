@@ -91,12 +91,14 @@ describe("log lines", () => {
         expect(line.endsWith("…")).toBe(true);
     });
 
-    it("carry no raw escape characters from guest-made names", async () => {
+    it("carry no raw escape characters from program-made names", async () => {
         const lines: string[] = [];
         const code = `function G() {}
 G.a = 1;
-Math["\\u001b]52;c;eA==\\u0007"] = Math.abs;
-Array.prototype["\\u001b]52;c;eA==\\u0007"] = Array.prototype.join;
+(function () {
+  Math["\\u001b]52;c;eA==\\u0007"] = Math.abs;
+  Array.prototype["\\u001b]52;c;eA==\\u0007"] = Array.prototype.join;
+})();
 `;
         await deobfuscate(code, { logger: createLogger("debug", (line) => lines.push(line)) });
         expect(lines.some((line) => line.includes("\\x1B]52"))).toBe(true);

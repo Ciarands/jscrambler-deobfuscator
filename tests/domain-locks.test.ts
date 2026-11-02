@@ -7,7 +7,7 @@ const LICENSED = "licensed.example";
 /** On the host the script was licensed for. */
 const RUN: Run = { globals: () => ({ location: { hostname: LICENSED } }) };
 
-const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "domain-locks"] })).code;
+const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["runtime", "domain-locks"] })).code;
 
 const hash = (text: string, seed: number): number => {
     let x = seed;

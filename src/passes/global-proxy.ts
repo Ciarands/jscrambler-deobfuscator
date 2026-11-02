@@ -3,11 +3,11 @@ import { propertyKey } from "../core/ast.js";
 import { at } from "../core/build.js";
 import { traverse } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
-import { RUNTIME } from "./emulate/model.js";
-import { storageAnalysis } from "./emulate/effects.js";
+import { RUNTIME } from "./runtime/model.js";
+import { storageAnalysis } from "./runtime/effects.js";
 
 /**
- * Global proxy: `G[k]` (where the emulated prelude left the global object) becomes `globalThis`.
+ * Global proxy: `G[k]` (where the prelude left the global object) becomes `globalThis`.
  *
  * Only reads of those slots are rewritten; `G` stays its own object (so `G[0] = ...` doesn't land on `window[0]`).
  * A read is rewritten only where it sees the snapshot's value and `globalThis` isn't a local name.

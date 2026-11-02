@@ -52,7 +52,7 @@ result = out;
 
 describe("aliases", () => {
     it("replaces every alias style with the builtin call it makes, and keeps behaviour", async () => {
-        const { code } = await deobfuscate(PROGRAM, { passes: ["emulate", "global-proxy", "aliases"] });
+        const { code } = await deobfuscate(PROGRAM, { passes: ["runtime", "global-proxy", "aliases"] });
         expect(code).toContain("out.push(String.fromCharCode(72, 105));");
         expect(code).toContain(`out.push("a%b".split("%").join("-"));`);
         // Dispatch on the receiver: a method call on it. Apply on the receiver: the builtin, called with it as this.
@@ -65,12 +65,12 @@ describe("aliases", () => {
     });
 
     it("keeps an alias where the builtin's name is shadowed", async () => {
-        const { code } = await deobfuscate(PROGRAM, { passes: ["emulate", "global-proxy", "aliases"] });
+        const { code } = await deobfuscate(PROGRAM, { passes: ["runtime", "global-proxy", "aliases"] });
         expect(code).toContain("return q1Str;");
     });
 });
 
-// The same setup also forwards globals to host objects the guest doesn't have (a page's `document`, here `hostDoc`).
+// The same setup also forwards globals to host objects the builtins lack (a page's `document`, here `hostDoc`).
 const withHost = (
     later: string
 ) => `${PRELUDE.replace("S(G[3]);", 'S(G[3]);\n(function (g) { Object.defineProperty(g, "q6Hd", { get: function () { return typeof g.hostDoc == "undefined" ? undefined : g.hostDoc; }, set: function (v) { g.hostDoc = v; }, configurable: true }); })(G[3]);')}

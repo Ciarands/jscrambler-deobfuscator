@@ -14,14 +14,13 @@ import { factKey } from "../pipeline/facts.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
 import type { CallSite } from "./storage-usage.js";
 import { rewriteCalls, survey } from "./storage-usage.js";
-import type { Builder, Closure, Slot } from "./emulate/builders.js";
-import { bodyOf, builderOf, definitionOf, returnsOf, sameSlot, slotOf, slotsOnly } from "./emulate/builders.js";
-import { storageAnalysis } from "./emulate/effects.js";
-import type { PropertyPath } from "./emulate/guest.js";
-import { RUNTIME } from "./emulate/model.js";
-import type { RuntimeModel } from "./emulate/model.js";
-import type { StorageMatcher } from "./emulate/storage.js";
-import { assignedPaths, storageMatcher } from "./emulate/storage.js";
+import type { Builder, Closure, Slot } from "./runtime/builders.js";
+import { bodyOf, builderOf, definitionOf, returnsOf, sameSlot, slotOf, slotsOnly } from "./runtime/builders.js";
+import { storageAnalysis } from "./runtime/effects.js";
+import type { PropertyPath, RuntimeModel } from "./runtime/model.js";
+import { RUNTIME } from "./runtime/model.js";
+import type { StorageMatcher } from "./runtime/storage.js";
+import { assignedPaths, storageMatcher } from "./runtime/storage.js";
 
 /** Builders `G.k = (function () {...})()` holding only anti-debug detectors: cleanup may remove them (model 5). */
 export const DETECTOR_BUILDERS = factKey<Set<Node>>("detector builders");
@@ -474,7 +473,7 @@ class BuilderMemo {
     /** The prelude statement building the holder `key`, and its builder, when it has a builder's shape. */
     holder(key: string): { statement: Statement; iife: FunctionNode; builder: Builder } | undefined {
         if (this.#holders.has(key)) return this.#holders.get(key);
-        const definition = definitionOf(this.#runtime, this.#matcher.isStorage, [key], true);
+        const definition = definitionOf(this.#runtime, this.#matcher.isStorage, [key]);
         const builder = typeof definition === "string" ? definition : builderOf(definition.iife, this.#scopes);
         const held = typeof definition === "string" || typeof builder === "string" ? undefined : { ...definition, builder };
         this.#holders.set(key, held);
@@ -552,17 +551,18 @@ const detectorAt = (path: PropertyPath, memo: BuilderMemo, scopes: ScopeInfo): D
  *                { E = t; D = C(); } } return D; }; }()                          // C returns R, !R or !!R
  *
  * Code locks, decoders and helpers take arguments or answer otherwise, so they never fit. Under the model the report
- * stays falsy, so every call answers `f(falsy)`. Where the guest ran the builder, it must answer the same,
- * repeatably. Calls where the method is current (`staleAt`) become the answer; call statements go. Not exact under a
- * debugger or where a detector would open an inspector session: accepted (model 5).
+ * stays falsy, so every call answers `f(falsy)`, whatever the report writes compute: the detector shows a debugger sign
+ * in its own code (`detectorAt`), so each write is a detection, which undebugged doesn't happen. Calls where the method
+ * is current (`staleAt`) become the answer; call statements go. Not exact under a debugger or where a detector would
+ * open an inspector session: accepted (model 5).
  */
 export const detectors: Pass = {
     name: "detectors",
     description: "Answer jscrambler's anti-debug detector calls with their no-detection answer (semantic model 5)",
     run({ program, log, facts, scope }: PassContext): PassResult {
         const runtime = facts.get(RUNTIME);
-        if (runtime === undefined || runtime.guest.broken !== undefined) {
-            log.info("no usable runtime, nothing to do");
+        if (runtime === undefined) {
+            log.info("no runtime, nothing to do");
             return { changed: 0 };
         }
         const scopes = scope();
@@ -610,24 +610,6 @@ export const detectors: Pass = {
             const { statement, detector } = found;
             const { answer } = detector;
             const shown = answer.exact ? String(answer.value) : answer.value ? "a truthy value" : "a falsy value";
-            // Without the guest's word, every detection must store a detection code.
-            const [probe] = runtime.executed.has(statement) ? runtime.guest.resolve([{ path, args: [] }]) : [];
-            const confirmed =
-                probe?.ok === true && !("nonPrimitive" in probe) && probe.repeatable && (answer.exact ? Object.is(probe.value, answer.value) : Boolean(probe.value) === Boolean(answer.value));
-            if (probe?.ok === true && !confirmed) {
-                log.debug(`${name} looks like a detector answering ${shown}, but the guest, which isn't debugged, doesn't answer that repeatably`, detector.slowPaths[0]);
-                continue;
-            }
-            // An answer that depends on the environment (time, host globals) confirms nothing, but one contradicting
-            // the detector's answer still shows its check may fire undebugged.
-            if (probe?.ok === false && probe.env === true && probe.seen !== undefined && (answer.exact ? !Object.is(probe.seen, answer.value) : Boolean(probe.seen) !== Boolean(answer.value))) {
-                log.debug(`${name} looks like a detector answering ${shown}, but in the guest (${probe.error}) it answered otherwise`, detector.slowPaths[0]);
-                continue;
-            }
-            if (!confirmed && !answer.literal) {
-                log.debug(`${name} looks like a detector answering ${shown}, but the guest can't confirm it and it stores reports other than detection codes`, detector.slowPaths[0]);
-                continue;
-            }
             counts.detectors++;
             log.debug(`${name} is an anti-debug detector: undebugged, it answers ${shown}`, detector.slowPaths[0]);
 

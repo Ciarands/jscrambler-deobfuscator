@@ -3,7 +3,6 @@ import { isFunctionNode, memberPath, propertyKey } from "../core/ast.js";
 import { at } from "../core/build.js";
 import { constantEnv } from "../core/constants.js";
 import type { ConstantEnv } from "../core/constants.js";
-import type { Value } from "../core/evaluate.js";
 import { evaluate } from "../core/evaluate.js";
 import { pushAll, spliceList } from "../core/list.js";
 import { parse, ParseError } from "../core/parse.js";
@@ -12,22 +11,22 @@ import type { ScopeInfo, Variable } from "../core/scope.js";
 import { traverse } from "../core/traverse.js";
 import type { Facts } from "../pipeline/facts.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
-import type { PropertyPath, ResolveRequest } from "./emulate/guest.js";
-import type { RuntimeModel } from "./emulate/model.js";
-import { RUNTIME } from "./emulate/model.js";
-import { definitionOf, parentsWithin } from "./emulate/builders.js";
-import type { DecoderProof } from "./emulate/decoder.js";
-import { DECODER_PROOF } from "./emulate/decoder.js";
-import type { StorageEffects } from "./emulate/effects.js";
-import { storageAnalysis } from "./emulate/effects.js";
-import type { StorageMatcher } from "./emulate/storage.js";
-import { rootStatements, storageMatcher } from "./emulate/storage.js";
+import type { PropertyPath, RuntimeModel } from "./runtime/model.js";
+import { RUNTIME } from "./runtime/model.js";
+import { definitionOf, parentsWithin } from "./runtime/builders.js";
+import type { DecoderProof } from "./runtime/decoder.js";
+import { DECODER_PROOF } from "./runtime/decoder.js";
+import { FUNCTION_NAMES } from "./runtime/decoder-host.js";
+import type { StorageEffects } from "./runtime/effects.js";
+import { storageAnalysis } from "./runtime/effects.js";
+import type { StorageMatcher } from "./runtime/storage.js";
+import { rootStatements, storageMatcher } from "./runtime/storage.js";
 import { isAliasDeclarator, isGlobalRead, onlyTested } from "./storage-usage.js";
 import { DETECTOR_BUILDERS } from "./detectors.js";
 import { keySets, mayName } from "./key-sets.js";
 import { inlineStorageAliases } from "./storage-aliases.js";
-import type { Effect } from "./locality.js";
-import { exposedLocalityOf } from "./locality.js";
+import type { Effect, RuntimeCall } from "./locality.js";
+import { callLocalityOf, exposedLocalityOf } from "./locality.js";
 
 const isLocalScope = (scopeType: string): boolean => scopeType !== "global" && scopeType !== "module";
 
@@ -39,8 +38,8 @@ const isLocalScope = (scopeType: string): boolean => scopeType !== "global" && s
  * - `store`: `globalThis.P = G`; other scripts don't read it (model 2).
  */
 type Role =
-    | { kind: "def"; key: string; removable: boolean }
-    | { kind: "stage"; key: string; probe: { call: ResolveRequest } | { read: readonly string[] } }
+    | { kind: "def"; key: string; removable: boolean; effect?: string | undefined }
+    | { kind: "stage"; key: string; probe: { call: PropertyPath } | { read: PropertyPath } }
     | { kind: "setup" }
     | { kind: "fn"; name: string }
     | { kind: "store" }
@@ -48,14 +47,49 @@ type Role =
 
 const isRemovable = (role: Role): boolean => (role.kind === "def" && role.removable) || role.kind === "stage" || role.kind === "setup" || role.kind === "fn" || role.kind === "store";
 
-const roleOf = (
+/**
+ * Why evaluating `right` (of a root `G.k = right`) may change something outside the storage object, its own state and
+ * objects it creates; `undefined` when it can't. It completes (model 1). Proofs: `isPure`; the setup evaluator's
+ * (`getters.ts`, `RuntimeModel.local`); a templated decoder's build on the host (`DecoderProof.hostBuilt`); a read of
+ * a storage property no setup call defined (a data property, model 9); an immediately invoked function `locality.ts`
+ * shows local, with call aliases as the builtins they stand for (model 7) and calls of templated string decoders,
+ * which write only the state `G` holds for them (`DecoderProof`).
+ */
+const definitionEffect = (
     statement: Statement,
+    right: Node,
     runtime: RuntimeModel,
-    isStorage: (n: Node) => boolean,
-    keptAsGlobal: (n: Node) => boolean,
+    matcher: StorageMatcher,
+    effects: StorageEffects,
     scopes: ScopeInfo,
-    detectorBuilders: ReadonlySet<Node> | undefined
-): Role => {
+    decoders: DecoderProof | undefined
+): string | undefined => {
+    if (isPure(right, scopes) || runtime.local.has(statement) || decoders?.hostBuilt.has(statement) === true) return undefined;
+    const path = memberPath(right);
+    if (path !== undefined && matcher.isStorage(path.root)) {
+        const [key] = path.keys;
+        return path.keys.length === 1 && key !== undefined && !runtime.setupKeys.has(key) && !runtime.callAliases.has(key) && !FUNCTION_NAMES.includes(key)
+            ? undefined
+            : "it reads a storage property a getter may hold";
+    }
+    if (right.type !== "CallExpression" || (right.callee.type !== "FunctionExpression" && right.callee.type !== "ArrowFunctionExpression")) return "its right side isn't a builder";
+    if (!right.arguments.every((arg) => arg.type !== "SpreadElement" && isPure(arg, scopes))) return "its builder's arguments may have effects";
+    const runtimeCall = (call: Node): RuntimeCall | undefined => {
+        if (call.type !== "CallExpression" || call.callee.type !== "MemberExpression") return undefined;
+        const callee = memberPath(call.callee);
+        if (callee === undefined || !matcher.isStorage(callee.root)) return undefined;
+        const [first] = callee.keys;
+        const alias = callee.keys.length === 1 && first !== undefined ? runtime.callAliases.get(first) : undefined;
+        if (alias !== undefined) return { kind: "alias", owner: alias.owner, original: alias.original, style: alias.style, nullishCalls: alias.nullishCalls };
+        return decoders?.templated.has(targetId(runtime, callee.keys)) === true ? { kind: "own-state" } : undefined;
+    };
+    const effect = callLocalityOf(right.callee, scopes, parentsWithin(right.callee), (call) => isGlobalRead(call, runtime, matcher, effects), runtimeCall);
+    return effect?.reason;
+};
+
+const roleOf = (statement: Statement, runtime: RuntimeModel, matcher: StorageMatcher, effects: StorageEffects, scopes: ScopeInfo, inputs: RemovalInputs): Role => {
+    const { isStorage } = matcher;
+    const keptAsGlobal = (node: Node): boolean => effects.keptAsGlobal(node);
     if (runtime.setup.has(statement)) return { kind: "setup" };
     if (statement.type !== "ExpressionStatement") return { kind: "other" };
     const e = statement.expression;
@@ -67,7 +101,8 @@ const roleOf = (
         if (isStorage(holder)) {
             const key = propertyKey(e.left);
             if (key === undefined) return { kind: "other" };
-            return { kind: "def", key, removable: isPure(e.right, scopes) || runtime.pure.has(statement) || detectorBuilders?.has(statement) === true };
+            const effect = inputs.detectorBuilders?.has(statement) === true ? undefined : definitionEffect(statement, e.right, runtime, matcher, effects, scopes, inputs.decoders);
+            return { kind: "def", key, removable: effect === undefined, effect };
         }
     }
     const target = e.type === "CallExpression" ? e.callee : e;
@@ -78,13 +113,8 @@ const roleOf = (
     const affected = (first === undefined ? undefined : runtime.wrappers.get(first)?.target[0]) ?? first;
     if (affected === undefined) return { kind: "other" };
     if (e.type !== "CallExpression") return { kind: "stage", key: affected, probe: { read: path.keys } };
-    const args: Value[] = [];
-    for (const arg of e.arguments) {
-        const value = arg.type === "SpreadElement" ? undefined : evaluate(arg);
-        if (value === undefined || !value.ok) return { kind: "other" };
-        args.push(value.value);
-    }
-    return { kind: "stage", key: affected, probe: { call: { path: path.keys, args } } };
+    if (e.arguments.some((arg) => arg.type === "SpreadElement" || !evaluate(arg).ok)) return { kind: "other" };
+    return { kind: "stage", key: affected, probe: { call: path.keys } };
 };
 
 const MAX_CLEANUP_ROUNDS = 16;
@@ -171,11 +201,11 @@ const namesRuntime = (removed: readonly Node[], runtime: RuntimeModel, matcher: 
     return false;
 };
 
-/** `pure` and `setup` are keyed by root statement; an earlier pass splitting or removing one loses its fact. */
+/** `local` and `setup` are keyed by root statement; an earlier pass splitting or removing one loses its fact. */
 const logLostFacts = (runtime: RuntimeModel, log: PassContext["log"]): void => {
     const body = new Set<Node>(rootStatements(runtime.root));
     for (const [name, recorded] of [
-        ["pure", runtime.pure],
+        ["local", runtime.local],
         ["setup", runtime.setup],
     ] as const) {
         const lost = [...recorded].filter((statement) => !body.has(statement));
@@ -474,7 +504,7 @@ const computeLiveness = (roots: readonly RootUses[], log: PassContext["log"]): L
 
 /**
  * Why the stage call at `index`, which nothing that stays needs, must stay anyway; `undefined` when it can go. Its own
- * run must have completed (a static proof ignores throws). A templated decoder writes only its own, dead, state
+ * run completes (model 1: the top level runs to completion). A templated decoder writes only its own, dead, state
  * (model 7: builtins intact).
  */
 const stageObjection = (
@@ -485,11 +515,11 @@ const stageObjection = (
     decoders: DecoderProof | undefined,
     proofs: Map<string, Effect | undefined>
 ): string | undefined => {
-    const { runtime } = analysis;
-    if ("read" in role.probe) return runtime.guest.inspect(role.probe.read)?.data === true ? undefined : "runtime call has effects outside its own state";
-    if (decoders?.templated.has(targetId(runtime, role.probe.call.path)) === true) return undefined;
-    if (!runtime.pure.has((roots[index] as RootUses).statement)) return "its own run in the guest wasn't seen to change nothing outside the storage object";
-    return stageRefusal(index, role.key, role.probe.call.path, roots, analysis, proofs);
+    const { runtime, effects } = analysis;
+    // A bare read through data properties runs no code (`Snapshot` answers only those).
+    if ("read" in role.probe) return typeof effects.snapshot.typeAt(role.probe.read) === "string" ? "runtime call has effects outside its own state" : undefined;
+    if (decoders?.templated.has(targetId(runtime, role.probe.call)) === true) return undefined;
+    return stageRefusal(index, role.key, role.probe.call, roots, analysis, proofs);
 };
 
 /**
@@ -522,7 +552,7 @@ const removeRuntime = (program: Node, runtime: RuntimeModel | undefined, scopes:
     if (body.length === 0) return 0;
     const { matcher, effects } = storageAnalysis(program, runtime, scopes, log);
     const analysis: RuntimeAnalysis = { runtime, matcher, effects, scopes };
-    const roles = body.map((statement) => roleOf(statement, runtime, matcher.isStorage, (node) => effects.keptAsGlobal(node), scopes, inputs.detectorBuilders));
+    const roles = body.map((statement) => roleOf(statement, runtime, matcher, effects, scopes, inputs));
     // Escapes and alias uses only matter in statements that stay; prelude-only computed reads go to `selectable`.
     const roots = collectUses(body, roles, analysis, inputs.evalUses);
     const unreachable = selectable(roots, analysis);
@@ -556,8 +586,8 @@ const logDefinitions = (roots: readonly RootUses[], { kept, liveBy }: Liveness, 
         const reader = liveBy.get(role.key);
         const because = !kept.has(index)
             ? `goes: nothing that stays reads ${name}${unreachable.has(index) ? ` (${unreachable.get(index)})` : ""}`
-            : !role.removable
-              ? "stays: its right side may have effects outside the storage object"
+            : role.effect !== undefined
+              ? `stays: its right side may have effects outside the storage object (${role.effect})`
               : `stays: ${name} is read by root statement ${reader ?? "?"}, which stays`;
         log.debug(`definition ${because}`, statement);
     }

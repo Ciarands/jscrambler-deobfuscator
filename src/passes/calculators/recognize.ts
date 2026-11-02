@@ -4,10 +4,10 @@ import type { EvaluateEnv } from "../../core/evaluate.js";
 import { evaluate } from "../../core/evaluate.js";
 import type { ScopeInfo, Variable } from "../../core/scope.js";
 import type { PassContext } from "../../pipeline/pass.js";
-import { bodyOf, builderOf, definitionOf } from "../emulate/builders.js";
-import type { StorageEffects } from "../emulate/effects.js";
-import type { RuntimeModel } from "../emulate/model.js";
-import { rootStatements } from "../emulate/storage.js";
+import { bodyOf, builderOf, definitionOf } from "../runtime/builders.js";
+import type { StorageEffects } from "../runtime/effects.js";
+import type { RuntimeModel } from "../runtime/model.js";
+import { rootStatements } from "../runtime/storage.js";
 import type { Calculator, Case, Refusal } from "./sites.js";
 import { refusal } from "./sites.js";
 
@@ -160,11 +160,11 @@ export const recognize = (runtime: RuntimeModel, isStorage: (node: Node) => bool
             continue;
         }
         const unsure = [shape.selector, shape.calculation].find((method) => {
-            const info = runtime.guest.inspect([...keys, method]);
-            return info === undefined || !info.data || info.type !== "function" || effects.preludeWritesTo([...keys, method]) !== 1;
+            const info = effects.snapshot.typeAt([...keys, method]);
+            return typeof info === "string" || info.type !== "function";
         });
         if (unsure !== undefined) {
-            log.debug(`${name} looks like a calculator, but the snapshot's ${name}.${unsure} may not be the method its builder made (more prelude writes, or an accessor)`, statement);
+            log.debug(`${name} looks like a calculator, but ${name}.${unsure} may not hold the method its builder made (more prelude writes, or other values)`, statement);
             continue;
         }
         log.debug(`${name} is a calculator: ${name}.${shape.selector}(n) selects one of ${shape.cases.length} case(s) ${name}.${shape.calculation}(...) computes`, statement);

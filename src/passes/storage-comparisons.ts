@@ -3,10 +3,10 @@ import { memberPath } from "../core/ast.js";
 import { valueToNode } from "../core/build.js";
 import { replaceNodes, traverse } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
-import { storageAnalysis } from "./emulate/effects.js";
-import type { PropertyPath } from "./emulate/guest.js";
-import { RUNTIME } from "./emulate/model.js";
-import { storageMatcher } from "./emulate/storage.js";
+import { storageAnalysis } from "./runtime/effects.js";
+import type { PropertyPath } from "./runtime/model.js";
+import { RUNTIME } from "./runtime/model.js";
+import { storageMatcher } from "./runtime/storage.js";
 
 const EQUALITY: Readonly<Record<string, true>> = { "===": true, "!==": true, "==": true, "!=": true };
 
@@ -20,9 +20,10 @@ interface Candidate {
 /**
  * Storage comparisons: `G.k.m[1][10] != G.k.m[3][10]` becomes the boolean it always is.
  *
- * Where nothing may change either path after the prelude (model 3), each reads the snapshot's value. Data property
- * reads run no code, and two objects (identity) or two primitives compare without conversions, so the guest's value
- * replaces it. An object against a primitive, or a path through a getter, stays.
+ * Where nothing may change either path after the prelude (model 3), each reads the value the prelude left, which
+ * `Snapshot` knows (a cyclic array's rows built on the host). Data property reads run no code, and two objects
+ * (identity) or two primitives compare without conversions. An object against a primitive, or a path through a getter,
+ * stays.
  */
 export const storageComparisons: Pass = {
     name: "storage-comparisons",
@@ -57,16 +58,15 @@ export const storageComparisons: Pass = {
             log.debug(`kept: ${stale.reason}`, node);
             return false;
         });
-        const answers = stable.length === 0 ? [] : runtime.guest.compare(stable.map(({ op, left, right }) => ({ left: left.path, right: right.path, op })));
         const replacements = new Map<Node, Node>();
-        for (const [i, candidate] of stable.entries()) {
-            const answer = answers[i];
-            if (answer?.ok !== true) {
+        for (const candidate of stable) {
+            const answer = effects.snapshot.compare(candidate.left.path, candidate.right.path, candidate.op);
+            if (typeof answer === "string") {
                 kept++;
-                log.debug(`kept: ${answer?.reason ?? "no answer"}`, candidate.node);
+                log.debug(`kept: ${answer}`, candidate.node);
                 continue;
             }
-            replacements.set(candidate.node, valueToNode(answer.value, candidate.node, scopes));
+            replacements.set(candidate.node, valueToNode(answer, candidate.node, scopes));
         }
         replaceNodes(program, replacements);
         log.info(`folded ${replacements.size} comparison(s) of runtime values; kept ${kept}`);

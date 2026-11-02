@@ -2,7 +2,7 @@ import type { Node } from "../../core/ast.js";
 import type { EvaluateEnv } from "../../core/evaluate.js";
 import { evaluate } from "../../core/evaluate.js";
 import type { ScopeInfo, Variable } from "../../core/scope.js";
-import { slotArray, slotOf } from "../emulate/builders.js";
+import { slotArray, slotOf } from "../runtime/builders.js";
 
 const GETTER = "a property read (possible getter)";
 const GLOBAL_READ = "a global read (possible getter)";

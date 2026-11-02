@@ -103,38 +103,34 @@ export const runPipeline = async (program: Program, steps: readonly PipelineStep
         return { report, settled: result.settled === true };
     };
 
-    try {
-        for (const step of steps) {
-            if (!isGroup(step)) {
-                await runPass(step);
-                continue;
-            }
-            // A pass whose last run changed nothing (or that settled), with nothing changed since, would change nothing
-            // again: passes are deterministic in the tree and the facts they read, and no fact written inside a group
-            // changes another pass's input between its runs. Such facts are a pass's memo of its own work, read only by
-            // it (LOCK_PROBES, RESOLUTION, DECIDED, SPENT), or set once before its reader runs (DECODER_PROOF, on
-            // resolve-calls' first walk, which comes before cleanup's first run in any pipeline, as resolve-calls precedes
-            // cleanup in its group); `onReplace` updates come with a change. A fact one pass sets in a group for another to
-            // read would break this skip.
-            let version = 0;
-            const quietAt = new Map<Pass, number>();
-            let round = 1;
-            for (; round <= step.maxRounds; round++) {
-                let changed = 0;
-                for (const pass of step.passes) {
-                    if (quietAt.get(pass) === version) continue;
-                    const { report, settled } = await runPass(pass, { name: step.group, round });
-                    if (report.changed > 0) version++;
-                    if (report.changed === 0 || settled) quietAt.set(pass, version);
-                    else quietAt.delete(pass);
-                    changed += report.changed;
-                }
-                if (changed === 0) break;
-            }
-            if (round > step.maxRounds) options.logger.warn(`[${step.group}] still changing after ${step.maxRounds} rounds, stopped`);
+    for (const step of steps) {
+        if (!isGroup(step)) {
+            await runPass(step);
+            continue;
         }
-    } finally {
-        facts.dispose();
+        // A pass whose last run changed nothing (or that settled), with nothing changed since, would change nothing
+        // again: passes are deterministic in the tree and the facts they read, and no fact written inside a group
+        // changes another pass's input between its runs. Such facts are a pass's memo of its own work, read only by
+        // it (LOCK_PROBES, RESOLUTION, DECIDED, SPENT), or set once before its reader runs (DECODER_PROOF, on
+        // resolve-calls' first walk, which comes before cleanup's first run in any pipeline, as resolve-calls precedes
+        // cleanup in its group); `onReplace` updates come with a change. A fact one pass sets in a group for another to
+        // read would break this skip.
+        let version = 0;
+        const quietAt = new Map<Pass, number>();
+        let round = 1;
+        for (; round <= step.maxRounds; round++) {
+            let changed = 0;
+            for (const pass of step.passes) {
+                if (quietAt.get(pass) === version) continue;
+                const { report, settled } = await runPass(pass, { name: step.group, round });
+                if (report.changed > 0) version++;
+                if (report.changed === 0 || settled) quietAt.set(pass, version);
+                else quietAt.delete(pass);
+                changed += report.changed;
+            }
+            if (changed === 0) break;
+        }
+        if (round > step.maxRounds) options.logger.warn(`[${step.group}] still changing after ${step.maxRounds} rounds, stopped`);
     }
     return reports;
 };

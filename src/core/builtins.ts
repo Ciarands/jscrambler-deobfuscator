@@ -25,6 +25,17 @@ export class ArrayObject {
     constructor(readonly items: JsValue[]) {}
 }
 
+/**
+ * A function's `arguments`: an array-like inheriting from `Object.prototype`, not an array. Its elements are never
+ * written (`setMember` refuses: sloppy-mode ones alias the parameters), so mapped and unmapped ones read the same.
+ */
+export class ArgumentsObject extends ArrayObject {
+    constructor(items: JsValue[]) {
+        super(items);
+        this.frozen = true;
+    }
+}
+
 export class PlainObject {
     readonly props = new Map<string, JsValue>();
     shape = 0;
@@ -103,6 +114,9 @@ const checked = <T>(result: T): T => {
 
 /** An array index (`ToString(ToUint32(key)) === key`, below 2^32 - 1), or -1. */
 const arrayIndex = (key: string): number => {
+    // A canonical index starts with a digit: names (`charCodeAt`) skip the conversion.
+    const first = key.charCodeAt(0);
+    if (!(first >= 48 && first <= 57)) return -1;
     const n = Number(key);
     return Number.isInteger(n) && n >= 0 && n < 4294967295 && String(n) === key ? n : -1;
 };
@@ -134,6 +148,7 @@ const join = (array: ArrayObject, separator: string, run: Run): string => {
 /** `ToPrimitive`: arrays join (Array.prototype.toString, model 7), plain objects without own conversions are `[object Object]`. */
 export const toPrimitive = (v: JsValue, run: Run): Value => {
     if (!isObject(v)) return v;
+    if (v instanceof ArgumentsObject) return "[object Arguments]";
     if (v instanceof ArrayObject) return join(v, ",", run);
     if (v instanceof PlainObject) {
         if (v.props.has("toString") || v.props.has("valueOf")) return refuse("it converts an object with its own toString or valueOf");
@@ -167,6 +182,7 @@ export const hasOwn = (v: JsValue, key: string): boolean => {
     if (v === null || v === undefined) return thrown(`TypeError: cannot convert ${v} to an object`);
     if (typeof v === "string") return key === "length" || (arrayIndex(key) !== -1 && arrayIndex(key) < v.length);
     if (typeof v === "number" || typeof v === "boolean") return false;
+    if (v instanceof ArgumentsObject && key === "callee") return refuse("it asks about arguments.callee");
     if (v instanceof ArrayObject) {
         const index = arrayIndex(key);
         return key === "length" || (index !== -1 && index in v.items);
@@ -210,14 +226,15 @@ const thisString = (self: JsValue, name: string, run: Run): string => {
     return toStr(self, run);
 };
 
-const stringMethod = (name: string, guard?: (s: string, args: readonly Value[]) => void): Native =>
-    native(name, (self, args, run) => {
+const stringMethod = (name: string, guard?: (s: string, args: readonly Value[]) => void): Native => {
+    const method = HOST_STRING[name] as (this: string, ...args: Value[]) => Value;
+    return native(name, (self, args, run) => {
         const s = thisString(self, name, run);
         const converted = primitives(args, run);
         guard?.(s, converted);
-        const method = HOST_STRING[name] as (this: string, ...args: Value[]) => Value;
         return checked(method.apply(s, converted));
     });
+};
 
 const lengthGuard = (s: string, args: readonly Value[]): void => {
     if (Number(args[0]) > MAX_STRING) refuse(`it makes a string longer than ${MAX_STRING} characters`);
@@ -377,10 +394,11 @@ const reduce = (name: string, fromRight: boolean): Native =>
     });
 
 const concat = native("concat", (self, args, run) => {
+    if (self instanceof ArgumentsObject) return refuse("Array.prototype.concat of arguments");
     const array = reading(self, "concat", run);
     const out: JsValue[] = array.items.slice();
     for (const arg of args) {
-        if (arg instanceof ArrayObject) {
+        if (arg instanceof ArrayObject && !(arg instanceof ArgumentsObject)) {
             run.step(arg.items.length);
             const start = out.length;
             out.length += arg.items.length;
@@ -417,7 +435,8 @@ const ARRAY_PROTO = namespace("Array.prototype", {
         const array = thisArray(self, "join");
         return join(array, args[0] === undefined ? "," : toStr(args[0], run), run);
     }),
-    toString: native("toString", (self, args, run) => join(thisArray(self, "toString"), ",", run)),
+    // On `arguments` (no `join` of its own) it falls back to `Object.prototype.toString`.
+    toString: native("toString", (self, args, run) => (self instanceof ArgumentsObject ? refuse("Array.prototype.toString of arguments") : join(thisArray(self, "toString"), ",", run))),
     sort: native("sort", (self, args, run) => {
         if (args[0] !== undefined) return refuse("sorting with a comparator may not be consistent");
         const array = changing(self, "sort", run);
@@ -529,7 +548,7 @@ const ARRAY = namespace(
     "Array",
     {
         prototype: ARRAY_PROTO,
-        isArray: native("isArray", (self, args) => args[0] instanceof ArrayObject),
+        isArray: native("isArray", (self, args) => args[0] instanceof ArrayObject && !(args[0] instanceof ArgumentsObject)),
         of: native("of", (self, args) => new ArrayObject([...args])),
         from: native("from", (self, args, run) => {
             const [source, mapper, thisArg] = args;
@@ -645,6 +664,7 @@ const serialize = (v: JsValue, stack: Set<JsObject>, run: Run): string | undefin
     if (run.aliasOf("Object.prototype", "toJSON") !== undefined) return refuse("Object.prototype has an alias named toJSON");
     stack.add(v);
     try {
+        if (v instanceof ArgumentsObject) return refuse("it serializes arguments");
         if (v instanceof ArrayObject) {
             if (run.aliasOf("Array.prototype", "toJSON") !== undefined) return refuse("Array.prototype has an alias named toJSON");
             const parts: string[] = [];
@@ -707,7 +727,7 @@ const STRING = namespace(
         prototype: STRING_PROTO,
         fromCharCode: native("fromCharCode", (self, args, run) => {
             run.step(args.length);
-            return String.fromCharCode(...args.map((arg) => toNum(arg, run)));
+            return args.length === 1 ? String.fromCharCode(toNum(args[0], run)) : String.fromCharCode(...args.map((arg) => toNum(arg, run)));
         }),
         fromCodePoint: native("fromCodePoint", (self, args, run) => {
             run.step(args.length);
@@ -818,6 +838,16 @@ export const getMember = (v: JsValue, key: string, run: Run): JsValue => {
         default:
             break;
     }
+    if (v instanceof ArgumentsObject) {
+        if (key === "length") return v.items.length;
+        const index = arrayIndex(key);
+        if (index !== -1) return v.items[index];
+        if (key === "callee") return refuse("it reads arguments.callee");
+        const member = memberOf(OBJECT_CHAIN, key, run);
+        if (member !== undefined) return member;
+        if (OBJECT_PROTOTYPE_NAMES.has(key)) return refuse(`it reads Object.prototype.${key}, which isn't modelled`);
+        return undefined;
+    }
     if (v instanceof ArrayObject) {
         if (key === "length") return v.items.length;
         const index = arrayIndex(key);
@@ -844,6 +874,7 @@ export const getMember = (v: JsValue, key: string, run: Run): JsValue => {
 /** `PutValue` on a member; writes the program's modes treat differently (primitives, frozen objects, builtins) refuse. */
 export const setMember = (target: JsValue, key: string, value: JsValue, run: Run): void => {
     if (target === null || target === undefined) return void thrown(`TypeError: cannot set ${key} of ${target}`);
+    if (target instanceof ArgumentsObject) return void refuse("it writes to arguments (in sloppy mode they alias the parameters)");
     if (target instanceof ArrayObject) {
         if (target.frozen) return void refuse("it writes to a frozen array");
         const index = arrayIndex(key);
@@ -897,6 +928,11 @@ export const hasProperty = (target: JsValue, key: string, run: Run): boolean => 
         if (target.props.has(key) || OBJECT_PROTOTYPE_NAMES.has(key)) return true;
         return memberOf(OBJECT_CHAIN, key, run) !== undefined;
     }
+    if (target instanceof ArgumentsObject) {
+        if (hasOwn(target, key)) return true;
+        if (isNumericKey(key)) return false;
+        return memberOf(OBJECT_CHAIN, key, run) !== undefined || OBJECT_PROTOTYPE_NAMES.has(key);
+    }
     if (target instanceof ArrayObject) {
         if (hasOwn(target, key)) return true;
         if (isNumericKey(key)) return false;
@@ -915,9 +951,9 @@ export const forInKeys = (v: JsValue, run: Run): string[] => {
               ? "Number.prototype"
               : typeof v === "boolean"
                 ? "Boolean.prototype"
-                : v instanceof ArrayObject
+                : v instanceof ArrayObject && !(v instanceof ArgumentsObject)
                   ? "Array.prototype"
-                  : v instanceof PlainObject
+                  : v instanceof PlainObject || v instanceof ArgumentsObject
                     ? "Object.prototype"
                     : refuse("it enumerates a function or builtin");
     if (run.hasAliases(prototype) || run.hasAliases("Object.prototype")) return refuse("aliases on its prototypes may be enumerable");

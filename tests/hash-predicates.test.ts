@@ -4,7 +4,7 @@ import { observe, type Run } from "./helpers.js";
 
 const RUN: Run = { timers: true, timeout: 2000 };
 
-const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "hash-predicates", "simplify"] })).code;
+const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["runtime", "hash-predicates", "simplify"] })).code;
 
 const hash = (s: string, n: number, seed: number): number => {
     let q = seed;
@@ -148,7 +148,7 @@ describe("hash-predicates", () => {
         expect(output).toContain("G.U.h(d.toString()");
     });
 
-    it("keeps predicates on a hash the guest no longer holds, or that changes after the prelude", async () => {
+    it("keeps predicates on a hash the prelude replaces through a call, or that changes after the prelude", async () => {
         const replaced = `function (s, n, seed) { log.push("replaced"); return seed; }`;
         for (const [name, options] of Object.entries({
             // Through a reference the analysis doesn't follow (handed to a builtin), while the prelude runs.

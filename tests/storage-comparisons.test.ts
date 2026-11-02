@@ -14,7 +14,7 @@ G.k = (function (n) {
 })(3);
 `;
 
-const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "storage-comparisons"] })).code;
+const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["runtime", "storage-comparisons"] })).code;
 
 const RUN: Run = { timers: true };
 
@@ -38,5 +38,19 @@ describe("storage-comparisons", () => {
             expect(output).toContain(kept);
             expect(observe(output, RUN)).toBe(observe(program, RUN));
         }
+    });
+
+    it("keeps tests of a literal the prelude changes through a wrapper's this", async () => {
+        const program = `
+function G() {}
+G.k = { a: 1, b: 1 };
+G.T = function () { this.a = 2; };
+G.w = function () { return typeof G.T === "function" ? G.T.apply(G.k, arguments) : G.T; };
+G.w();
+setTimeout(function () { result = [G.k.a == G.k.b]; });
+`;
+        const output = await run(program);
+        expect(output).toContain("G.k.a == G.k.b");
+        expect(observe(output, RUN)).toBe(observe(program, RUN));
     });
 });

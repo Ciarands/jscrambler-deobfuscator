@@ -4,7 +4,7 @@ import { observe, type Run } from "./helpers.js";
 
 const RUN: Run = { timers: true };
 
-const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "calculators", "calculators-bound"] })).code;
+const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["runtime", "calculators", "calculators-bound"] })).code;
 
 const sameBehaviour = async (program: string): Promise<string> => {
     const output = await run(program);
@@ -172,7 +172,7 @@ describe("calculators", () => {
 
     it("leaves a bound calculation to the passes after it, which don't know its parameters", async () => {
         const program = later("  var z = 2;\n  var o = { valueOf: function () { z = 100; return 7; } };\n  G.s(4);\n  result = G.c(o, 1, z);");
-        const { code } = await deobfuscate(program, { passes: ["emulate", "calculators", "calculators-bound", "cleanup", "simplify", "unminify"] });
+        const { code } = await deobfuscate(program, { passes: ["runtime", "calculators", "calculators-bound", "cleanup", "simplify", "unminify"] });
         expect(observe(code, RUN)).toBe(observe(program, RUN));
         expect(code).toContain("((p0, p1) => (p0 - 1) * p1)(o, z)");
     });

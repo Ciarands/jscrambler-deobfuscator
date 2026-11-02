@@ -7,9 +7,9 @@ import type { PassLog } from "../../core/log.js";
 import type { ScopeInfo } from "../../core/scope.js";
 import { forEachChild, traverse } from "../../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../../pipeline/pass.js";
-import { storageAnalysis } from "../emulate/effects.js";
-import type { RuntimeModel } from "../emulate/model.js";
-import { RUNTIME } from "../emulate/model.js";
+import { storageAnalysis } from "../runtime/effects.js";
+import type { RuntimeModel } from "../runtime/model.js";
+import { RUNTIME } from "../runtime/model.js";
 import { caseDeclarations, perIterationCapture } from "./declarations.js";
 import type { Machine, Refusal, RefusalCode, StateKey } from "./match.js";
 import { matchMachine, refuse } from "./match.js";
@@ -17,15 +17,14 @@ import { reachableOrder, structure } from "./structure.js";
 import { tidy } from "./tidy.js";
 
 /**
- * State keys from the emulated runtime, for constant-key member chains on the storage object
- * (`G[123].m[18][11]`, cyclic-array states): the value the chain holds in the sandbox once the
- * prelude has run. That is only the value the program reads when nothing can change the chain in between
- * (`storageEffects`); otherwise the chain gets no key. The guest walks data properties only; a getter on the way gives
- * no key, so no runtime code runs. Objects (rows of the state table) are keyed by identity, numbers and strings by
- * value, like static constants.
+ * State keys from the runtime, for constant-key member chains on the storage object (`G[123].m[18][11]`, cyclic-array
+ * states): the value the chain holds once the prelude has run (`Snapshot`: a cyclic array is built on the host). That
+ * is only the value the program reads when nothing can change the chain in between (`storageEffects`); otherwise the
+ * chain gets no key. Data properties only, so reading runs no code. Objects (rows of the state table) are keyed by
+ * identity, numbers and strings by value, like static constants.
  */
 const runtimeStateKey = (program: Node, runtime: RuntimeModel | undefined, scopes: ScopeInfo, log: PassLog): ((node: Node) => StateKey | undefined) | undefined => {
-    if (runtime === undefined || runtime.guest.broken !== undefined) return undefined;
+    if (runtime === undefined) return undefined;
     const { matcher, effects } = storageAnalysis(program, runtime, scopes, log);
     const cache = new Map<string, StateKey | undefined>();
     return (node) => {
@@ -37,7 +36,11 @@ const runtimeStateKey = (program: Node, runtime: RuntimeModel | undefined, scope
             return undefined;
         }
         const id = JSON.stringify(path.keys);
-        if (!cache.has(id)) cache.set(id, runtime.guest.stateKey(path.keys));
+        if (!cache.has(id)) {
+            const key = effects.snapshot.keyAt(path.keys);
+            if (typeof key === "string") log.debug(`no state key: ${key}`, node);
+            cache.set(id, typeof key === "string" ? undefined : key.key);
+        }
         return cache.get(id);
     };
 };
@@ -97,7 +100,7 @@ const statementsOf = (parent: Node): readonly Statement[] => (parent.type === "S
 /**
  * Runs right after `normalize`: jscrambler flattens nearly every function into `for (; S !== end;) switch (S)`
  * machines, and every later pass is far simpler on structured code. Machines with computed states (cyclic-array ids)
- * wait for a later run, once those ids are constants or keyed by the emulated runtime (`runtimeStateKey`).
+ * wait for a later run, once those ids are constants or keyed by the runtime's snapshot (`runtimeStateKey`).
  */
 export const unflatten: Pass = {
     name: "unflatten",

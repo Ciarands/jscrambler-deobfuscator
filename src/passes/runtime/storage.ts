@@ -2,8 +2,8 @@ import type { Node, Statement } from "../../core/ast.js";
 import { isFunctionNode, memberPath } from "../../core/ast.js";
 import type { Reference, ScopeInfo, Variable } from "../../core/scope.js";
 import { traverse } from "../../core/traverse.js";
-import type { RuntimeModel } from "./model.js";
-import type { PropertyPath } from "./guest.js";
+import type { Path } from "../../core/traverse.js";
+import type { RuntimeModel, PropertyPath } from "./model.js";
 
 export interface StorageMatcher {
     /** `node` is `G` itself, or another name that only ever holds `G`. */
@@ -103,4 +103,31 @@ export const storageMatcher = (program: Node, runtime: RuntimeModel, scopes: Sco
     };
     matchers.set(scopes, matcher);
     return matcher;
+};
+
+/**
+ * Where the value at `path` goes: up through the operators passing it on (`||`/`&&`/`??`, `?:` branches, a sequence's
+ * last) and the object and array literals holding it (a property's value, an element), to the outermost; `literal`
+ * when it went into one.
+ */
+export const passedOn = (path: Path): { outer: Path; literal: boolean } => {
+    let outer = path;
+    let literal = false;
+    for (let through = outer.parentPath; through !== null; through = outer.parentPath) {
+        const node = through.node;
+        if (node.type === "Property" && outer.key === "value" && through.parent?.type === "ObjectExpression" && through.parentPath !== null) {
+            outer = through.parentPath;
+            literal = true;
+        } else if (node.type === "ArrayExpression" && outer.key === "elements") {
+            outer = through;
+            literal = true;
+        } else if (
+            node.type === "LogicalExpression" ||
+            (node.type === "ConditionalExpression" && outer.key !== "test") ||
+            (node.type === "SequenceExpression" && node.expressions.at(-1) === outer.node)
+        ) {
+            outer = through;
+        } else break;
+    }
+    return { outer, literal };
 };

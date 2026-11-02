@@ -6,13 +6,13 @@ import { cleanup } from "./cleanup.js";
 import { codeLocks } from "./code-locks.js";
 import { detectors } from "./detectors.js";
 import { domainLocks } from "./domain-locks.js";
-import { emulate } from "./emulate/index.js";
 import { globalProxy } from "./global-proxy.js";
 import { hashPredicates } from "./hash-predicates.js";
 import { normalize } from "./normalize.js";
 import { pureCalls } from "./pure-calls.js";
 import { resolveCalls } from "./resolve-calls.js";
 import { simplify } from "./simplify.js";
+import { runtime } from "./runtime/index.js";
 import { storageComparisons } from "./storage-comparisons.js";
 import { unflatten } from "./unflatten/index.js";
 import { unminify } from "./unminify/index.js";
@@ -20,7 +20,7 @@ import { wrappers } from "./wrappers.js";
 
 /**
  * The pipeline, in run order; each pass documents why it sits where it does. Ordering constraints:
- * - resolve-calls right after emulate: decoded strings make computed storage keys static for later storage analyses.
+ * - resolve-calls right after runtime: decoded strings make computed storage keys static for later storage analyses.
  * - code-locks, detectors and domain-locks after wrappers, which turned lock wrapper calls into direct calls.
  * - calculators next: removed lock and detector calls no longer stand between a selector call and its calculation.
  * - storage-comparisons once before the simplify group: its paths are static from the start.
@@ -34,7 +34,7 @@ import { wrappers } from "./wrappers.js";
 export const PIPELINE: readonly PipelineStep[] = [
     normalize,
     unflatten,
-    emulate,
+    runtime,
     resolveCalls,
     globalProxy,
     aliases,

@@ -9,7 +9,7 @@ const run = async (program: string): Promise<{ code: string; lines: string[] }> 
     return { code, lines };
 };
 
-const refusals = (lines: readonly string[]): string[] => lines.filter((line) => line.includes("[emulate]") && line.includes("not taken"));
+const refusals = (lines: readonly string[]): string[] => lines.filter((line) => line.includes("[runtime]") && line.includes("not taken"));
 
 const STORAGE = `
 function G() {}
@@ -191,7 +191,7 @@ setTimeout(function () { result = [G.c1(72, 105), G.c2("a,b", ",").length, Strin
 `;
         const { code, lines } = await run(program);
         expect(refusals(lines)).toEqual([]);
-        expect(lines.some((line) => line.includes("[emulate] global read G.c3() = globalThis.__probe"))).toBe(true);
+        expect(lines.some((line) => line.includes("[runtime] global read G.c3() = globalThis.__probe"))).toBe(true);
         expect(code).toContain("String.fromCharCode(72, 105)");
         expect(code).toContain(`"a,b".split(",").length`);
         expect(code).toContain("String.fromCharCode(65)");
@@ -227,7 +227,7 @@ result = [G.early, String.q2Fcc === String.fromCharCode];
 `;
         const { code, lines } = await run(program);
         expect(code).toContain("String.q2Fcc === String.raw");
-        expect(refusals(lines).some((line) => line.includes("alias String.q2Fcc") && line.includes("an accessor would run before the setup finishes"))).toBe(true);
+        expect(refusals(lines).some((line) => line.includes("not taken as a setup call") && line.includes("an accessor would run before the setup finishes"))).toBe(true);
         expect(observe(code)).toBe(observe(program));
     });
 
@@ -249,5 +249,147 @@ setTimeout(function () { G.m(); result = [G.v === G.w]; });
     it("takes the setup's own call aliases as not using the storage object as this", async () => {
         const { lines } = await run(`${TEMPLATE}\nresult = [G.c1(72)];\n`);
         expect(lines.some((line) => line.includes("may use G as this"))).toBe(false);
+    });
+});
+
+describe("getters: the setup told without running it", () => {
+    it("takes a slot as the global object only where its function provably returns it", async () => {
+        const read = "\nfunction read() { return typeof G[3].Math; }\nsetTimeout(function () { result = read(); });\n";
+        const proven = `${STORAGE}${read}`;
+        expect((await run(proven)).code).toContain("return typeof globalThis.Math;");
+        for (const slot of ["G[3] = (function () { return Math.random() > 2 ? globalThis : { Math: 1 }; })();", "G[3] = (function () { return globalThis; })();\nG[3] = { Math: 1 };"]) {
+            const program = `function G() {}\n${slot}${read}`;
+            const { code } = await run(program);
+            expect(code).toContain("G[3].Math");
+            expect(observe(code, { timers: true })).toBe(observe(program, { timers: true }));
+        }
+    });
+
+    it("takes a setup's argument as the global object only where nothing between may change the slot", async () => {
+        const program = `${STORAGE}
+G[4] = (function () { G[3] = { String: { fromCharCode: function () { return "x"; } } }; return 1; })();
+function S(g) { Object.defineProperty(String, "q2Fcc", { get: function () { return g.String.fromCharCode; }, configurable: true }); }
+S(G[3]);
+result = [String.q2Fcc(72), G[4]];
+`;
+        const { code, lines } = await run(program);
+        expect(code).toContain("String.q2Fcc(72)");
+        expect(lines.some((line) => line.includes("G.3 may change before the call"))).toBe(true);
+        expect(observe(code)).toBe(observe(program));
+    });
+
+    it("keeps a setup that leaves a plain value on G while code reads it, and logs what each setup call defines", async () => {
+        const program = `${STORAGE}
+function S(g) {
+  Object.defineProperty(G, "w", { value: 5, configurable: true });
+  Object.defineProperty(String, "q2Fcc", { get: function () { return String.fromCharCode; }, configurable: true });
+}
+S(G[3]);
+result = [G.w, String.q2Fcc(72)];
+`;
+        const { code, lines } = await run(program);
+        expect(observe(code)).toBe(observe(program));
+        expect(code).toContain("G.w");
+        expect(lines.some((line) => line.includes("setup call: defines G.w, String.q2Fcc"))).toBe(true);
+    });
+
+    it("tells setInterval from setTimeout (the host's functions are each their own)", async () => {
+        const program = `${STORAGE}
+function S(g) {
+  Object.defineProperty(g, "q8Si", { get: function () { return g.setInterval; }, configurable: true });
+  Object.defineProperty(g, "q8St", { get: function () { return g.setTimeout; }, configurable: true });
+}
+S(G[3]);
+result = [q8Si === setInterval, q8St === setTimeout];
+`;
+        const { code } = await run(program);
+        expect(code).toContain("setInterval === setInterval");
+        expect(code).toContain("setTimeout === setTimeout");
+    });
+
+    it("rewrites a method call alias that goes on for a missing receiver only where the receiver is there", async () => {
+        const program = `${STORAGE}
+function S(g) {
+  Object.defineProperty(G, "ap", { get: function () { return function () {
+    var a = Array.prototype.slice.call(arguments);
+    if (a.length === 0) return Function.prototype.apply;
+    var r = a[0] === null || a[0] === undefined ? Function : a[0];
+    return r.apply.apply(r, a.slice(1));
+  }; }, configurable: true });
+}
+S(G[3]);
+var f = null;
+var made = G.ap(f, null, ["return 7"]);
+result = [G.ap(Math.max, null, [1, 5]), made()];
+`;
+        const { code, lines } = await run(program);
+        expect(lines.some((line) => line.includes("call alias G.ap(...) = x.apply(...) where x is neither null nor undefined"))).toBe(true);
+        expect(code).toContain("Math.max.apply(null, [1, 5])");
+        expect(code).toContain("G.ap(f, null,");
+        expect(observe(code)).toBe(observe(program));
+    });
+
+    it("takes a static call alias of a builtin that is no function as throwing a TypeError like it", async () => {
+        const program = `${STORAGE}
+function S(g) {
+  Object.defineProperty(G, "m5", { get: function () { return function () {
+    if (arguments.length > 0) return Math.apply(g, arguments);
+    return Math;
+  }; }, configurable: true });
+}
+S(G[3]);
+var caught;
+try { G.m5(1); } catch (e) { caught = e instanceof TypeError; }
+result = [G.m5() === Math, caught];
+`;
+        const { code } = await run(program);
+        expect(code).toContain("Math(1)");
+        expect(code).toContain("Math === Math");
+        expect(observe(code)).toBe(observe(program));
+    });
+
+    it("follows rest parameters and spreads in the function a getter hands out", async () => {
+        const program = `${STORAGE}
+function S(g) {
+  Object.defineProperty(G, "sp", { get: function () { return (...a) => {
+    if (a.length > 0) return (a[0] === null || a[0] === undefined ? String : a[0]).split(...a.slice(1));
+    return String.prototype.split;
+  }; }, configurable: true });
+}
+S(G[3]);
+result = [G.sp("a,b", ",").length];
+`;
+        const { code } = await run(program);
+        expect(code).toContain(`"a,b".split(",").length`);
+        expect(observe(code)).toBe(observe(program));
+    });
+
+    it("refuses an alias a setup may not install: a defineProperty that may throw, a check of another name", async () => {
+        const twice = `${STORAGE}
+function S(g) {
+  Object.defineProperty(String, "q2Fcc", { get: function () { return String.fromCharCode; } });
+  try { Object.defineProperty(String, "q2Fcc", { get: function () { return String.raw; } }); } catch (e) {}
+}
+S(G[3]);
+result = [String.q2Fcc === String.fromCharCode];
+`;
+        const first = await run(twice);
+        expect(first.code).toContain("String.q2Fcc === String.fromCharCode");
+        expect(first.lines.some((line) => line.includes("alias String.q2Fcc: not taken"))).toBe(true);
+        expect(observe(first.code)).toBe(observe(twice));
+
+        // The page may have the global the setup checks: then it installs nothing.
+        const other = `${STORAGE}
+function S(g) {
+  if (g.hasOwnProperty("pageFlag")) return;
+  Object.defineProperty(g, "q1Str", { get: function () { return g.String; }, configurable: true });
+}
+S(G[3]);
+result = [typeof q1Str];
+`;
+        const second = await run(other);
+        expect(second.code).toContain("typeof q1Str");
+        const page: Run = { globals: () => ({ pageFlag: 1 }) };
+        expect(observe(second.code, page)).toBe(observe(other, page));
     });
 });

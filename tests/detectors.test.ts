@@ -5,7 +5,7 @@ import { observe, type Run } from "./helpers.js";
 /** Runs in a healthy, undebugged page: no `require`/`process`, native `Date.now`, a `navigator`. */
 const RUN: Run = { globals: () => ({ navigator: { userAgent: "test" } }), timers: true };
 
-const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["emulate", "detectors", "simplify", "cleanup"] })).code;
+const run = async (code: string): Promise<string> => (await deobfuscate(code, { passes: ["runtime", "detectors", "simplify", "cleanup"] })).code;
 
 const sameBehaviour = async (program: string): Promise<string> => {
     const output = await run(program);
@@ -97,7 +97,7 @@ setTimeout(function () { result = [G.L.d() ? "set" : "unset"]; });
 const WITH_FEATURE: Run = { globals: () => ({ FEATURE: true }), timers: true };
 
 describe("detectors", () => {
-    it("answers every detector call whose builder ran alike with and without the host's globals", async () => {
+    it("answers every detector call, directly and through a wrapper", async () => {
         const program = `${DETECTORS}if (G.w()) { log.push("start"); }
 setTimeout(function () {
   if (!G.N.d()) { log.push("n"); }
@@ -107,11 +107,9 @@ setTimeout(function () {
 });
 `;
         const output = await sameBehaviour(program);
-        expect(output).not.toMatch(/G\.[NFH]\.d\(\)/);
-        // G.T's builder reads navigator: without it the guest's run throws, with it (the second lane) it builds G.T,
-        // so what the prelude's G.w() call reaches is unknown and its calls stay.
-        expect(output).toContain("if (G.w()) {");
-        expect(output).toContain("result = [log, undefined, true, false, G.w(), typeof G.T.d()];");
+        // G.T's builder reads navigator, which its static proof doesn't need: its calls are answered too.
+        expect(output).not.toMatch(/G\.([NFHT]\.d|w)\(\)/);
+        expect(output).toContain('result = [log, undefined, true, false, true, "boolean"];');
     });
 
     it("answers only the truthiness of a report whose detections aren't all literal codes", async () => {
@@ -144,7 +142,7 @@ G.V = function () {
             const output = await sameBehaviour(program);
             expect(output).toContain("result = [G.N.d()];");
         }
-        // A prelude call before the builder (the guest didn't finish it) runs before the detector exists.
+        // A prelude call before the builder runs before the detector exists.
         const early = DETECTORS.replace("G.T = function", 'try { var early = G.T.d(); } catch (e) { early = "threw"; }\nG.T = function');
         const output = await sameBehaviour(`${early}setTimeout(function () { result = [early, G.T.d()]; });\n`);
         expect(output).toContain("var early = G.T.d();");
@@ -155,14 +153,21 @@ G.V = function () {
         const shapes = [
             lazy('S[4] = "ready";', unfinished), // set unconditionally: an initialization
             lazy("S[4] = [1, 2].join();", unfinished), // a computed value
-            lazy("S[4] = Date.now() > 0;", unfinished), // a check's outcome the guest can't confirm is no detection code
-            lazy('if (Date.now() > 0) { S[4] = "j-016-00001"; }'), // a check that fires in the guest, which isn't debugged
+            lazy("S[4] = Date.now() > 0;", unfinished), // a check's outcome, with no debugger sign
             lazy('if (Date.now() > 0) { S[4] = "j-016-00001"; }', "\n  S[4] = 7;"), // started as a report
         ];
         for (const program of shapes) {
             const output = await sameBehaviour(program);
             expect(output).toContain("G.L.d()");
         }
+    });
+
+    it("answers a check that stores a detection code, whatever it tests (model 5)", async () => {
+        // The code is the debugger sign: model 5 takes such a check not to fire undebugged, and this one, which does
+        // fire, is answered all the same.
+        const output = await run(lazy('if (Date.now() > 0) { S[4] = "j-016-00001"; }'));
+        expect(output).not.toContain("G.L.d()");
+        expect(output).toContain('"unset"');
     });
 
     it("leaves a lazy feature probe: nothing in it checks for a debugger", async () => {
@@ -201,5 +206,32 @@ setTimeout(function () { result = [G.L.d() ? "set" : "unset", G.L.e() ? "on" : "
             const output = await sameBehaviour(program);
             expect(observe(output, RUN), start).toContain(",1]");
         }
+    });
+
+    it("answers a detector whose report write is computed, behind a debugger sign in its own code (model 5)", async () => {
+        // A timing check around opening an inspector: undebugged it reports nothing, whatever its write computes.
+        const program = lazy('var t = Date.now(); if (typeof require === "function") { require("inspector").url(); } S[4] = Date.now() - t > 100;');
+        const output = await sameBehaviour(program);
+        expect(output).not.toContain("G.L.d()");
+        expect(output).toContain('"unset"');
+    });
+
+    it("keeps a computed report write when only a sibling method shows a debugger sign", async () => {
+        const program = `
+function G() {}
+G.L = function () {
+  var S = [arguments];
+  return {
+    d: function () { var X = [arguments]; if (!S[4]) { P(); } return S[4]; },
+    e: function () { var X = [arguments]; if (!S[6]) { Q(); } return S[6]; }
+  };
+  function P() { var t = Date.now(); S[4] = Date.now() - t > 100; }
+  function Q() { if (typeof require === "function" && require("inspector").url()) { S[6] = "j-016-00001"; } }
+}();
+setTimeout(function () { result = [G.L.d() ? "set" : "unset", G.L.e() ? "on" : "off"]; });
+`;
+        const output = await sameBehaviour(program);
+        expect(output).toContain("G.L.d()");
+        expect(output).not.toContain("G.L.e()");
     });
 });

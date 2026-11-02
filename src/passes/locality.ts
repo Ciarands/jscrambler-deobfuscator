@@ -1,13 +1,24 @@
-import type { FunctionLike, Node } from "../core/ast.js";
-import { keyName, propertyKey } from "../core/ast.js";
+import type { Expression, FunctionLike, Node } from "../core/ast.js";
+import { isFunctionNode, keyName, propertyKey } from "../core/ast.js";
 import type { Scope, ScopeInfo, Variable } from "../core/scope.js";
-import type { Slot } from "./emulate/builders.js";
-import { sameSlot, slotArray, slotOf } from "./emulate/builders.js";
+import { traverse } from "../core/traverse.js";
+import { keySets, mayName } from "./key-sets.js";
+import type { Slot } from "./runtime/builders.js";
+import { returnsOf, sameSlot, slotArray, slotOf } from "./runtime/builders.js";
 
 export interface Effect {
     readonly reason: string;
     readonly node: Node;
 }
+
+/**
+ * A call the runtime's facts model: `alias`, a call alias `G.k(...)` standing for a builtin (model 7; no arguments give
+ * the builtin itself); `own-state`, a call writing only state the runtime keeps for itself (a templated decoder's),
+ * giving a primitive or a builtin.
+ */
+export type RuntimeCall =
+    | { readonly kind: "alias"; readonly owner: readonly string[]; readonly original: string; readonly style: "static" | "method" | "call"; readonly nullishCalls: boolean }
+    | { readonly kind: "own-state" };
 
 // Own objects are tracked by allocation site so fields keyed by strings read from own arrays stay exact.
 /** Non-string primitives. */
@@ -102,6 +113,12 @@ const OUTSIDE_KINDS = kinds(OUTSIDE);
 
 const foreign = (value: Kinds): number => value.bits & (OUTSIDE | BUILTIN);
 
+/** `a + b`: a string only when an operand may be one or an object (converted, model 4: no `valueOf` of the program's). */
+const sumOf = (left: Kinds, right: Kinds): Kinds => {
+    const stringy = (value: Kinds): boolean => (value.bits & ~OTHER) !== 0 || value.strings !== undefined || value.sites !== undefined || value.args !== undefined;
+    return stringy(left) || stringy(right) ? PRIMITIVE_KINDS : OTHER_KINDS;
+};
+
 /** Whether a key may be any string: one the function doesn't know exactly, or an object's or a symbol's. */
 const unknownKey = (key: Kinds): boolean => (key.bits & (STRING | SYMBOL | BUILTIN | OUTSIDE)) !== 0 || key.sites !== undefined || key.args !== undefined;
 
@@ -139,7 +156,7 @@ const PURE_FUNCTIONS: ReadonlyMap<string, Kinds> = new Map([
     ...["isNaN", "isFinite", "parseInt", "parseFloat", "Number", "Boolean", "Symbol", "BigInt"].map((name) => [name, OTHER_KINDS] as const),
 ]);
 
-type StaticResult = "other" | "string" | "keys" | "prototype";
+type StaticResult = "other" | "string" | "keys" | "prototype" | "descriptor";
 
 const mathFunctions = Object.getOwnPropertyNames(Math).filter((name) => typeof (Math as unknown as Record<string, unknown>)[name] === "function");
 
@@ -159,6 +176,7 @@ const PURE_STATICS: ReadonlyMap<string, ReadonlyMap<string, StaticResult>> = new
             ["keys", "keys"],
             ["getOwnPropertyNames", "keys"],
             ["getPrototypeOf", "prototype"],
+            ["getOwnPropertyDescriptor", "descriptor"],
             ["is", "other"],
         ]),
     ],
@@ -198,6 +216,42 @@ const STORING_METHODS: ReadonlySet<string> = new Set(["push", "unshift"]);
 /** Builtin methods that would install accessors, whose calls on reads and writes the analysis doesn't follow. */
 const ACCESSOR_METHODS: ReadonlySet<string> = new Set(["__defineGetter__", "__defineSetter__"]);
 
+/** Keys host code calls a function under, on an object it got as a value: conversions, iteration, thenables, `JSON.stringify`. */
+const HOST_CALLED: ReadonlySet<string> = new Set(["valueOf", "toString", "toLocaleString", "toJSON", "then", "next", "return", "throw", "handleEvent"]);
+
+/** The standard library's globals (model 7: the global object holds the builtins under these names). */
+const STANDARD_GLOBALS: ReadonlySet<string> = new Set([
+    "Object",
+    "Function",
+    "Array",
+    "String",
+    "Number",
+    "Boolean",
+    "Symbol",
+    "BigInt",
+    "Math",
+    "JSON",
+    "Date",
+    "RegExp",
+    "Error",
+    "EvalError",
+    "RangeError",
+    "ReferenceError",
+    "SyntaxError",
+    "TypeError",
+    "URIError",
+    "parseInt",
+    "parseFloat",
+    "isNaN",
+    "isFinite",
+    "escape",
+    "unescape",
+    "encodeURI",
+    "decodeURI",
+    "encodeURIComponent",
+    "decodeURIComponent",
+]);
+
 type Eval = () => Kinds;
 type CallNode = Node & { type: "CallExpression" | "NewExpression" };
 
@@ -223,6 +277,243 @@ const insideWith = (scope: Scope | null): boolean => {
     return false;
 };
 
+/** Calls defining a property under a key they are passed: the key's argument, by method name (`set`: `Reflect.set`). */
+const DEFINING_KEY: Readonly<Record<string, number>> = { defineProperty: 1, set: 1, __defineGetter__: 0, __defineSetter__: 0 };
+
+/**
+ * Calls giving their first argument the keys of others, own or inherited: the first such argument, by method name
+ * (`Object.assign(o, ...sources)`, `Object.defineProperties(o, descriptors)`, `Object.setPrototypeOf(o, prototype)`).
+ */
+const COPYING_FROM: Readonly<Record<string, number>> = { assign: 1, defineProperties: 1, setPrototypeOf: 1 };
+
+/** What a variable may hold, written so: objects the program made, never the global object. */
+const MADE: Readonly<Record<string, true>> = { ArrayExpression: true, ObjectExpression: true, FunctionExpression: true, ArrowFunctionExpression: true, ClassExpression: true };
+
+/**
+ * What a variable holds when every write (a declarator or a plain assignment) gives it an object or array literal or a
+ * function: those values; `undefined` otherwise.
+ */
+const ownValues = (variable: Variable, scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): Node[] | undefined => {
+    const references = scopes.references(variable);
+    if (references === undefined || !variable.defs.every((def) => def.type === "Variable" || def.type === "FunctionName")) return undefined;
+    const values: Node[] = [];
+    for (const reference of references) {
+        if (!reference.isWrite()) continue;
+        const id = reference.identifier as unknown as Node;
+        const parent = parents.get(id);
+        const value =
+            parent?.type === "VariableDeclarator" && parent.id === id
+                ? parent.init
+                : parent?.type === "AssignmentExpression" && parent.operator === "=" && parent.left === id
+                  ? parent.right
+                  : undefined;
+        if (value === undefined || value === null || MADE[value.type] !== true) return undefined;
+        values.push(value);
+    }
+    return values;
+};
+
+/** `Array(...)`, `new Array(...)` (model 7: the builtin), an array literal, or `fill` or `map` called on one: a fresh array. */
+const freshArray = (node: Node, scopes: ScopeInfo): boolean => {
+    if (node.type === "ArrayExpression") return true;
+    if ((node.type === "CallExpression" || node.type === "NewExpression") && node.callee.type === "Identifier") return node.callee.name === "Array" && scopes.isGlobalReference(node.callee);
+    if (node.type !== "CallExpression" || node.callee.type !== "MemberExpression") return false;
+    const name = propertyKey(node.callee);
+    return (name === "fill" || name === "map") && freshArray(node.callee.object, scopes);
+};
+
+/** A value that is never the global object: a literal, a function, a primitive an operator gives, a fresh array. */
+const notGlobal = (node: Node, scopes: ScopeInfo): boolean =>
+    MADE[node.type] === true ||
+    node.type === "Literal" ||
+    node.type === "TemplateLiteral" ||
+    node.type === "UnaryExpression" ||
+    node.type === "BinaryExpression" ||
+    node.type === "UpdateExpression" ||
+    freshArray(node, scopes);
+
+/**
+ * A fresh array none of whose own values is the global object (model 7: `fill` fills its receiver, `map` makes a
+ * plain array of what its callback returns): an array literal or `Array(...)` of such values, `fill` with one, `map`
+ * with a plain function returning only such values.
+ */
+const freshElements = (node: Node, scopes: ScopeInfo): boolean => {
+    if (node.type === "ArrayExpression") return node.elements.every((element) => element === null || notGlobal(element, scopes));
+    if (node.type !== "CallExpression" && node.type !== "NewExpression") return false;
+    const { callee } = node;
+    const args = node.arguments;
+    if (callee.type === "Identifier") return freshArray(node, scopes) && args.every((arg) => notGlobal(arg, scopes));
+    if (node.type !== "CallExpression" || callee.type !== "MemberExpression" || !freshArray(callee.object, scopes)) return false;
+    const name = propertyKey(callee);
+    const [first] = args;
+    // `fill(v, start, end)` leaves the receiver's values outside `start..end`.
+    if (name === "fill") return (first === undefined || notGlobal(first, scopes)) && (args.length <= 1 || freshElements(callee.object, scopes));
+    if (name !== "map" || (first?.type !== "FunctionExpression" && first?.type !== "ArrowFunctionExpression") || first.async || (first.type === "FunctionExpression" && first.generator)) return false;
+    if (first.body?.type !== "BlockStatement") return first.body !== null && first.body !== undefined && notGlobal(first.body, scopes);
+    return returnsOf(first).every((ret) => ret.type === "ReturnStatement" && (ret.argument === null || notGlobal(ret.argument, scopes)));
+};
+
+/**
+ * `a` in `a[i][k] = v`: written once, by its declarator, with a fresh array none of whose own values is the global
+ * object (`freshElements`); read only for one of its properties, never written to one: `a[i]` is one of those values, a
+ * number (`length`) or a builtin (inherited, model 7), never the global object.
+ */
+const freshHolder = (variable: Variable, scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>, written: ReadonlySet<Node>): boolean => {
+    const references = scopes.references(variable);
+    const definition = variable.defs.length === 1 ? (variable.defs[0]?.node as unknown as Node) : undefined;
+    if (references === undefined || definition?.type !== "VariableDeclarator" || definition.init === null || !freshElements(definition.init, scopes)) return false;
+    const method = (member: Node): boolean => {
+        const parent = parents.get(member);
+        return parent?.type === "CallExpression" && parent.callee === member;
+    };
+    return references.every((reference) => {
+        const id = reference.identifier as unknown as Node;
+        if (reference.isWrite()) return id === definition.id && !reference.isRead();
+        const element = parents.get(id);
+        return element?.type === "MemberExpression" && element.object === id && !written.has(element) && !method(element);
+    });
+};
+
+const requireMakers = new WeakMap<ScopeInfo, { readonly generation: number; readonly effect: Effect | undefined }>();
+
+/**
+ * Why the program may itself make a global `require` (model 10 speaks only of the host's), or `undefined`: a `with`; a
+ * write of the bare name; `require` as a static property name or in a string (a write by name,
+ * `Object.defineProperty(o, "require", ...)`, code a string hands `eval`); a computed key `key-sets` can't tell from
+ * `require` or `__proto__` of a write, of an object literal or class, or of a property-defining call (`DEFINING_KEY`,
+ * also through `.call` and `.apply`, and called by a computed name `key-sets` can't tell from every such builtin). The
+ * global object may be held anywhere else.
+ *
+ * A write to a variable only holding objects the program made (`ownValue`), or to a value of a fresh array a variable
+ * keeps (`freshHolder`: `a[i][k] = v`), writes no global; but the keys it gives reach the global object where that
+ * object is copied there (`COPYING_FROM`, a `__proto__` write or literal property). A copy may take keys only from
+ * literals and from variables holding their own objects, whose writes are then checked; any other value refuses.
+ */
+const requireMaker = (scopes: ScopeInfo): Effect | undefined => {
+    const known = requireMakers.get(scopes);
+    if (known !== undefined && known.generation === scopes.generation) return known.effect;
+    const program = scopes.manager.globalScope?.block as unknown as Node | undefined;
+    let effect: Effect | undefined;
+    const parents = new Map<Node, Node>();
+    const keys: { key: Node; object?: Node }[] = [];
+    /** Method calls: the method's member, and the arguments it gets (`undefined` where `apply` hides them). */
+    const calls: { call: Node; member: Node & { type: "MemberExpression" }; args: readonly Node[] | undefined }[] = [];
+    /** What a copy may take keys from. */
+    const sources: Node[] = [];
+    /** Members written to. */
+    const written = new Set<Node>();
+    if (program !== undefined) {
+        traverse(program, {
+            enter(path) {
+                const node = path.node;
+                if (path.parent !== null) parents.set(node, path.parent);
+                if (effect !== undefined) return;
+                const parent = path.parent;
+                if (node.type === "WithStatement") effect = { reason: "a with statement may make a name a property", node };
+                else if (
+                    (node.type === "Literal" && typeof node.value === "string" && node.value.includes("require")) ||
+                    (node.type === "TemplateElement" && node.value.cooked?.includes("require") === true)
+                )
+                    effect = { reason: "a string names require", node };
+                else if (node.type === "Identifier" && node.name === "require") {
+                    const asKey =
+                        (parent?.type === "MemberExpression" && path.key === "property" && !parent.computed) ||
+                        ((parent?.type === "Property" || parent?.type === "MethodDefinition" || parent?.type === "PropertyDefinition") && path.key === "key" && !parent.computed);
+                    if (asKey) effect = { reason: "it names require as a property", node };
+                    else if (path.isWriteTarget() && scopes.staticVariableOf(node) === undefined) effect = { reason: "it writes the global require", node };
+                } else if (node.type === "MemberExpression" && path.isWriteTarget()) {
+                    written.add(node);
+                    if (node.computed && node.property.type !== "Literal") keys.push({ key: node.property, object: node.object });
+                    else if (propertyKey(node) === "__proto__") {
+                        if (parent?.type === "AssignmentExpression" && parent.operator === "=" && path.key === "left") sources.push(parent.right);
+                        else effect = { reason: "a copy takes keys from a value it can't tell", node };
+                    }
+                } else if ((node.type === "Property" || node.type === "MethodDefinition" || node.type === "PropertyDefinition") && node.computed) keys.push({ key: node.key });
+                else if (node.type === "CallExpression" && node.callee.type === "MemberExpression") {
+                    // `f.call(self, ...args)` and `f.apply(self, args)` call `f` too.
+                    const via = propertyKey(node.callee);
+                    const through = (via === "call" || via === "apply") && node.callee.object.type === "MemberExpression";
+                    const member = through ? (node.callee.object as Node & { type: "MemberExpression" }) : node.callee;
+                    const name = propertyKey(member);
+                    if (name === undefined ? member.computed : Object.hasOwn(DEFINING_KEY, name) || Object.hasOwn(COPYING_FROM, name)) {
+                        const args = !through ? node.arguments : via === "call" && node.arguments[0]?.type !== "SpreadElement" ? node.arguments.slice(1) : undefined;
+                        calls.push({ call: node, member, args });
+                    }
+                }
+            },
+        });
+    }
+    const keySetOf = keySets(scopes, parents);
+    for (const { call, member, args } of effect === undefined ? calls : []) {
+        const name = propertyKey(member);
+        const names = name === undefined ? keySetOf(member.property as Expression) : undefined;
+        if (name === undefined && names === undefined) {
+            effect ??= { reason: "a call by a computed name may be a property-defining builtin's", node: member.property };
+            continue;
+        }
+        const may = (builtin: string): boolean => (names === undefined ? builtin === name : mayName(names, builtin));
+        // `set` only as `Reflect.set`, but the object of a call by a computed name isn't told.
+        const reflect = name === undefined || (member.object.type === "Identifier" && member.object.name === "Reflect");
+        const defining = Object.keys(DEFINING_KEY).filter((builtin) => may(builtin) && (builtin !== "set" || reflect));
+        const copying = Object.keys(COPYING_FROM).filter(may);
+        if (defining.length + copying.length === 0) continue;
+        if (args === undefined) {
+            effect ??= { reason: "a property-defining call's arguments can't be told", node: call };
+            continue;
+        }
+        for (const builtin of defining) {
+            const index = DEFINING_KEY[builtin] as number;
+            const key = args[index];
+            if (args.slice(0, index + 1).some((argument) => argument.type === "SpreadElement")) effect ??= { reason: "a property-defining call's key can't be told", node: call };
+            else if (key !== undefined && key.type !== "Literal") keys.push({ key });
+        }
+        for (const builtin of copying) {
+            const from = COPYING_FROM[builtin] as number;
+            if (args.slice(0, from).some((argument) => argument.type === "SpreadElement")) effect ??= { reason: "a copy takes keys from a value it can't tell", node: call };
+            // `assign` takes every later argument.
+            else sources.push(...(builtin === "assign" ? args.slice(from) : args.slice(from, from + 1)));
+        }
+    }
+    /** Variables holding their own objects whose keys a copy takes: their writes stay checked. */
+    const sourced = new Set<Variable>();
+    for (let i = 0; i < sources.length; i++) {
+        const source = sources[i] as Node;
+        // A literal's own keys are in the program (computed ones are checked); a spread's, a prototype's and a
+        // superclass's are a value's.
+        if (source.type === "ObjectExpression") {
+            for (const property of source.properties) {
+                if (property.type === "SpreadElement") sources.push(property.argument);
+                else if (property.kind === "init" && !property.computed && !property.shorthand && !property.method && keyName(property.key) === "__proto__") sources.push(property.value);
+            }
+            continue;
+        }
+        if (source.type === "ClassExpression" && source.superClass !== null) sources.push(source.superClass);
+        if (MADE[source.type] === true || (source.type === "Literal" && source.value === null)) continue;
+        const variable = source.type === "Identifier" ? scopes.staticVariableOf(source) : undefined;
+        const values = variable === undefined ? undefined : ownValues(variable, scopes, parents);
+        if (variable === undefined || values === undefined) effect ??= { reason: "a copy takes keys from a value it can't tell", node: source };
+        else if (!sourced.has(variable)) {
+            sourced.add(variable);
+            sources.push(...values);
+        }
+    }
+    if (effect === undefined) {
+        for (const { key, object } of keys) {
+            const variable = object?.type === "Identifier" ? scopes.staticVariableOf(object) : undefined;
+            if (variable !== undefined && !sourced.has(variable) && ownValues(variable, scopes, parents) !== undefined) continue;
+            const holder = object?.type === "MemberExpression" && object.object.type === "Identifier" ? scopes.staticVariableOf(object.object) : undefined;
+            if (holder !== undefined && freshHolder(holder, scopes, parents, written)) continue;
+            const set = keySetOf(key as Expression);
+            const named = set === undefined ? "require" : ["require", "__proto__"].find((name) => mayName(set, name));
+            if (named === undefined) continue;
+            effect = { reason: `a computed key that may be ${named}`, node: key };
+            break;
+        }
+    }
+    requireMakers.set(scopes, { generation: scopes.generation, effect });
+    return effect;
+};
+
 const argsKinds = (fn: Node): Kinds => {
     const result = new Kinds();
     result.addArgs(fn);
@@ -237,6 +528,11 @@ class Analysis {
     readonly #scopes: ScopeInfo;
     readonly #parents: ReadonlyMap<Node, Node>;
     readonly #isGlobalRead: (call: Node) => boolean;
+    readonly #runtimeCall: ((call: Node) => RuntimeCall | undefined) | undefined;
+    /** `f.bind(t, ...a)` results, by the call making them: what calling one calls, with which `this` and leading arguments. */
+    readonly #bound = new Map<object, { readonly target: Kinds; readonly self: Kinds; readonly args: Kinds }>();
+    /** Bound functions being called (a bound function may end up calling itself). */
+    readonly #calling = new Set<object>();
     readonly #fnScope: Scope | null;
     readonly #within = new Map<Scope, boolean>();
     readonly #facts: (() => void)[] = [];
@@ -259,17 +555,31 @@ class Analysis {
     readonly #returns = new Map<Node, Kinds>();
     /** Every own object but the slot arrays: what `this` may be when host code calls an own function implicitly. */
     readonly #allSites = new Kinds();
+    /** The statement lists being compiled in the current function, outermost first, at the statement being compiled. */
+    #lists: { readonly statements: readonly Node[]; index: number }[] = [];
+    /** `#setBefore`'s reads, and the field buckets a `delete` may take off own objects. */
+    readonly #setReads: { readonly site: Node; readonly key: string; readonly node: Node }[] = [];
+    readonly #deleted = new Map<object, Set<string>>();
 
     #thisOwner: Node;
     #returnOwner: Node;
 
-    constructor(fn: Node, allowed: Slot | undefined, called: readonly string[] | undefined, scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>, isGlobalRead: (call: Node) => boolean) {
+    constructor(
+        fn: Node,
+        allowed: Slot | undefined,
+        called: readonly string[] | undefined,
+        scopes: ScopeInfo,
+        parents: ReadonlyMap<Node, Node>,
+        isGlobalRead: (call: Node) => boolean,
+        runtimeCall?: (call: Node) => RuntimeCall | undefined
+    ) {
         this.#fn = fn;
         this.#allowed = allowed;
         this.#called = called;
         this.#scopes = scopes;
         this.#parents = parents;
         this.#isGlobalRead = isGlobalRead;
+        this.#runtimeCall = runtimeCall;
         this.#fnScope = scopes.scopeOf(fn);
         this.#thisOwner = fn;
         this.#returnOwner = fn;
@@ -286,7 +596,11 @@ class Analysis {
                 if (round === MAX_ROUNDS) return { reason: `the analysis didn't settle in ${MAX_ROUNDS} rounds`, node: this.#fn };
                 this.#changed = false;
                 for (const fact of this.#facts) fact();
-                if (!this.#changed) return this.#called === undefined ? undefined : this.#calledEffect(this.#called);
+                if (!this.#changed) {
+                    const lost = this.#setReads.find(({ site, key }) => this.#deleted.get(site)?.has(bucketOf(key)) === true || this.#deleted.get(site)?.has(UNKNOWN) === true);
+                    if (lost !== undefined) return { reason: "reads a field a delete may take off, where what its prototype has shows", node: lost.node };
+                    return this.#called === undefined ? undefined : this.#calledEffect(this.#called);
+                }
             }
         } catch (error) {
             if (error instanceof Refusal) return error.effect;
@@ -325,7 +639,10 @@ class Analysis {
     }
 
     #growField(site: object, bucket: string, value: Kinds): void {
-        this.#markLive(value);
+        // Host code calls a function an own object holds only under these keys (conversions, the iteration and
+        // thenable protocols, `JSON.stringify`) or a symbol's; any other host call gets the object first (a builtin's
+        // argument: `#callBuiltin` marks what it reaches live; anything from outside is refused).
+        if (bucket === UNKNOWN || HOST_CALLED.has(bucket)) this.#markLive(value);
         this.#grow(this.#field(site, bucket), value);
     }
 
@@ -468,6 +785,8 @@ class Analysis {
                 const found = new Kinds();
                 this.#collectFields(site, kinds(STRING), found, new Set());
                 found.add(this.#links.get(site) ?? NOTHING);
+                const bound = this.#bound.get(site);
+                if (bound !== undefined) found.add(union([bound.target, bound.self, bound.args]));
                 out.add(found);
                 work.push(found);
             }
@@ -575,7 +894,10 @@ class Analysis {
         if (name === "test" && [...(self.sites ?? [])].every((site) => !this.#fields.has(site))) return OTHER_KINDS;
         const reached = this.#reach(union([self, args]));
         this.#markLive(reached);
-        for (const site of reached.sites ?? []) if (this.#slotSites.has(site)) refuse("hands a slot array to a builtin method", node);
+        for (const site of reached.sites ?? []) {
+            if (this.#slotSites.has(site)) refuse("hands a slot array to a builtin method", node);
+            if (this.#bound.has(site)) refuse("hands a bound function to a builtin method", node);
+        }
         const returned = new Kinds();
         for (const site of reached.sites ?? []) {
             if (!this.#functions.has(site)) continue;
@@ -591,10 +913,79 @@ class Analysis {
     }
 
     #invoke(callee: Kinds, self: Kinds, method: Kinds, args: Kinds, node: CallNode): Kinds {
+        // `f.bind(t)`/`f.toString()` on a value from outside or a bound function: the methods functions inherit, host
+        // ones included (model 7, user decision 2026-11-02); they read `f` and make a bound function or a string.
+        const name = !unknownKey(method) && (method.bits & OTHER) === 0 && method.strings?.size === 1 ? [...method.strings][0] : undefined;
+        const hostReceiver =
+            (self.bits & OUTSIDE) !== 0 &&
+            (self.bits & ~(OUTSIDE | OTHER)) === 0 &&
+            self.strings === undefined &&
+            self.args === undefined &&
+            [...(self.sites ?? [])].every((site) => this.#bound.has(site) && !this.#fields.has(site));
+        if ((callee.bits & OUTSIDE) !== 0 && hostReceiver && node.type === "CallExpression" && (name === "bind" || name === "toString")) {
+            if (name === "toString") return kinds(STRING);
+            const bound = this.#bound.get(node) ?? { target: new Kinds(), self: new Kinds(), args: new Kinds() };
+            this.#bound.set(node, bound);
+            this.#grow(bound.target, self);
+            this.#grow(bound.self, args);
+            this.#grow(bound.args, args);
+            return siteKinds(node);
+        }
         if ((callee.bits & OUTSIDE) !== 0) refuse("calls a function from outside", node);
         const out = this.#callOwn(callee, self, args, node);
-        if ((callee.bits & BUILTIN) !== 0) out.add(this.#callBuiltin(self, method, args, node));
+        for (const site of callee.sites ?? []) {
+            const bound = this.#bound.get(site);
+            if (bound === undefined || this.#calling.has(site)) continue;
+            this.#calling.add(site);
+            out.add(this.#invoke(bound.target, bound.self, NOTHING, union([bound.args, args]), node));
+            this.#calling.delete(site);
+        }
+        if ((callee.bits & BUILTIN) === 0) return out;
+        // `f.bind(t, ...a)` makes a function and does nothing else (model 7); calling it calls `f` with `t` and `a`.
+        if (node.type === "CallExpression" && !unknownKey(method) && (method.bits & OTHER) === 0 && method.strings?.size === 1 && method.strings.has("bind")) {
+            const bound = this.#bound.get(node) ?? { target: new Kinds(), self: new Kinds(), args: new Kinds() };
+            this.#bound.set(node, bound);
+            this.#grow(bound.target, self);
+            this.#grow(bound.self, args);
+            this.#grow(bound.args, args);
+            out.add(siteKinds(node));
+            return out;
+        }
+        out.add(this.#callBuiltin(self, method, args, node));
         return out;
+    }
+
+    /** A call the runtime's facts model (`RuntimeCall`). */
+    #compileRuntimeCall(modeled: RuntimeCall, node: CallNode): Eval {
+        const parts = node.arguments.map((argument) => (argument.type === "SpreadElement" ? this.#compileSpread(argument.argument) : this.#compile(argument)));
+        const all = (): Kinds => union(parts.map((part) => part()));
+        if (modeled.kind === "own-state") {
+            return () => {
+                all();
+                return kinds(OTHER | STRING | BUILTIN);
+            };
+        }
+        if (parts.length === 0) return () => kinds(BUILTIN);
+        const { owner, original, style } = modeled;
+        if (style === "static") {
+            const result = owner.length === 0 ? undefined : PURE_STATICS.get(owner.join("."))?.get(original);
+            if (result !== undefined) return this.#compileStatic(result, all, node);
+            const pure = owner.length === 0 ? PURE_FUNCTIONS.get(original) : undefined;
+            if (pure === undefined) return refuse(`calls ${[...owner, original].join(".")} through a call alias, which it can't tell`, node);
+            return () => {
+                all();
+                return pure;
+            };
+        }
+        const [receiver, ...rest] = parts;
+        const name = exact(original);
+        return () => {
+            const self = (receiver as Eval)();
+            const args = union(rest.map((part) => part()));
+            if (modeled.nullishCalls && (self.bits & OTHER) !== 0) refuse("a call alias may call another builtin on a null or undefined receiver", node);
+            // `call`: always the builtin; `method`: whatever the receiver has under that name.
+            return style === "call" ? this.#callBuiltin(self, name, args, node) : this.#invoke(this.#read(self, name), self, name, args, node);
+        };
     }
 
     #compileArguments(node: CallNode): Eval {
@@ -648,9 +1039,20 @@ class Analysis {
     #compileCall(node: CallNode): Eval {
         // A call the caller proved to read a global property (a setup getter's): a read, giving a value from outside.
         if (this.#isGlobalRead(node)) return () => OUTSIDE_KINDS;
+        const modeled = this.#runtimeCall?.(node);
+        if (modeled !== undefined) return this.#compileRuntimeCall(modeled, node);
         const inPlace = this.#compileInPlace(node);
         if (inPlace !== undefined) return inPlace;
         const callee = node.callee;
+        // Model 10 (user decision 2026-11-02): the script runs in a web page, which has no `require`, unless the program
+        // makes one (`requireMaker`). Calling it throws a ReferenceError before the arguments are evaluated; here that
+        // throw lands in a handler of this function's own `try`, or a `typeof require` test keeps the call from running
+        // at all: either way the call does nothing.
+        if (callee.type === "Identifier" && this.#hostGlobal(callee) === "require" && this.#guardedRequire(node)) {
+            const maker = requireMaker(this.#scopes);
+            if (maker !== undefined) return refuse(`calls require, which the program may make a global: ${maker.reason}`, maker.node);
+            return () => NOTHING;
+        }
         const args = this.#compileArguments(node);
         const isNew = node.type === "NewExpression";
 
@@ -674,6 +1076,8 @@ class Analysis {
             const result = owner === undefined || name === undefined ? undefined : PURE_STATICS.get(owner)?.get(name);
             if (result !== undefined) return this.#compileStatic(result, args, node);
         }
+        const known = this.#knownCall(node, args);
+        if (known !== undefined) return known;
         if (callee.type !== "MemberExpression") {
             const value = this.#compile(callee);
             return () => this.#invoke(value(), OUTSIDE_KINDS, NOTHING, args(), node);
@@ -684,6 +1088,139 @@ class Analysis {
         const value = this.#compileMember(callee);
         const key = this.#compileKey(callee);
         return () => this.#invoke(value(), receiver(), key(), args(), node);
+    }
+
+    /** A `require(...)` call that a `try` of this function catches the throw of, or that `typeof require` guards. */
+    #guardedRequire(call: Node): boolean {
+        const typeofRequire = (test: Node): boolean =>
+            test.type === "BinaryExpression" &&
+            [test.left, test.right].some(
+                (side) => side.type === "UnaryExpression" && side.operator === "typeof" && side.argument.type === "Identifier" && this.#hostGlobal(side.argument) === "require"
+            ) &&
+            [test.left, test.right].some(
+                (side) =>
+                    side.type === "Literal" &&
+                    ((side.value === "function" && (test.operator === "===" || test.operator === "==")) || (side.value === "undefined" && (test.operator === "!==" || test.operator === "!=")))
+            );
+        let child: Node = call;
+        for (let parent = this.#parents.get(call); parent !== undefined; child = parent, parent = this.#parents.get(parent)) {
+            if (isFunctionNode(parent)) return false;
+            if (parent.type === "TryStatement" && parent.block === child && parent.handler !== null) return true;
+            if (parent.type === "LogicalExpression" && parent.operator === "&&" && parent.right === child && typeofRequire(parent.left)) return true;
+            if ((parent.type === "IfStatement" || parent.type === "ConditionalExpression") && parent.consequent === child && typeofRequire(parent.test)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * Calls of standard builtins reached by name, through `globalThis` or a variable holding one (`knownGlobal`, model
+     * 7): constructors make a fresh object holding their arguments, `Object.defineProperty(ies)` on an own object
+     * defines its properties, `C.prototype.m.call(o, ...)` is `o.m(...)` with the builtin `m`.
+     */
+    #knownCall(node: CallNode, args: Eval): Eval | undefined {
+        const callee = node.callee;
+        const path = this.#knownGlobal(callee, new Set());
+        if (path !== undefined) {
+            if (node.type === "CallExpression" && PURE_FUNCTIONS.has(path)) {
+                const result = PURE_FUNCTIONS.get(path) as Kinds;
+                return () => {
+                    args();
+                    return result;
+                };
+            }
+            if (PURE_CONSTRUCTORS.has(path)) {
+                return () => {
+                    this.#growField(node, UNKNOWN, args());
+                    return siteKinds(node);
+                };
+            }
+            const dot = path.lastIndexOf(".");
+            const result = node.type === "CallExpression" && dot > 0 ? PURE_STATICS.get(path.slice(0, dot))?.get(path.slice(dot + 1)) : undefined;
+            if (result !== undefined) return this.#compileStatic(result, args, node);
+            if (node.type === "CallExpression" && (path === "Object.defineProperty" || path === "Object.defineProperties")) return this.#compileDefine(node, path === "Object.defineProperties");
+            return undefined;
+        }
+        const method = callee.type === "MemberExpression" ? propertyKey(callee) : undefined;
+        if (node.type !== "CallExpression" || callee.type !== "MemberExpression" || (method !== "call" && method !== "apply")) return undefined;
+        const target = this.#knownGlobal(callee.object, new Set());
+        const name = target?.match(/^[A-Za-z]+\.prototype\.(\w+)$/)?.[1];
+        if (name === undefined || ACCESSOR_METHODS.has(name)) return undefined;
+        const parts = node.arguments.map((argument) => (argument.type === "SpreadElement" ? this.#compileSpread(argument.argument) : this.#compile(argument)));
+        return () => {
+            const [self = OTHER_KINDS, ...rest] = parts.map((part) => part());
+            const passed = method === "call" ? union(rest) : this.#read(rest[0] ?? OTHER_KINDS, OTHER_KINDS);
+            return this.#callBuiltin(self, exact(name), passed, node);
+        };
+    }
+
+    /**
+     * `Object.defineProperty(o, k, d)`/`Object.defineProperties(o, ds)` on own objects `o` with own descriptors: `o`'s
+     * fields get the descriptors' values and what their getters return. Accessors run on any read of `o`, by anyone:
+     * they are taken as live, called on `o`, setters with anything `o` may hold.
+     */
+    #compileDefine(node: CallNode, many: boolean): Eval {
+        const parts = node.arguments.map((argument) => (argument.type === "SpreadElement" ? this.#compileSpread(argument.argument) : this.#compile(argument)));
+        return () => {
+            const [target = OTHER_KINDS, key = OTHER_KINDS, descriptors = OTHER_KINDS] = parts.map((part) => part());
+            // `defineProperties` takes the descriptors from its second argument's own properties.
+            const listed = new Kinds();
+            if (many) {
+                if (foreign(key) !== 0 || key.args !== undefined || (key.bits & ~OTHER) !== 0 || key.strings !== undefined) refuse("defines properties from descriptors not its own", node);
+                for (const site of key.sites ?? []) this.#collectFields(site, kinds(STRING), listed, new Set());
+            } else listed.add(descriptors);
+            const keys = many ? kinds(STRING) : key;
+            if (foreign(target) !== 0 || target.args !== undefined || target.sites === undefined || foreign(listed) !== 0 || listed.args !== undefined) {
+                return refuse("defines properties of something other than its own objects, or from descriptors not its own", node);
+            }
+            const values = union([this.#read(listed, exact("value")), OTHER_KINDS]);
+            for (const accessor of [this.#read(listed, exact("get")), this.#read(listed, exact("set"))]) {
+                if (foreign(accessor) !== 0 || accessor.args !== undefined) refuse("defines an accessor from outside", node);
+                this.#markLive(accessor);
+                for (const site of accessor.sites ?? []) {
+                    if (!this.#functions.has(site)) continue;
+                    this.#grow(this.#thisOf(site as Node), target);
+                    this.#grow(this.#argsOf(site as Node), PRIMITIVE_KINDS);
+                    values.add(this.#location(this.#returns, site as Node));
+                }
+            }
+            for (const site of target.sites) this.#store(site, keys, values, node);
+            return target;
+        };
+    }
+
+    /** The standard builtin `node` names (`Error`, `Object.defineProperties`, `Array.prototype.push`), if it surely does (model 7). */
+    #knownGlobal(node: Node, seen: Set<Node>): string | undefined {
+        if (seen.has(node)) return undefined;
+        seen.add(node);
+        if (node.type === "SequenceExpression") {
+            const last = node.expressions.at(-1);
+            return last !== undefined && node.expressions.slice(0, -1).every((e) => e.type === "Literal") ? this.#knownGlobal(last, seen) : undefined;
+        }
+        if (node.type === "Identifier") {
+            const global = this.#hostGlobal(node);
+            if (global !== undefined) return STANDARD_GLOBALS.has(global) ? global : undefined;
+            const variable = this.#scopes.staticVariableOf(node);
+            const declarator = variable?.defs[0]?.node as unknown as Node | undefined;
+            if (variable === undefined || variable.defs.length !== 1 || declarator?.type !== "VariableDeclarator" || declarator.init === null) return undefined;
+            if (this.#scopes.staticReferences(variable).filter((reference) => reference.isWrite()).length !== 1) return undefined;
+            return this.#knownGlobal(declarator.init, seen);
+        }
+        if (node.type !== "MemberExpression") return undefined;
+        const key = propertyKey(node);
+        if (key === undefined) return undefined;
+        const object = node.object;
+        const base = object.type === "Identifier" && this.#hostGlobal(object) === "globalThis" ? undefined : this.#knownGlobal(object, seen);
+        const path = base === undefined ? (object.type === "Identifier" && this.#hostGlobal(object) === "globalThis" ? key : undefined) : `${base}.${key}`;
+        if (path === undefined || (base === undefined && !STANDARD_GLOBALS.has(path))) return undefined;
+        let value: unknown = globalThis;
+        for (const part of path.split(".")) {
+            const holder = value as Record<string, unknown>;
+            if ((typeof value !== "object" && typeof value !== "function") || value === null || !Object.hasOwn(holder, part)) return undefined;
+            const descriptor = Object.getOwnPropertyDescriptor(holder, part);
+            if (descriptor === undefined || !("value" in descriptor)) return undefined;
+            value = descriptor.value;
+        }
+        return typeof value === "function" || (typeof value === "object" && value !== null) ? path : undefined;
     }
 
     #compileStatic(result: StaticResult, args: Eval, node: CallNode): Eval {
@@ -697,6 +1234,14 @@ class Analysis {
                 case "keys":
                     this.#growField(node, INDEX, kinds(STRING));
                     return siteKinds(node);
+                case "descriptor": {
+                    // A fresh descriptor (or undefined) holding the property's value or accessors: from outside, or
+                    // what an own object holds.
+                    const held = kinds(values.bits & OUTSIDE);
+                    for (const site of values.sites ?? []) this.#collectFields(site, kinds(STRING), held, new Set());
+                    this.#growField(node, UNKNOWN, held);
+                    return union([siteKinds(node), OTHER_KINDS]);
+                }
                 case "prototype": {
                     const out = kinds(OTHER | BUILTIN | (values.bits & OUTSIDE));
                     for (const site of values.sites ?? []) out.add(this.#links.get(site) ?? NOTHING);
@@ -723,9 +1268,49 @@ class Analysis {
             const location = this.#location(this.#slots.get(array) as Map<string, Kinds>, index);
             return () => union([location, OTHER_KINDS]);
         }
+        const own = this.#setBefore(node);
+        if (own !== undefined) {
+            const key = exact(own.key);
+            return () => {
+                const out = new Kinds();
+                this.#collectFields(own.site, key, out, new Set());
+                return out;
+            };
+        }
         const receiver = this.#compile(node.object);
         const key = this.#compileKey(node);
         return () => this.#read(receiver(), key());
+    }
+
+    /**
+     * `V.k`, where V's one write is `var V = {...}` and a statement `V.k = e;` ran before this one in the same list,
+     * after that declaration (or the declaration before the statement holding that list), all in this function: the
+     * literal's own `k`, not what its prototype has under that name. Only a `delete` takes `k` off it again (builtins
+     * given the object write only index keys, model 7; anything from outside is refused), which `run` checks.
+     */
+    #setBefore(node: Node & { type: "MemberExpression" }): { site: Node; key: string } | undefined {
+        const key = propertyKey(node);
+        if (key === undefined || isPrimitiveKey(key) || node.object.type !== "Identifier") return undefined;
+        const variable = this.#scopes.staticVariableOf(node.object);
+        const declarator = variable?.defs[0]?.node as unknown as Node | undefined;
+        if (variable === undefined || !this.#isWithin(variable.scope) || variable.defs.length !== 1 || declarator?.type !== "VariableDeclarator" || declarator.init?.type !== "ObjectExpression")
+            return undefined;
+        if (this.#scopes.staticReferences(variable).filter((reference) => reference.isWrite()).length !== 1) return undefined;
+        const declares = (statement: Node | undefined): boolean => statement?.type === "VariableDeclaration" && statement.declarations.includes(declarator as never);
+        const sets = (statement: Node | undefined): boolean => {
+            if (statement?.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression" || statement.expression.operator !== "=") return false;
+            const left = statement.expression.left;
+            return left.type === "MemberExpression" && left.object.type === "Identifier" && this.#scopes.staticVariableOf(left.object) === variable && propertyKey(left) === key;
+        };
+        for (const [level, { statements, index }] of this.#lists.entries()) {
+            const set = statements.findIndex((statement, i) => i < index && sets(statement));
+            if (set < 0) continue;
+            const declared = statements.slice(0, set).some(declares) || this.#lists.slice(0, level).some((outer) => outer.statements.slice(0, outer.index).some(declares));
+            if (!declared) continue;
+            this.#setReads.push({ site: declarator.init, key, node });
+            return { site: declarator.init, key };
+        }
+        return undefined;
     }
 
     #compileIdentifier(node: Node & { type: "Identifier" }): Eval {
@@ -769,9 +1354,10 @@ class Analysis {
             this.#allSites.addSite(prototype);
             this.#field(prototype, "constructor").addSite(node);
         }
-        const [thisOwner, returnOwner] = [this.#thisOwner, this.#returnOwner];
+        const [thisOwner, returnOwner, lists] = [this.#thisOwner, this.#returnOwner, this.#lists];
         if (node.type !== "ArrowFunctionExpression") this.#thisOwner = node;
         this.#returnOwner = node;
+        this.#lists = [];
         let body: () => void;
         try {
             body = this.#compileBody(node);
@@ -786,6 +1372,7 @@ class Analysis {
         });
         this.#thisOwner = thisOwner;
         this.#returnOwner = returnOwner;
+        this.#lists = lists;
     }
 
     #compileBody(node: FunctionLike): () => void {
@@ -845,9 +1432,8 @@ class Analysis {
             operator === "||=" || operator === "&&=" || operator === "??="
                 ? () => union([old(), right()])
                 : () => {
-                      old();
-                      right();
-                      return operator === "+=" ? PRIMITIVE_KINDS : OTHER_KINDS;
+                      const [before, after] = [old(), right()];
+                      return operator === "+=" ? sumOf(before, after) : OTHER_KINDS;
                   };
         return this.#compileWrite(node.left, value);
     }
@@ -870,7 +1456,14 @@ class Analysis {
         const receiver = this.#compile(target.object);
         const key = this.#compileKey(target);
         return () => {
-            this.#write(receiver(), key(), NOTHING, target);
+            const receiverKinds = receiver();
+            const keyKinds = key();
+            for (const site of receiverKinds.sites ?? []) {
+                const buckets = this.#deleted.get(site) ?? new Set<string>();
+                for (const bucket of writeBuckets(keyKinds)) buckets.add(bucket);
+                this.#deleted.set(site, buckets);
+            }
+            this.#write(receiverKinds, keyKinds, NOTHING, target);
             return OTHER_KINDS;
         };
     }
@@ -919,8 +1512,9 @@ class Analysis {
                 return this.#compileWrite(node.argument, this.#sequence([this.#compile(node.argument)], OTHER_KINDS));
             case "BinaryExpression": {
                 if (node.left.type === "PrivateIdentifier") return refuse("uses a private name", node);
-                const result = node.operator === "+" ? PRIMITIVE_KINDS : OTHER_KINDS;
-                return this.#sequence([this.#compile(node.left), this.#compile(node.right)], result);
+                const [left, right] = [this.#compile(node.left), this.#compile(node.right)];
+                if (node.operator === "+") return () => sumOf(left(), right());
+                return this.#sequence([left, right], OTHER_KINDS);
             }
             case "LogicalExpression": {
                 const [left, right] = [this.#compile(node.left), this.#compile(node.right)];
@@ -968,7 +1562,13 @@ class Analysis {
     }
 
     #compileStatements(statements: readonly Node[]): () => void {
-        const parts = statements.map((statement) => this.#compileStatement(statement));
+        const position = { statements, index: 0 };
+        this.#lists.push(position);
+        const parts = statements.map((statement, index) => {
+            position.index = index;
+            return this.#compileStatement(statement);
+        });
+        this.#lists.pop();
         return () => {
             for (const part of parts) part();
         };
@@ -1105,6 +1705,18 @@ class Analysis {
  */
 export const localityOf = (fn: Node, allowed: Slot, scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>, isGlobalRead: (call: Node) => boolean): Effect | undefined =>
     new Analysis(fn, allowed, undefined, scopes, parents, isGlobalRead).run();
+
+/**
+ * The first effect calling `fn` may have beyond objects it creates and the runtime's own state (`runtimeCall`'s
+ * `own-state` calls); `undefined` when proven local. Analysed as `localityOf`.
+ */
+export const callLocalityOf = (
+    fn: Node,
+    scopes: ScopeInfo,
+    parents: ReadonlyMap<Node, Node>,
+    isGlobalRead: (call: Node) => boolean,
+    runtimeCall: (call: Node) => RuntimeCall | undefined
+): Effect | undefined => new Analysis(fn, undefined, undefined, scopes, parents, isGlobalRead, runtimeCall).run();
 
 /**
  * The first effect calling `builder`, and then from outside (on anything, with primitive arguments) any function its

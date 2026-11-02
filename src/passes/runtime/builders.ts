@@ -2,8 +2,7 @@ import type { Function as FunctionNode, Node, Statement } from "../../core/ast.j
 import { isFunctionNode, isIndexKey, keyName, memberPath, propertyKey } from "../../core/ast.js";
 import type { Reference, ScopeInfo, Variable } from "../../core/scope.js";
 import { traverse } from "../../core/traverse.js";
-import type { PropertyPath } from "./guest.js";
-import type { RuntimeModel } from "./model.js";
+import type { PropertyPath, RuntimeModel } from "./model.js";
 import { rootStatements } from "./storage.js";
 
 export interface Slot {
@@ -216,8 +215,8 @@ const literalMethods = (
     }
 };
 
-/** The one prelude statement `G.k = (function () {...})()` building `prefix`; unless `unfinished`, run to completion. */
-export const definitionOf = (runtime: RuntimeModel, isStorage: (node: Node) => boolean, prefix: PropertyPath, unfinished = false): { iife: FunctionNode; statement: Statement } | string => {
+/** The one prelude statement `G.k = (function () {...})()` building `prefix` (in place before later code reads it: model 1). */
+export const definitionOf = (runtime: RuntimeModel, isStorage: (node: Node) => boolean, prefix: PropertyPath): { iife: FunctionNode; statement: Statement } | string => {
     const found: { iife: FunctionNode; statement: Statement }[] = [];
     for (const statement of rootStatements(runtime.root)) {
         if (statement.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression") continue;
@@ -229,6 +228,5 @@ export const definitionOf = (runtime: RuntimeModel, isStorage: (node: Node) => b
     }
     const [only] = found;
     if (only === undefined || found.length !== 1) return found.length === 0 ? "no prelude statement builds it" : "the prelude builds it more than once";
-    if (!unfinished && !runtime.executed.has(only.statement)) return "the guest didn't run the statement that builds it";
     return only;
 };

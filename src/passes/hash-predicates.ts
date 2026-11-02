@@ -9,12 +9,12 @@ import { pushAll, sameItems, spliceList } from "../core/list.js";
 import type { ScopeInfo, Variable } from "../core/scope.js";
 import { forEachChild, traverse, walkSkippingFunctions } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
-import { builderOf, definitionOf } from "./emulate/builders.js";
-import type { StorageAnalysis } from "./emulate/effects.js";
-import { storageAnalysis } from "./emulate/effects.js";
-import type { PropertyPath } from "./emulate/guest.js";
-import type { RuntimeModel } from "./emulate/model.js";
-import { RUNTIME } from "./emulate/model.js";
+import { builderOf, definitionOf } from "./runtime/builders.js";
+import type { StorageAnalysis } from "./runtime/effects.js";
+import { storageAnalysis } from "./runtime/effects.js";
+import type { PropertyPath, RuntimeModel } from "./runtime/model.js";
+import { RUNTIME } from "./runtime/model.js";
+import { rootStatements, storageMatcher } from "./runtime/storage.js";
 import { PurityProver } from "./hash-purity.js";
 
 const MAX_ITERATIONS = 10_000;
@@ -106,12 +106,12 @@ export const hashPredicates: Pass = {
     description: "Decide opaque predicates built on the runtime's pure hash function",
     run({ program, log, facts, scope }: PassContext): PassResult {
         const runtime = facts.get(RUNTIME);
-        if (runtime === undefined || runtime.guest.broken !== undefined) {
-            log.info("no usable runtime, nothing to do");
+        if (runtime === undefined) {
+            log.info("no runtime, nothing to do");
             return { changed: 0 };
         }
         const scopes = scope();
-        if (!anyPureMethod(runtime, scopes)) {
+        if (!anyPureMethod(runtime, storageMatcher(program, runtime, scopes).isStorage, scopes)) {
             log.info("no method a prelude builder made is a pure hash, no hash predicates");
             return { changed: 0 };
         }
@@ -133,7 +133,7 @@ export const hashPredicates: Pass = {
             return { changed: 0 };
         }
         const hasWith = scopes.manager.scopes.some((s) => s.type === "with");
-        const folder = new Folder(runtime, analysis, hashes, scopes, log, facts, hasWith);
+        const folder = new Folder(analysis, hashes, scopes, log, facts, hasWith);
         // Inner lists first (the walk found them after the lists holding them): unrolling an outer loop moves its body's
         // statements into the outer list, and the inner list is then decided already.
         for (const [list, predicates] of [...lists].toReversed()) folder.scan(list, predicates);
@@ -148,19 +148,19 @@ export const hashPredicates: Pass = {
 };
 
 /**
- * Whether some prelude-built method may be a pure hash; without one no test can be decided. Uses its own prover,
- * so the search's proofs don't depend on these.
+ * Whether some method a root builder `G.k = (function () {...})()` makes may be a pure hash; without one no test can be
+ * decided. Uses its own prover, so the search's proofs don't depend on these.
  */
-const anyPureMethod = (runtime: RuntimeModel, scopes: ScopeInfo): boolean => {
+const anyPureMethod = (runtime: RuntimeModel, isStorage: (node: Node) => boolean, scopes: ScopeInfo): boolean => {
     const prover = new PurityProver(scopes);
-    for (const [statement, identities] of runtime.built) {
-        if (statement.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression") continue;
-        const right = statement.expression.right;
-        if (right.type !== "CallExpression" || right.callee.type !== "FunctionExpression" || right.arguments.length > 0) continue;
+    for (const statement of rootStatements(runtime.root)) {
+        if (statement.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression" || statement.expression.left.type !== "MemberExpression") continue;
+        const { left, right } = statement.expression;
+        if (!isStorage(left.object) || right.type !== "CallExpression" || right.callee.type !== "FunctionExpression" || right.arguments.length > 0) continue;
         const iife = right.callee;
         const builder = builderOf(iife, scopes);
         if (typeof builder === "string") continue;
-        for (const [name, fn] of builder.methods) if (identities.methods.has(name) && prover.impurity(fn, iife) === undefined) return true;
+        for (const fn of builder.methods.values()) if (prover.impurity(fn, iife) === undefined) return true;
     }
     return false;
 };
@@ -229,8 +229,8 @@ class HashFunctions {
         if (typeof builder === "string") return builder;
         const fn = builder.methods.get(name);
         if (fn === undefined) return `its builder gives it no plain function ${name}`;
-        const built = this.#runtime.built.get(definition.statement)?.methods.get(name);
-        if (built === undefined || this.#runtime.guest.stateKey(target) !== `o:${built}`) return "the guest no longer holds the builder's function there";
+        const held = this.#analysis.effects.snapshot.functionAt(target);
+        if (held !== fn) return typeof held === "string" ? `after the prelude it may hold another function: ${held}` : "after the prelude it holds another function";
         const impure = this.#prover.impurity(fn, definition.iife);
         if (impure !== undefined) return `it isn't pure: ${impure}`;
         return { path: target, fn, interpreter: new Interpreter({ outer: (identifier) => this.#builderBinding(identifier, definition.iife) }) };
@@ -293,7 +293,6 @@ class HashFunctions {
 class Folder {
     readonly counts = { ifs: 0, neverRun: 0, unrolled: 0 };
     readonly refusals = new Map<string, number>();
-    readonly #runtime: RuntimeModel;
     readonly #analysis: StorageAnalysis;
     readonly #hashes: HashFunctions;
     readonly #scopes: ScopeInfo;
@@ -302,8 +301,7 @@ class Folder {
     readonly #hasWith: boolean;
     readonly #followedCache = new Map<Variable, boolean>();
 
-    constructor(runtime: RuntimeModel, analysis: StorageAnalysis, hashes: HashFunctions, scopes: ScopeInfo, log: PassContext["log"], facts: PassContext["facts"], hasWith: boolean) {
-        this.#runtime = runtime;
+    constructor(analysis: StorageAnalysis, hashes: HashFunctions, scopes: ScopeInfo, log: PassContext["log"], facts: PassContext["facts"], hasWith: boolean) {
         this.#analysis = analysis;
         this.#hashes = hashes;
         this.#scopes = scopes;
@@ -391,7 +389,7 @@ class Folder {
         return evaluateIn;
     }
 
-    /** The guest's state key for a constant-key chain on the storage object nothing changes after the prelude. */
+    /** The value's key (`Snapshot`) for a constant-key chain on the storage object nothing changes after the prelude. */
     #stateKey(node: Node, reason: (why: string) => void): string | undefined {
         const path = memberPath(node);
         if (path === undefined || !this.#analysis.matcher.isStorage(path.root)) return undefined;
@@ -400,7 +398,9 @@ class Folder {
             reason(stale.reason);
             return undefined;
         }
-        return this.#runtime.guest.stateKey(path.keys);
+        const key = this.#analysis.effects.snapshot.keyAt(path.keys);
+        if (typeof key === "string") reason(key);
+        return typeof key === "string" ? undefined : key.key;
     }
 
     /** `R1 == R2` (also `!=`, `===`, `!==`) for two of the runtime's objects (cyclic-array rows): by identity. */

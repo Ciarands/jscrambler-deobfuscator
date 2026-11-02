@@ -5,16 +5,23 @@ import type { Reference, Scope, ScopeInfo, Variable } from "../../core/scope.js"
 import { traverse } from "../../core/traverse.js";
 import type { Path } from "../../core/traverse.js";
 import { builderOf, returnsOf } from "./builders.js";
-import type { PropertyPath } from "./guest.js";
-import type { RuntimeModel } from "./model.js";
+import type { PropertyPath, RuntimeModel } from "./model.js";
 import type { StorageMatcher } from "./storage.js";
-import { rootStatements, storageMatcher } from "./storage.js";
+import { Snapshot } from "./snapshot.js";
+import { passedOn, rootStatements, storageMatcher } from "./storage.js";
 
 /**
- * Relative to the prelude: `prelude` runs only during root statements `first`..`last` (`reflected` when the guest
- * finished them all, so the snapshot holds its effects); `later` may run after it; `never` nothing refers to it.
+ * Relative to the prelude: `prelude` runs only during root statements `first`..`last`; `later` may run after it; `never`
+ * nothing refers to it.
+ *
+ * Root statements' top-level code is prelude code, in order: a later root statement runs only after every earlier one
+ * completed, and callbacks run only after the top level completed (model 1). Completion fails only where a root
+ * statement throws: the script ends there, and callbacks earlier ones registered would see what it left. Model 1 rules
+ * that out for the runtime's statements (with model 5: the environment passes its checks); for the others, the writes
+ * a throw may skip count all the same, as every consumer takes a path's value from its one defining write and refuses
+ * where another prelude write or call may reach it (`preludeWritesTo`, `preludeCallChanging`, `changedWithin`).
  */
-type Timing = { readonly kind: "prelude"; readonly reflected: boolean; readonly first: number; readonly last: number } | { readonly kind: "later" } | { readonly kind: "never" };
+type Timing = { readonly kind: "prelude"; readonly first: number; readonly last: number } | { readonly kind: "later" } | { readonly kind: "never" };
 
 const LATER: Timing = { kind: "later" };
 const NEVER: Timing = { kind: "never" };
@@ -78,8 +85,8 @@ const enclosingFunction = (scope: Scope | null, root: Node): Node | undefined | 
 type KeyPattern = readonly (string | undefined)[];
 
 /**
- * Something the snapshot may not show: a `write` to `keys`, or an `escape` of the object at `keys` to code this
- * analysis doesn't follow (argument, stored value, `this` of a call), which may then write anything below it.
+ * Something later code may do: a `write` to `keys`, or an `escape` of the object at `keys` to code this analysis
+ * doesn't follow (argument, stored value, `this` of a call), which may then write anything below it.
  */
 interface StorageEffect {
     readonly kind: "write" | "escape";
@@ -88,8 +95,6 @@ interface StorageEffect {
     /** For the log. */
     readonly via: string;
     readonly value?: Node | undefined;
-    /** Set for code directly in a root statement the guest didn't finish. */
-    readonly statement?: number | undefined;
 }
 
 /** What calling a value could do with its `this`: `inert` (not callable), `this-free` (body has no `this`), `unknown`. */
@@ -156,10 +161,10 @@ export interface Staleness {
 
 export interface StorageEffects {
     /**
-     * Why the value at `path`, read through `site`, may differ from the snapshot; `undefined` when it can't.
-     * `writesOnly` ignores objects handed to calls as `this` (for a wrapper's target: the runtime's own calls run in the
-     * guest too). `built`: a root statement storing the value at `path`, so its own writes don't count and the read
-     * must start after it.
+     * Why the value at `path`, read through `site`, may differ from the one the prelude leaves; `undefined` when it
+     * can't. `writesOnly` ignores objects handed to calls as `this` (for a wrapper's target, whose every write by the
+     * builder's code `Snapshot` follows and whose builder's functions don't use `this`). `built`: a root statement
+     * storing the value at `path`, so the read must start after it.
      */
     readonly staleAt: (site: Node, path: PropertyPath, writesOnly?: boolean, built?: Node) => Staleness | undefined;
     /** `site` is a reference to `G`, here and below. */
@@ -176,10 +181,25 @@ export interface StorageEffects {
      * object the prelude's one write to the path (or a prefix) put there, held by no closure.
      */
     readonly reachedOnlyThroughStorage: (path: PropertyPath) => boolean;
-    /** Prelude writes in the snapshot to `path` or a prefix. */
+    /** Prelude writes to `path` or a prefix. */
     readonly preludeWritesTo: (path: PropertyPath) => number;
+    /**
+     * A call in prelude code, from root statement `from` on, that may change `path` through a `this` it hands a function
+     * (a call on a `G` path whose function may use it); `undefined` when there is none.
+     */
+    readonly preludeCallChanging: (path: PropertyPath, from: number) => Node | undefined;
+    /**
+     * A write, an escape or (unless not `withCalls`) a call handing `this` that may change an object at or under
+     * `prefix` (or the path to it), at any time, but `built`'s own write to `prefix` (a root assignment); `undefined`
+     * when there is none. Calls of static paths under `prefix` that `harmless` vouches for don't count.
+     */
+    readonly changedWithin: (prefix: PropertyPath, built: Node, harmless?: (callee: PropertyPath) => boolean, withCalls?: boolean) => Node | undefined;
+    /** Where prelude code hands `path` or a prefix to a call as an argument (which may change it there), if it does. */
+    readonly escapedInPrelude: (path: PropertyPath) => Node | undefined;
     /** `fn` is a root function, or `undefined` for the root's top level. */
     readonly runsOnlyInPrelude: (fn: Node | undefined) => boolean;
+    /** What `G`'s paths hold after the prelude. */
+    readonly snapshot: Snapshot;
 }
 
 const matches = (pattern: KeyPattern, path: PropertyPath): boolean => {
@@ -196,7 +216,7 @@ const describe = (storage: string, keys: KeyPattern): string => storage + keys.m
  * use a direct call from prelude code; least fixpoint). Unreferenced functions never run. The script is taken to be
  * closed: other scripts don't call its functions. A mention of `.callee`/`.caller` disables prelude-only functions.
  */
-const timeline = (runtime: RuntimeModel, scopes: ScopeInfo, log: PassLog): { timingOf: (fn: Node) => Timing; memberDeclarators: readonly VariableDeclarator[] } => {
+export const timeline = (runtime: RuntimeModel, scopes: ScopeInfo, log?: PassLog): { timingOf: (fn: Node) => Timing; memberDeclarators: readonly VariableDeclarator[] } => {
     const statements = rootStatements(runtime.root);
     const parentOf = new Map<Node, { fn: Node | undefined; index: number; inPlace: boolean }>();
     const topLevelIndex = new Map<Node, number>();
@@ -251,13 +271,7 @@ const timeline = (runtime: RuntimeModel, scopes: ScopeInfo, log: PassLog): { tim
     const memo = new Map<Node, Timing>();
 
     /** For `undefined`: the top level of root statement `index`. */
-    const contextTiming = (fn: Node | undefined, index: number): Timing => {
-        if (fn === undefined) {
-            const statement = statements[index];
-            return { kind: "prelude", reflected: statement !== undefined && runtime.executed.has(statement), first: index, last: index };
-        }
-        return timingOf(fn);
-    };
+    const contextTiming = (fn: Node | undefined, index: number): Timing => (fn === undefined ? { kind: "prelude", first: index, last: index } : timingOf(fn));
     const timingOf = (fn: Node): Timing => {
         const known = memo.get(fn) ?? preludeOnly.get(fn);
         if (known !== undefined) return known;
@@ -274,7 +288,7 @@ const timeline = (runtime: RuntimeModel, scopes: ScopeInfo, log: PassLog): { tim
         for (const { fn, references } of candidates) {
             if (references.some((reference) => !reference.isWrite())) continue;
             memo.set(fn, NEVER);
-            log.debug("never runs: nothing refers to it", fn);
+            log?.debug("never runs: nothing refers to it", fn);
         }
         for (let changed = true; changed;) {
             changed = false;
@@ -294,7 +308,7 @@ const timeline = (runtime: RuntimeModel, scopes: ScopeInfo, log: PassLog): { tim
                     if (within(caller, fn)) continue; // a call from inside itself: only while it runs anyway
                     const index = caller === undefined ? topLevelIndex.get(identifier) : parentOf.get(caller)?.index;
                     const timing = index === undefined ? LATER : contextTiming(caller, index);
-                    if (timing.kind !== "prelude" || !timing.reflected) {
+                    if (timing.kind !== "prelude") {
                         only = false;
                         break;
                     }
@@ -302,8 +316,8 @@ const timeline = (runtime: RuntimeModel, scopes: ScopeInfo, log: PassLog): { tim
                     last = Math.max(last, timing.last);
                 }
                 if (only && last >= 0) {
-                    preludeOnly.set(fn, { kind: "prelude", reflected: true, first, last });
-                    log.debug(`runs only during the prelude: every call comes from it (root statements ${first} to ${last})`, fn);
+                    preludeOnly.set(fn, { kind: "prelude", first, last });
+                    log?.debug(`runs only during the prelude: every call comes from it (root statements ${first} to ${last})`, fn);
                     changed = true;
                 }
             }
@@ -323,15 +337,16 @@ const timeline = (runtime: RuntimeModel, scopes: ScopeInfo, log: PassLog): { tim
 };
 
 /**
- * Everything the program does to `G` that the snapshot may not show. `G` changes only through code naming its paths:
- * `G`, other names for it, locals bound to a static part (`var t = G.a`), `this` in methods called on `G` paths, and a
- * global the prelude keeps it under (`G[g].P = G`, once the program names `P` again). Each reference is followed up
- * its member chain to a write, a call (the object read from becomes `this`), or a read handing the value on.
+ * Everything the program does to `G`, in prelude code (in order, see `Timing`) and in code that may run later. `G`
+ * changes only through code naming its paths: `G`, other names for it, locals bound to a static part (`var t = G.a`),
+ * `this` in methods called on `G` paths, and a global the prelude keeps it under (`G[g].P = G`, also a part of `G` or
+ * an object or array literal holding either, once the program names `P` again). Each reference is followed up its
+ * member chain to a write, a call (the object read from becomes `this`), or a read handing the value on; one an object
+ * or array literal holds that isn't so stored escapes.
  *
- * What prelude code does is in the snapshot when the guest finished the statements it runs in; anything else may
- * happen later. Model assumptions, beyond the snapshot's own (app code runs after the prelude):
+ * Model assumptions:
  * - a reference to a part of `G` obtained otherwise (a call's result, an argument, a computed read held in a local)
- *   isn't used to change `G` after the prelude;
+ *   isn't used to change `G` (model 3, read for the prelude too: no run shows what prelude code did);
  * - operators only read: the runtime's objects don't override `valueOf`/`toString`.
  *
  * `keyOf` resolves computed keys the caller knows (`G[G.w(147)]`).
@@ -340,15 +355,17 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
     const statements = rootStatements(runtime.root);
     const { timingOf, memberDeclarators } = timeline(runtime, scopes, log);
     const later: StorageEffect[] = [];
-    const preludeWrites: { keys: KeyPattern; last: number }[] = [];
+    const preludeWrites: { keys: KeyPattern; last: number; node: Node }[] = [];
+    /** Parts of `G` prelude code hands to calls as arguments. */
+    const preludeEscapes: { keys: KeyPattern; node: Node }[] = [];
     const sites = new Map<Node, Timing>();
     /** By path. */
     const assignedFunctions = new Map<string, Node>();
     const preludeWriteCount = new Map<string, number>();
     const freshObjects = new Set<string>();
     const calls: { callee: KeyPattern; node: Node; timing: Timing }[] = [];
-    /** `G[g].P = G`, with `G[g]` the global object. */
-    const globalStores: { name: string; key: Node; node: Node }[] = [];
+    /** `G[g].P = G` (or a part of `G`, or a literal holding either), with `G[g]` the global object. */
+    const globalStores: { name: string; key: Node; keys: KeyPattern; node: Node }[] = [];
 
     /** `G[g].P` or `globalThis.P` (as global-proxy rewrites it). */
     const globalProperty = (target: Node): { name: string; key: Node } | undefined => {
@@ -361,8 +378,27 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
     };
     const keyOfMember = (member: MemberExpression): string | undefined => propertyKey(member) ?? (member.computed && keyOf !== undefined ? keyOf(member.property) : undefined);
     const storeInto = (target: Node, keys: KeyPattern, value: Node): void => {
-        const store = keys.length === 0 ? globalProperty(target) : undefined;
-        if (store !== undefined) globalStores.push({ ...store, node: value });
+        const store = globalProperty(target);
+        if (store !== undefined) globalStores.push({ ...store, keys, node: value });
+    };
+    // `O` in a wrapper's `T.apply(O, arguments)`, run only where T is a function (model 7: the builtin `apply`): it
+    // becomes T's `this`, which every call of the wrapper hands on as such (`verdictOf`'s wrapper case).
+    const receivers = new Set<Node>();
+    for (const wrapper of runtime.wrappers.values()) {
+        const { definition } = wrapper;
+        const fn = definition.type === "ExpressionStatement" && definition.expression.type === "AssignmentExpression" ? definition.expression.right : undefined;
+        const ret = fn?.type === "FunctionExpression" ? fn.body?.body[0] : undefined;
+        const apply = ret?.type === "ReturnStatement" && ret.argument?.type === "ConditionalExpression" ? ret.argument.consequent : undefined;
+        const receiver = apply?.type === "CallExpression" ? apply.arguments[0] : undefined;
+        if (receiver !== undefined) receivers.add(receiver);
+    }
+    /** An argument whose every use the walk follows as one of `G`'s paths: a wrapper's receiver, or `G` bound to an IIFE parameter (an alias). */
+    const followed = (call: Node & { type: "CallExpression" | "NewExpression" }, argument: Node): boolean => {
+        if (receivers.has(argument)) return true;
+        const fn = call.callee;
+        if (call.type !== "CallExpression" || (fn.type !== "FunctionExpression" && fn.type !== "ArrowFunctionExpression")) return false;
+        const param = fn.params[call.arguments.indexOf(argument as never)];
+        return param !== undefined && matcher.isAliasBinding(param);
     };
 
     // Locals bound once, by their initializer, to a static part of G (`var t = G.a[1]`).
@@ -390,21 +426,20 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
     };
 
     for (const [index, statement] of statements.entries()) {
-        const top: Timing = { kind: "prelude", reflected: runtime.executed.has(statement), first: index, last: index };
+        const top: Timing = { kind: "prelude", first: index, last: index };
         const timings: Timing[] = [top];
         const record = (kind: StorageEffect["kind"], keys: KeyPattern, node: Node, via: string, value?: Node): void => {
             const timing = timings.at(-1) as Timing;
             if (timing.kind === "never") return;
-            if (timing.kind === "prelude" && timing.reflected) {
-                // A reference prelude code hands out is taken not to be used later.
+            if (timing.kind === "prelude") {
+                // A reference prelude code hands out is taken not to be used to change `G` (model 3).
                 if (kind !== "write") return;
-                preludeWrites.push({ keys, last: timing.last });
+                preludeWrites.push({ keys, last: timing.last, node });
                 const id = keys.every((k) => k !== undefined) ? JSON.stringify(keys) : undefined;
                 if (id !== undefined) preludeWriteCount.set(id, (preludeWriteCount.get(id) ?? 0) + 1);
                 return;
             }
-            const when = timing.kind === "later" ? "in code that may run later" : `in prelude code the guest didn't finish (root statements ${timing.first} to ${timing.last})`;
-            later.push({ kind, keys, node, via: `${via}, ${when}`, value, statement: timing.kind === "prelude" ? timing.first : undefined });
+            later.push({ kind, keys, node, via: `${via}, in code that may run later`, value });
         };
         traverse(statement, {
             enter(path) {
@@ -451,7 +486,7 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
                 if (outer.isWriteTarget()) {
                     const value = parent?.type === "AssignmentExpression" && parent.operator === "=" ? parent.right : undefined;
                     record("write", keys, outer.node, `as the target of ${parent?.type ?? "a write"}`, value);
-                    const preludeKeys = timing.kind === "prelude" && timing.reflected && keys.every((k) => k !== undefined) ? (keys as string[]) : undefined;
+                    const preludeKeys = timing.kind === "prelude" && keys.every((k) => k !== undefined) ? (keys as string[]) : undefined;
                     if (value !== undefined && preludeKeys !== undefined && isFunctionNode(value)) assignedFunctions.set(JSON.stringify(preludeKeys), value);
                     if (value !== undefined && preludeKeys !== undefined && isFreshObject(value)) freshObjects.add(JSON.stringify(preludeKeys));
                     if (value?.type === "CallExpression" && value.callee.type === "FunctionExpression" && value.arguments.length === 0 && preludeKeys !== undefined) {
@@ -471,10 +506,50 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
                     calls.push({ callee: keys, node: outer.node, timing });
                 } else if (parent?.type === "AssignmentExpression" && outer.key === "right") {
                     storeInto(parent.left, keys, outer.node);
+                } else if ((parent?.type === "CallExpression" || parent?.type === "NewExpression") && outer.key === "arguments" && timing.kind === "prelude" && !followed(parent, outer.node)) {
+                    // What the prelude hands a call may change there (`Object.defineProperty(G.k, ...)`): no value
+                    // `Snapshot` takes from the AST holds below it.
+                    preludeEscapes.push({ keys, node: outer.node });
+                } else {
+                    // Held in an object or array literal, it may reach code the walk doesn't follow: only the literal
+                    // stored as a global property is followed (by that global's name, model 3); anything else escapes.
+                    const { outer: holder, literal } = passedOn(outer);
+                    const assignment = holder.parent;
+                    const store = literal && assignment?.type === "AssignmentExpression" && assignment.operator === "=" && holder.key === "right" ? globalProperty(assignment.left) : undefined;
+                    if (store !== undefined) globalStores.push({ ...store, keys, node: holder.node });
+                    else if (literal && timing.kind === "prelude") preludeEscapes.push({ keys, node: outer.node });
+                    else if (literal) record("escape", keys, outer.node, "held in an object or array literal");
                 }
                 // Anything else reads or hands on the value; that is taken not to change G (see model assumptions above).
             },
         });
+    }
+    // Only names the program writes out count (global reference, `.P`, `["P"]`); computed names are taken not to be these.
+    const mentioned = new Set<string>();
+    if (globalStores.length > 0) {
+        const names = new Set(globalStores.map((store) => store.name));
+        const own = new Set(globalStores.map((store) => store.key));
+        const mention = (node: Node, name: string): void => {
+            if (!names.has(name) || own.has(node)) return;
+            mentioned.add(name);
+            for (const store of globalStores) if (store.name === name) later.push({ kind: "escape", keys: store.keys, node, via: `by the global name ${name}` });
+        };
+        traverse(runtime.root, {
+            Identifier(path) {
+                const node = path.node;
+                if (!names.has(node.name) || matcher.isStorage(node)) return; // `G` itself is followed already
+                if (path.parent?.type === "MemberExpression" && path.key === "property" && !path.parent.computed) return mention(node, node.name);
+                // Locals aren't the global property; top-level declarations are.
+                if (scopes.referenceOf(node) === undefined) return;
+                const variable = scopes.staticVariableOf(node);
+                if (variable === undefined || variable.scope.type === "global") mention(node, node.name);
+            },
+            MemberExpression(path) {
+                const property = path.node.property;
+                if (path.node.computed && property.type === "Literal" && typeof property.value === "string") mention(property, property.value);
+            },
+        });
+        for (const store of globalStores) log.debug(`${describe(runtime.storage, store.keys)} kept as global ${store.name}`, store.node);
     }
 
     const writes = later.filter((effect) => effect.kind === "write");
@@ -507,23 +582,30 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
         if (prefixWrite || !ownWrites.every((write) => write.value !== undefined && valueKind(write.value) !== "unknown")) verdict = { thisFree: false };
         // A setup key whose getter and the functions it hands out provably never read `this` (`thisFreeKeys`).
         else if (key !== undefined && runtime.thisFreeKeys.has(key)) verdict = { thisFree: true, passes: [] };
-        // A wrapper hands its receiver on to a function target, unless the target doesn't use `this`.
+        // A wrapper hands its receiver on to its target, unless the target doesn't use `this`.
         else if (wrapper !== undefined) {
-            const appliesTarget = runtime.guest.inspect(wrapper.target)?.type === "function" || writes.some((write) => affects(write, wrapper.target));
             pending.add(id);
-            const target = appliesTarget ? verdictOf(wrapper.target) : undefined;
+            const target = verdictOf(wrapper.target);
             pending.delete(id);
-            if (target === undefined) verdict = { thisFree: true, passes: [] };
-            else if (target.thisFree) verdict = target;
-            else verdict = { thisFree: true, passes: wrapper.receiver === undefined ? [] : [wrapper.receiver] };
+            verdict = target.thisFree ? target : { thisFree: true, passes: wrapper.receiver === undefined ? [] : [wrapper.receiver] };
         } else if (assigned !== undefined) verdict = usesThis(assigned) ? { thisFree: false } : { thisFree: true, passes: [] };
-        else {
-            // Not a function, reached through data properties only: the call throws before running anything.
-            const info = runtime.guest.inspect(callee);
-            if (info !== undefined && info.data && info.type !== "function") verdict = { thisFree: true, passes: [] };
-        }
+        // What the prelude leaves there can't be called, or doesn't use `this` (`Snapshot.thisFreeAt`).
+        else if (snapshot.thisFreeAt(callee)) verdict = { thisFree: true, passes: [] };
         verdicts.set(id, verdict);
         return verdict;
+    };
+    /**
+     * Keys of `G` that may hold something callable: every key a write names, and the setup's (accessors and call
+     * aliases); none can be told after a computed write in the prelude.
+     */
+    const callableKeys = (): string[] | string => {
+        if (preludeWrites.some((write) => write.keys.length > 0 && write.keys[0] === undefined)) return "a computed write in the prelude may add any key";
+        const keys = new Set<string>([...runtime.setupKeys, ...runtime.callAliases.keys()]);
+        for (const write of [...preludeWrites, ...writes]) {
+            const [key] = write.keys;
+            if (key !== undefined) keys.add(key);
+        }
+        return [...keys];
     };
     /**
      * `G[k]()`, `k` computed: every own property, including later ones, must not use `this`. Inherited methods only
@@ -539,7 +621,12 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
             return computedVerdict;
         }
         const passes: KeyPattern[] = [];
-        for (const key of runtime.guest.ownCallables() ?? []) {
+        const keys = callableKeys();
+        if (typeof keys === "string") {
+            log.debug(`calls through computed ${runtime.storage} keys may use this: ${keys}`);
+            return computedVerdict;
+        }
+        for (const key of keys) {
             const verdict = verdictOf([key]);
             if (!verdict.thisFree) {
                 log.debug(`calls through computed ${runtime.storage} keys may use this: they can reach ${runtime.storage}.${key}`);
@@ -550,9 +637,43 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
         computedVerdict = { thisFree: true, passes };
         return computedVerdict;
     };
+    // Effects other than calls' (those `changedWithin` works out itself, whenever it is asked).
+    const direct = [...later];
+    const preludeWritesTo = (path: PropertyPath): number => preludeWrites.filter((write) => write.keys.length <= path.length && matches(write.keys, path)).length;
+    const agrees = (keys: KeyPattern, prefix: PropertyPath): boolean => keys.every((key, i) => i >= prefix.length || key === undefined || key === prefix[i]);
+    const changedWithin = (prefix: PropertyPath, built: Node, harmless?: (callee: PropertyPath) => boolean, withCalls = true): Node | undefined => {
+        const own = built.type === "ExpressionStatement" && built.expression.type === "AssignmentExpression" ? built.expression.left : undefined;
+        const write = preludeWrites.find((candidate) => candidate.node !== own && agrees(candidate.keys, prefix));
+        if (write !== undefined) return write.node;
+        const effect = [...direct, ...preludeEscapes].find((candidate) => agrees(candidate.keys, prefix));
+        if (effect !== undefined) return effect.node;
+        if (!withCalls) return undefined;
+        for (const call of calls) {
+            if (call.timing.kind === "never") continue;
+            const { callee } = call;
+            const inside = callee.length > prefix.length && callee.every((k) => k !== undefined) && prefix.every((k, i) => callee[i] === k);
+            if (inside && harmless?.(callee as PropertyPath) === true) continue;
+            const verdict = callee.every((k) => k !== undefined) ? verdictOf(callee as PropertyPath) : callee.length === 1 ? computedKeyVerdict() : { thisFree: false as const };
+            const handed = verdict.thisFree ? verdict.passes : [callee.slice(0, -1)];
+            if (handed.some((keys) => agrees(keys, prefix))) return call.node;
+        }
+        return undefined;
+    };
+    const escapedInPrelude = (path: PropertyPath): Node | undefined => preludeEscapes.find((escape) => escape.keys.length <= path.length && matches(escape.keys, path))?.node;
+    const preludeCallChanging = (path: PropertyPath, from: number): Node | undefined => {
+        for (const call of calls) {
+            if (call.timing.kind !== "prelude" || call.timing.last < from) continue;
+            const { callee } = call;
+            const verdict = callee.every((k) => k !== undefined) ? verdictOf(callee as PropertyPath) : callee.length === 1 ? computedKeyVerdict() : { thisFree: false as const };
+            const handed = verdict.thisFree ? verdict.passes : [callee.slice(0, -1)];
+            if (handed.some((keys) => keys.length < path.length && matches(keys, path))) return call.node;
+        }
+        return undefined;
+    };
+    const snapshot = new Snapshot(runtime, matcher, scopes, { preludeWritesTo, changedWithin, escapedInPrelude, preludeCallChanging });
     let thisFree = 0;
     for (const call of calls) {
-        if (call.timing.kind === "never" || (call.timing.kind === "prelude" && call.timing.reflected)) continue;
+        if (call.timing.kind !== "later") continue;
         const { callee } = call;
         const verdict = callee.every((k) => k !== undefined) ? verdictOf(callee as PropertyPath) : callee.length === 1 ? computedKeyVerdict() : { thisFree: false as const };
         if (verdict.thisFree) {
@@ -563,43 +684,15 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
         later.push({ kind: "escape", keys: callee.slice(0, -1), node: call.node, via: `as this of ${describe(runtime.storage, callee)}()` });
     }
 
-    // Only names the program writes out count (global reference, `.P`, `["P"]`); computed names are taken not to be these.
-    const mentioned = new Set<string>();
-    if (globalStores.length > 0) {
-        const names = new Set(globalStores.map((store) => store.name));
-        const own = new Set(globalStores.map((store) => store.key));
-        const mention = (node: Node, name: string): void => {
-            if (!names.has(name) || own.has(node)) return;
-            mentioned.add(name);
-            later.push({ kind: "escape", keys: [], node, via: `by the global name ${name}` });
-        };
-        traverse(runtime.root, {
-            Identifier(path) {
-                const node = path.node;
-                if (!names.has(node.name) || matcher.isStorage(node)) return; // `G` itself is followed already
-                if (path.parent?.type === "MemberExpression" && path.key === "property" && !path.parent.computed) return mention(node, node.name);
-                // Locals aren't the global property; top-level declarations are.
-                if (scopes.referenceOf(node) === undefined) return;
-                const variable = scopes.staticVariableOf(node);
-                if (variable === undefined || variable.scope.type === "global") mention(node, node.name);
-            },
-            MemberExpression(path) {
-                const property = path.node.property;
-                if (path.node.computed && property.type === "Literal" && typeof property.value === "string") mention(property, property.value);
-            },
-        });
-        for (const store of globalStores) log.debug(`${runtime.storage} kept as global ${store.name}`, store.node);
-    }
-
-    // One effect per kind and path answers for all; writes in unfinished root statements are kept per statement for `built`.
+    // One effect per kind and path answers for all.
     const unique = new Map<string, StorageEffect>();
     for (const effect of later) {
-        const id = `${effect.kind}:${JSON.stringify(effect.keys)}${effect.kind === "write" && effect.statement !== undefined ? `@${effect.statement}` : ""}`;
+        const id = `${effect.kind}:${JSON.stringify(effect.keys)}`;
         if (!unique.has(id)) unique.set(id, effect);
     }
     const effects = [...unique.values()];
     log.debug(`storage: ${preludeWrites.length} write(s) by prelude code, ${effects.length} other effect(s) on distinct paths; ${thisFree} later call(s) on ${runtime.storage} paths don't use this`);
-    if (log.debugging) for (const effect of effects) log.debug(`storage ${effect.kind} of ${describe(runtime.storage, effect.keys)} (${effect.via}) the snapshot doesn't hold`, effect.node);
+    if (log.debugging) for (const effect of effects) log.debug(`storage ${effect.kind} of ${describe(runtime.storage, effect.keys)} (${effect.via})`, effect.node);
 
     return {
         staleAt(site, path, writesOnly = false, built) {
@@ -607,7 +700,7 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
             if (timing === undefined) return { reason: `this reference to ${runtime.storage} wasn't analysed`, node: site };
             if (timing.kind === "never") return undefined;
             const builtAt = built === undefined ? -1 : (statements as readonly Node[]).indexOf(built);
-            const effect = effects.find((candidate) => (!writesOnly || candidate.kind === "write") && !(candidate.kind === "write" && candidate.statement === builtAt) && affects(candidate, path));
+            const effect = effects.find((candidate) => (!writesOnly || candidate.kind === "write") && affects(candidate, path));
             if (effect !== undefined)
                 return { reason: `${describe(runtime.storage, path)} may change after the prelude: ${effect.kind} of ${describe(runtime.storage, effect.keys)}`, node: effect.node };
             if (timing.kind === "prelude") {
@@ -641,15 +734,16 @@ export const storageEffects = (runtime: RuntimeModel, matcher: StorageMatcher, s
         },
         reachedOnlyThroughStorage(path) {
             if (path.length === 0) return true;
-            const count = preludeWrites.filter((write) => write.keys.length <= path.length && matches(write.keys, path)).length;
-            return count === 1 && freshObjects.has(JSON.stringify(path));
+            return preludeWritesTo(path) === 1 && freshObjects.has(JSON.stringify(path));
         },
-        preludeWritesTo(path) {
-            return preludeWrites.filter((write) => write.keys.length <= path.length && matches(write.keys, path)).length;
-        },
+        preludeWritesTo,
+        preludeCallChanging,
+        changedWithin,
+        escapedInPrelude,
         runsOnlyInPrelude(fn) {
             return fn === undefined || timingOf(fn).kind !== "later";
         },
+        snapshot,
     };
 };
 

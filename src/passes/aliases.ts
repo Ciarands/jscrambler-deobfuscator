@@ -1,13 +1,14 @@
 import type { Argument, CallExpression, Expression, MemberExpression, Node } from "../core/ast.js";
-import { isBindingName, propertyKey } from "../core/ast.js";
+import { isBindingName, memberPath, propertyKey } from "../core/ast.js";
 import { callOf, identifier, member, memberChain } from "../core/build.js";
 import type { ScopeInfo } from "../core/scope.js";
 import { OWN_GLOBAL_OBJECT_NAMES } from "../core/scope.js";
 import { traverse } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
-import type { CallAlias } from "./emulate/model.js";
-import { RUNTIME } from "./emulate/model.js";
-import { storageAnalysis } from "./emulate/effects.js";
+import type { CallAlias } from "./runtime/model.js";
+import { RUNTIME } from "./runtime/model.js";
+import { storageAnalysis } from "./runtime/effects.js";
+import { realm } from "./runtime/realm.js";
 
 type Rewrite = { readonly ok: true; readonly expression: Expression } | { readonly ok: false; readonly reason: string };
 
@@ -28,8 +29,36 @@ const builtin = (alias: CallAlias, scopes: ScopeInfo, site: Node, origin: Node):
     return { ok: true, expression: memberChain(identifier(first, origin), rest, origin) };
 };
 
-/** `G.alias(...)` as the builtin call it stands for. `site` is the reference to `G`. */
-const rewriteCall = (call: CallExpression, alias: CallAlias, scopes: ScopeInfo, site: Node): Rewrite => {
+/**
+ * `node` is neither `null` nor `undefined` wherever it runs: a literal other than `null`, an array, object, function or
+ * class it makes, a builtin reached by name through data properties (model 7: builtins intact), or a call alias called
+ * with no arguments where `bare` says it is the builtin itself.
+ */
+const isPresent = (node: Node, scopes: ScopeInfo, bare: (call: CallExpression) => boolean): boolean => {
+    switch (node.type) {
+        case "Literal":
+            return node.value !== null;
+        case "TemplateLiteral":
+        case "ArrayExpression":
+        case "ObjectExpression":
+        case "FunctionExpression":
+        case "ArrowFunctionExpression":
+        case "ClassExpression":
+            return true;
+        case "CallExpression":
+            return node.arguments.length === 0 && bare(node);
+        default: {
+            const path = node.type === "Identifier" ? { root: node, keys: [] } : memberPath(node);
+            if (path?.root.type !== "Identifier" || !scopes.isGlobalReference(path.root)) return false;
+            const [key, ...owner] = [path.root.name, ...path.keys].toReversed();
+            const found = key === undefined ? undefined : realm().lookup(owner.toReversed(), key);
+            return found?.kind === "data" && (found.type === "object" || found.type === "function");
+        }
+    }
+};
+
+/** `G.alias(...)` as the builtin call it stands for. `site` is the reference to `G`; `present` is `isPresent` there. */
+const rewriteCall = (call: CallExpression, alias: CallAlias, scopes: ScopeInfo, site: Node, present: (node: Node) => boolean): Rewrite => {
     const args = call.arguments;
     if (args.length === 0) return builtin(alias, scopes, site, call);
     if (alias.style !== "method") {
@@ -43,11 +72,12 @@ const rewriteCall = (call: CallExpression, alias: CallAlias, scopes: ScopeInfo, 
     if ((receiver.type === "Literal" && receiver.value === null) || (receiver.type === "Identifier" && receiver.name === "undefined")) {
         return refused("receiver is null or undefined");
     }
+    if (alias.nullishCalls && !present(receiver)) return refused("the receiver may be null or undefined, where the alias goes on to another call");
     return { ok: true, expression: callOf(member(receiver, alias.original, call.callee), rest, call) };
 };
 
 /**
- * Aliases: undo the builtin aliases the prelude's setup function created (recorded by `emulate`): global aliases
+ * Aliases: undo the builtin aliases the prelude's setup function created (recorded by `runtime`): global aliases
  * (`S` -> `String`), builtin-owned property aliases naming exactly one builtin property, call aliases on the storage
  * object (`G.a(s, "%")` -> `s.split("%")`), and host aliases (`D` -> `document`; model 10: the host globals exist).
  *
@@ -109,6 +139,12 @@ export const aliases: Pass = {
             });
         }
 
+        /** `G.k()`, `k` a call alias whose slot stays as the setup left it: the builtin itself. */
+        const bare = (call: CallExpression): boolean => {
+            const callee = call.callee;
+            const key = callee.type === "MemberExpression" && isStorage(callee.object) ? propertyKey(callee) : undefined;
+            return callee.type === "MemberExpression" && key !== undefined && runtime.callAliases.has(key) && effects.staleAt(callee.object, [key]) === undefined;
+        };
         traverse(program, {
             CallExpression(path) {
                 const call = path.node;
@@ -119,7 +155,7 @@ export const aliases: Pass = {
                 if (alias === undefined || key === undefined) return;
                 const stale = effects.staleAt(callee.object, [key]);
                 if (stale !== undefined) return refuse(stale.reason, stale.node);
-                const result = rewriteCall(call, alias, scopes, callee.object);
+                const result = rewriteCall(call, alias, scopes, callee.object, (node) => isPresent(node, scopes, bare));
                 if (!result.ok) return refuse(result.reason, call);
                 path.replace(result.expression);
                 counts.calls++;

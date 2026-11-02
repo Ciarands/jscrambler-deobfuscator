@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
 import type { IdentifierReference, Node } from "../src/core/ast.js";
+import { Closure, Native } from "../src/core/builtins.js";
 import type { Value } from "../src/core/evaluate.js";
 import type { Answer, OuterBinding } from "../src/core/interpret.js";
 import { Interpreter } from "../src/core/interpret.js";
 import { parse } from "../src/core/parse.js";
 import { ScopeInfo } from "../src/core/scope.js";
+import { traverse } from "../src/core/traverse.js";
 import { observe, serialize } from "./helpers.js";
 
 /** Top-level functions and literal constants of `source` are the outer bindings; unbound names are globals. */
@@ -43,6 +45,9 @@ const refusal = (source: string, name: string, ...args: Value[]): string => {
     return answer.reason;
 };
 
+/** Every name the code doesn't declare is a global. */
+const globalsOnly = (identifier: IdentifierReference): OuterBinding => ({ global: identifier.name });
+
 describe("interpret", () => {
     it("runs loops, labels and switches", () => {
         const source = `function f(n) {
@@ -68,6 +73,23 @@ describe("interpret", () => {
   return out;
 }`;
         expect(agrees(source, "f", 5)).toBe("1:1,2:1,2:2,3:1,3:2,ddaxcxccq");
+        agrees(source, "f", 0);
+    });
+
+    it("jumps to a labelled loop from a loop nested directly in it", () => {
+        // The inner loop isn't labelled: `continue a` and `break a` leave it for the outer one.
+        const source = `function f(n) {
+  var r = "";
+  a: for (var i = 0; i < n; i++) for (var j = 0; j < 3; j++) { if (j == 1) continue a; r += i + "" + j + ","; }
+  var w = 0;
+  b: while (w < n) while (true) { w++; r += "w" + w; continue b; }
+  var d = 0;
+  c: do do { d++; if (d % 2) continue c; r += "d" + d; break c; } while (true); while (d < n);
+  e: for (var k in [1, 2]) for (var v of [7, 8]) { r += k + v; if (v == 7) continue e; }
+  g: for (const x of [1, 2, 3]) for (const y of [4, 5]) { if (x == 2) break g; r += x * y; continue g; }
+  return r;
+}`;
+        expect(agrees(source, "f", 3)).toBe("00,10,20,w1w2w3d207174");
         agrees(source, "f", 0);
     });
 
@@ -161,8 +183,17 @@ function f(n) {
             ["function f() { var o = Object.freeze({}); o.x = 1; return 1; }", /frozen/],
             ["function f() { try { return 1; } catch (e) { return 2; } }", /TryStatement/],
             ["function f() { return /a/.test('a'); }", /regular expression/],
-            ["function f() { return typeof this; }", /ThisExpression/],
-            ["function f() { return arguments.length; }", /arguments/],
+            ["function f() { return typeof this; }", /this of a call with no receiver/],
+            ["function f() { return (function () { return typeof this; }).call(1); }", /this of a call with a number receiver/],
+            ["function f() { return this; }", /this of a call with no receiver/],
+            ["function f(a) { a = 2; return arguments[0]; }", /writes a parameter its arguments object may alias/],
+            ["function f(a) { var g = function () { a = 2; }; g(); return arguments.length; }", /writes a parameter its arguments object may alias/],
+            ["function f(a) { var a = 3; return arguments[0]; }", /writes a parameter its arguments object may alias/],
+            ["function f() { arguments[0] = 1; return 1; }", /writes to arguments/],
+            ["function f() { return arguments.callee; }", /arguments\.callee/],
+            ["function f() { var arguments = 1; return arguments; }", /declares a binding named arguments/],
+            ["function f() { return [].concat.call(arguments).length; }", /concat of arguments/],
+            ["function f() { return Array.prototype.toString.call(arguments); }", /toString of arguments/],
             ["function f() { return { get x() { return 1; } }.x; }", /getter/],
             ["function f() { return { __proto__: null }.x; }", /prototype/],
             ["function f() { var o = { toString: function () { return 'x'; } }; return '' + o; }", /toString/],
@@ -209,5 +240,60 @@ function f(n) {
         expect(interpreterFor("function f(s) { return s.x7('b'); }")("f", ["abc"])).toMatchObject({ ok: false });
         const enumerated = interpreterFor("function f() { var n = 0; for (var k in [1]) n++; return n; }", new Map([["Array.prototype", new Map([["q2", "join"]])]]));
         expect(enumerated("f", [])).toMatchObject({ ok: false, reason: expect.stringMatching(/enumerable/) as unknown });
+    });
+
+    it("binds this of method calls, call, apply, bind and callbacks given one; arrows take the one where they are made", () => {
+        agrees("function f() { var o = { x: 3, g: function () { return this.x; } }; var b = o.g.bind({ x: 6 }); return o.g() + o.g.call({ x: 4 }) + o.g.apply({ x: 5 }, []) + b(); }", "f");
+        agrees("function f() { var o = { x: 2, g: function () { var h = () => this.x * 10; return h(); } }; return o.g(); }", "f");
+        agrees("function f() { var t = { n: 0 }; [1, 2].forEach(function (v) { this.n += v; }, t); return t.n; }", "f");
+    });
+
+    it("gives a function's arguments as its call passed them", () => {
+        agrees(
+            'function f(a, b) { return arguments.length + ":" + a + arguments[1] + ":" + Array.prototype.slice.call(arguments, 1).join("") + ":" + Array.isArray(arguments) + ":" + ("" + arguments) + ":" + Object.keys(arguments).join(); }',
+            "f",
+            1,
+            2,
+            3
+        );
+        agrees("function f() { var g = () => arguments[0]; return [...arguments].length + g(); }", "f", 5, 6);
+        agrees("function f(a) { return (function () { return arguments.length; })() + a; }", "f", 7);
+    });
+
+    it("keeps objects and closures, with their state, between a session's calls", () => {
+        const source = "var holder = (function () { var n = 0; var log = []; return { next: function (k) { n += k; log.push(n); return n; }, all: function () { return log.join(); } }; })();";
+        const statement = parse(source).body[0];
+        const init = statement?.type === "VariableDeclaration" ? statement.declarations[0]?.init : undefined;
+        if (init === undefined || init === null) throw new Error("no initializer");
+        const interpreter = new Interpreter({ outer: globalsOnly });
+        const holder = interpreter.evaluate(init, 10_000);
+        if (!holder.ok) throw new Error(holder.reason);
+        const call = (name: string, args: readonly Value[]): unknown => {
+            const method = interpreter.member(holder.value, name, 100);
+            const result = method.ok ? interpreter.callHeld(method.value, holder.value, args, 1000) : method;
+            return result.ok ? result.value : result.reason;
+        };
+        const seen = [call("next", [2]), call("next", [3]), call("all", [])];
+        expect(serialize(seen)).toBe(observe(`${source}\nresult = [holder.next(2), holder.next(3), holder.all()];`));
+        const self = parse("this;").body[0];
+        if (self?.type !== "ExpressionStatement") throw new Error("unexpected program");
+        expect(interpreter.evaluate(self.expression, 100)).toMatchObject({ ok: false, reason: "it reads this outside its functions" });
+    });
+
+    it("replaces a function expression by the value the caller proved it equal to", () => {
+        // Called, `probe` would refuse (Math.random); replaced, its call gives the root function it would find.
+        const program = parse('function found() { return "s"; }\nvar made = (function () { var probe = function (k) { return Math.random(); }; return probe(1)() + "!"; })();');
+        const [found, declaration] = program.body;
+        const init = declaration?.type === "VariableDeclaration" ? declaration.declarations[0]?.init : undefined;
+        if (found?.type !== "FunctionDeclaration" || init === undefined || init === null) throw new Error("unexpected program");
+        let probe: Node | undefined;
+        traverse(init, {
+            VariableDeclarator(path) {
+                if (path.node.id.type === "Identifier" && path.node.id.name === "probe") probe = path.node.init ?? undefined;
+            },
+        });
+        const substitute = (fn: Node) => (fn === probe ? { value: new Native("probe", () => new Closure(found, null)) } : undefined);
+        expect(new Interpreter({ outer: globalsOnly, substitute }).evaluate(init, 10_000)).toMatchObject({ ok: true, value: "s!" });
+        expect(new Interpreter({ outer: globalsOnly }).evaluate(init, 10_000)).toMatchObject({ ok: false, reason: expect.stringMatching(/Math\.random/) as unknown });
     });
 });

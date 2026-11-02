@@ -3,7 +3,7 @@ import { MATH_MEMBERS } from "../core/builtins.js";
 import type { ScopeInfo, Variable } from "../core/scope.js";
 import { scopeWithin } from "../core/scope.js";
 import { traverse } from "../core/traverse.js";
-import { returnsOf } from "./emulate/builders.js";
+import { returnsOf } from "./runtime/builders.js";
 
 const GLOBAL_VALUES: ReadonlySet<string> = new Set(["undefined", "NaN", "Infinity"]);
 

@@ -4,17 +4,14 @@ import type { Primitive } from "../core/build.js";
 import type { ScopeInfo } from "../core/scope.js";
 import { traverse } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
-import { factKey } from "../pipeline/facts.js";
-import type { ResolveResult } from "./emulate/guest.js";
-import type { Builder, Slot } from "./emulate/builders.js";
-import { bodyOf, builderOf, definitionOf, returnsOf, sameSlot, slotOf, slotsOnly } from "./emulate/builders.js";
-import { storageAnalysis } from "./emulate/effects.js";
-import type { Staleness, StorageEffects } from "./emulate/effects.js";
-import type { PropertyPath } from "./emulate/guest.js";
-import type { RuntimeModel } from "./emulate/model.js";
-import { RUNTIME } from "./emulate/model.js";
-import type { StorageMatcher } from "./emulate/storage.js";
-import { assignedPaths, storageMatcher } from "./emulate/storage.js";
+import type { Builder, Slot } from "./runtime/builders.js";
+import { bodyOf, builderOf, definitionOf, returnsOf, sameSlot, slotOf, slotsOnly } from "./runtime/builders.js";
+import { storageAnalysis } from "./runtime/effects.js";
+import type { Staleness, StorageEffects } from "./runtime/effects.js";
+import type { PropertyPath, RuntimeModel } from "./runtime/model.js";
+import { RUNTIME } from "./runtime/model.js";
+import type { StorageMatcher } from "./runtime/storage.js";
+import { assignedPaths, rootStatements, storageMatcher } from "./runtime/storage.js";
 import { localityOf } from "./locality.js";
 import type { CallSite } from "./storage-usage.js";
 import { HolderReach, isGlobalRead, rewriteCalls, survey } from "./storage-usage.js";
@@ -36,6 +33,17 @@ const refused = (reason: string, node: Node): FastPath => ({ ok: false, reason, 
 const isPrimitiveLiteral = (node: Node | null | undefined): node is Node & { type: "Literal"; value: Primitive } =>
     node?.type === "Literal" && (node.value === null || typeof node.value === "string" || typeof node.value === "number" || typeof node.value === "boolean");
 
+const contains = (outer: Node, inner: Node): boolean => {
+    let found = false;
+    traverse(outer, {
+        enter(path) {
+            if (found) return path.skip();
+            if (path.node === inner) found = true;
+        },
+    });
+    return found;
+};
+
 /**
  * The cached answer of the code lock `method` that `iife` builds, proven from its code:
  *
@@ -48,7 +56,8 @@ const isPrimitiveLiteral = (node: Node | null | undefined): node is Node & { typ
  * (or the methods in a returned object literal). The cache is a slot of an array the builder declares and keeps to
  * itself. Once set, nothing clears it (its only writes are the builder's own top-level statements, which ran once,
  * and truthy literals the method stores at its own top level), so every later call returns `L` and does nothing else.
- * The method's other returns are literals other than `L`: a call that answers `L` took the cached path.
+ * The method's other returns are literals other than `L`, each after a top-level statement setting the cache: a call
+ * that answers `L` took the cached path, and one that returns at all (its checks passed, model 5) set the cache.
  */
 const fastPathOf = (iife: FunctionNode, builder: Builder | string, method: string, scopes: ScopeInfo): FastPath => {
     if (typeof builder === "string") return refused(builder, iife);
@@ -96,6 +105,18 @@ const fastPathOf = (iife: FunctionNode, builder: Builder | string, method: strin
     if (others.length > 0 && others.every(isAnswer)) return { ok: true, answer, method: fn, cache, parents: builder.parents, constant: true };
     const other = others.find((r) => r.type !== "ReturnStatement" || !isPrimitiveLiteral(r.argument) || isAnswer(r));
     if (other !== undefined) return refused(`${method} may answer ${String(answer)} without its cache`, other);
+    // Every other return comes after a top-level statement setting the cache: a call whose checks pass leaves it set.
+    const sets = statements.findIndex(
+        (statement) =>
+            statement.type === "ExpressionStatement" &&
+            statement.expression.type === "AssignmentExpression" &&
+            statement.expression.operator === "=" &&
+            sameSlot(cache, slotOf(statement.expression.left, scopes)) &&
+            isPrimitiveLiteral(statement.expression.right) &&
+            Boolean(statement.expression.right.value)
+    );
+    const unset = others.find((r) => !(sets >= 0 && statements.findIndex((statement) => contains(statement, r)) > sets));
+    if (unset !== undefined) return refused(`${method} may return before it sets its cache`, unset);
     return { ok: true, answer, method: fn, cache, parents: builder.parents, constant: false };
 };
 
@@ -135,14 +156,12 @@ const fullModeRefusal = (lock: Lock, context: LockContext): { reason: string; no
     return undefined;
 };
 
-/** Each lock's first probe in the guest, by path: later runs (the cleanup group's) reuse it. */
-const LOCK_PROBES = factKey<Map<string, ResolveResult | undefined>>("code-lock probes");
-
 /**
  * Code locks: jscrambler's environment checks (`G.k.m()`) run once, then answer from a cache.
  *
- * Proof per lock: the builder's code shows the cached path and that the cache, once set, stays set (`fastPathOf`);
- * one guest call after the prelude answers the cached value; and each call site reaches the lock the snapshot holds.
+ * Proof per lock: the builder's code shows the cached path and that the cache, once set, stays set (`fastPathOf`); a
+ * root call statement after the builder makes the first call in the prelude, whose checks pass (model 5) and set the
+ * cache; and each call site reaches the lock the prelude left.
  *
  * Full mode (the whole lock goes): the first call changes only objects it creates and its cache (`localityOf`), and
  * the environment passes its checks (model 5). A used call becomes the answer only after the prelude. Every static
@@ -151,15 +170,15 @@ const LOCK_PROBES = factKey<Map<string, ResolveResult | undefined>>("code-lock p
  * partial mode: only post-prelude calls go, so the checks run when the original's did.
  *
  * Constant locks (self-defending): every return gives the answer and the other outcome is a trap the environment
- * never meets (model 5), so only full mode applies and the guest isn't asked (it may fall into the trap).
+ * never meets (model 5), so only full mode applies.
  */
 export const codeLocks: Pass = {
     name: "code-locks",
     description: "Remove cached environment checks: all their calls when their checks touch only their own objects, else the calls made after the prelude",
     run({ program, log, facts, scope }: PassContext): PassResult {
         const runtime = facts.get(RUNTIME);
-        if (runtime === undefined || runtime.guest.broken !== undefined) {
-            log.info("no usable runtime, nothing to do");
+        if (runtime === undefined) {
+            log.info("no runtime, nothing to do");
             return { changed: 0 };
         }
         const scopes = scope();
@@ -184,8 +203,6 @@ export const codeLocks: Pass = {
         const holders = new Set([...programSurvey.calls.values()].flatMap(({ path }) => (path.length === 2 ? [path[0] as string] : [])));
         // The storage effects (a walk of every function) only once a builder has a lock's shape.
         let context: LockContext | undefined;
-        const probes = facts.get(LOCK_PROBES) ?? new Map<string, ResolveResult | undefined>();
-        facts.set(LOCK_PROBES, probes);
 
         const replacements = new Map<Node, Node>();
         const removals = new Set<Node>();
@@ -202,13 +219,12 @@ export const codeLocks: Pass = {
                 continue;
             }
             if (!fast.constant) {
-                // The probe runs the lock in the guest, setting its cache there if the prelude hadn't: a later run
-                // must see what the first probe saw, not the state that probe left.
-                const id = path.join("\u0000");
-                const probe = probes.get(id) ?? runtime.guest.resolve([{ path, args: [] }])[0];
-                probes.set(id, probe);
-                if (probe === undefined || !probe.ok || "nonPrimitive" in probe || !probe.repeatable || !Object.is(probe.value, fast.answer)) {
-                    log.debug(`${name} looks like a code lock, but in the guest it doesn't answer ${String(fast.answer)} from its cache`, fast.method);
+                // Its first call sets the cache (model 5: the environment passes its checks); later ones answer it. A
+                // call statement at the root after the builder makes that first call in the prelude (model 1).
+                const root: readonly Node[] = rootStatements(runtime.root);
+                const builtAt = root.indexOf(definition.statement);
+                if (!sites.some(({ statement }) => statement !== undefined && root.indexOf(statement) > builtAt)) {
+                    log.debug(`${name} looks like a code lock, but no root statement after its builder calls it: a later call may be its first`, fast.method);
                     continue;
                 }
             }

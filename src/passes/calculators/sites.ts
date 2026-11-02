@@ -3,7 +3,7 @@ import { isFunctionNode } from "../../core/ast.js";
 import type { Value } from "../../core/evaluate.js";
 import type { Variable } from "../../core/scope.js";
 import type { Path } from "../../core/traverse.js";
-import type { PropertyPath } from "../emulate/guest.js";
+import type { PropertyPath } from "../runtime/model.js";
 
 export interface Case {
     readonly label: Value;

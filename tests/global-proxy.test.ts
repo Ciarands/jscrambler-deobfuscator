@@ -2,9 +2,9 @@ import { describe, expect, it } from "vitest";
 import { deobfuscate } from "../src/index.js";
 import { observe, type Run } from "./helpers.js";
 
-const run = async (code: string) => (await deobfuscate(code, { passes: ["emulate", "global-proxy"] })).code;
+const run = async (code: string) => (await deobfuscate(code, { passes: ["runtime", "global-proxy"] })).code;
 
-/** Timers (code after the prelude) never fire in the emulator; here they run in order once the script finishes. */
+/** Code after the prelude: here timers run in order once the script finishes. */
 const RUN: Run = { timers: true };
 
 const beforeAndAfter = async (code: string): Promise<[string, string, string]> => {
@@ -91,11 +91,18 @@ function g() { var s = G; s = other; return s[7]; }
         expect(neverAfter).toBe(neverBefore);
         expect(neverOutput).toContain("return typeof globalThis.Math;");
 
-        // Only the prelude calls it: what its method call does with `this` (G) is in the snapshot.
+        // Only the prelude calls it, and its method doesn't use `this`: nothing it does reaches G[7].
         const [preludeBefore, preludeAfter, preludeOutput] = await beforeAndAfter(
-            `${PRELUDE}\nG.m = function () { this.flag = 1; };\nfunction setup() { G.m(); }\nsetup();\nfunction read() { return typeof G[7].Math; }\nsetTimeout(function () { result = read(); });\n`
+            `${PRELUDE}\nG.m = function () { return 1; };\nfunction setup() { G.m(); }\nsetup();\nfunction read() { return typeof G[7].Math; }\nsetTimeout(function () { result = read(); });\n`
         );
         expect(preludeAfter).toBe(preludeBefore);
         expect(preludeOutput).toContain("return typeof globalThis.Math;");
+
+        // A method the prelude calls on G may change G[7] through its `this`: no snapshot says it didn't.
+        const [thisBefore, thisAfter, thisOutput] = await beforeAndAfter(
+            `${PRELUDE}\nG.m = function () { this[7] = { Math: 1 }; };\nfunction setup() { G.m(); }\nsetup();\nfunction read() { return typeof G[7].Math; }\nsetTimeout(function () { result = read(); });\n`
+        );
+        expect(thisAfter).toBe(thisBefore);
+        expect(thisOutput).toContain("return typeof G[7].Math;");
     });
 });

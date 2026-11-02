@@ -1,12 +1,21 @@
-import type { Expression, Function as FunctionNode, Node, Statement, VariableDeclarator } from "../../core/ast.js";
-import { keyName, propertyKey } from "../../core/ast.js";
+import type { CallExpression, Expression, Function as FunctionNode, Node, Statement, VariableDeclarator } from "../../core/ast.js";
+import { keyName, memberPath, propertyKey } from "../../core/ast.js";
+import { isObject } from "../../core/builtins.js";
+import type { Value } from "../../core/evaluate.js";
 import { evaluate } from "../../core/evaluate.js";
+import type { Held } from "../../core/interpret.js";
 import type { PassLog } from "../../core/log.js";
 import type { ScopeInfo, Variable } from "../../core/scope.js";
+import { traverse } from "../../core/traverse.js";
 import { factKey } from "../../pipeline/facts.js";
+import { keySets, mayName } from "../key-sets.js";
+import type { KeySet } from "../key-sets.js";
 import { parentsWithin, returnsOf } from "./builders.js";
-import type { LoggedCall, PropertyPath } from "./guest.js";
-import { pathName } from "./guest.js";
+import type { HostDecoder } from "./decoder-host.js";
+import { buildHostDecoder, keySetAliases } from "./decoder-host.js";
+import type { OrderContext } from "./decoder-order.js";
+import { statementOrder } from "./decoder-order.js";
+import { pathName } from "./model.js";
 import type { RuntimeModel } from "./model.js";
 import type { StorageMatcher } from "./storage.js";
 import { rootStatements } from "./storage.js";
@@ -90,136 +99,6 @@ const localFunction = (variable: Variable, body: readonly Statement[]): Function
 const twoNumbers = (args: readonly Node[]): boolean => args.length === 2 && args.every((arg) => numberOf(arg) !== undefined);
 
 const isStringLiteral = (node: Node | undefined): boolean => node?.type === "Literal" && typeof node.value === "string";
-
-export interface DecoderProof {
-    readonly lookups: ReadonlySet<LoggedCall>;
-    /**
-     * Wrappers whose decoder settled during the prelude and stayed in place: a later call is a pure lookup unless
-     * something writes `G.k` or `G.k.m` after the prelude.
-     */
-    readonly settled: ReadonlySet<string>;
-    /** Targets (`JSON.stringify` of `[k, m]`) following the template: a call writes only state reachable through `G.k`. */
-    readonly templated: ReadonlySet<string>;
-    /** Calls made after the settling call can't drive a stage. */
-    readonly settlingCalls: ReadonlySet<LoggedCall>;
-}
-
-/** For cleanup: stage calls of templated decoders only touch their own state. */
-export const DECODER_PROOF = factKey<DecoderProof>("decoder proof");
-
-/**
- * Which recorded decoder calls were pure table lookups (see `Template`), and which decoders are settled after the prelude.
- *
- * Proof, per decoder `G.k.m`. The template makes `S` write only `T`, `R` (stage paths) and `Q.m` (lookup exits, only
- * ever to `L`), and return `L(x)`, which only reads `T[x]`, on every path but the stage paths; a stage path requires
- * `R === c` for one of the stage guards `c`, and `R` only grows. So once `R` exceeds every guard (the decoder is
- * settled), S and L are both `x => T[x]` with `T` fixed: T's array came fresh from `split` and only ever went to
- * builtins as their receiver (the shuffles), so nothing else holds it; the stage paths, the only code writing `T`
- * after the setup, can't run again. That holds wherever S or L got to, so no escape analysis is needed. (Relies on
- * model 7: builtins intact. `split`, `splice`, `unshift` and `apply`, reached by name, through the aliases the runtime
- * added or through its call aliases, are the standard ones: they return fresh arrays and keep no receiver.)
- *
- * The guest says when that happens: right after the builder ran, `G.k` is `Q` and `G.k.m` is `S` (identities). A
- * recorded call on S that left `G.k.m` alone, with an integer argument and a number result (and no index property on
- * `Array.prototype`/`Object.prototype`) took a stage path: L's `T[x]` gives the table's strings or `undefined`. Its
- * result tells `R` after it; when that exceeds every guard (and matches the stage table), the decoder is settled from
- * that call on. The call must have been made while the guest still matched a real run: then a real run settles at the
- * same point. Every recorded call made after it on `Q` (`G.k` still `Q`) that found S or L at `G.k.m` and left it
- * there wrote nothing: it is a pure lookup, whose value is what the guest saw. (A call that replaced S by L, the
- * freeze, is not: it wrote `Q.m`.) L's identity is what such a call left at `G.k.m`. A later call is a lookup too
- * when the prelude left `G.k` at `Q` and `G.k.m` at S or L (the guest's final state) and nothing writes them after it.
- */
-export const decoderLookups = (runtime: RuntimeModel, matcher: StorageMatcher, scopes: ScopeInfo, log: PassLog): DecoderProof => {
-    const lookups = new Set<LoggedCall>();
-    const settledKeys = new Set<string>();
-    const templated = new Set<string>();
-    const settlingCalls = new Set<LoggedCall>();
-    const { storage, wrappers, aliases, callAliases } = runtime;
-    const cx: DecoderContext = { scopes, matcher, callAliases, originals: new Map(aliases.map((alias) => [`${pathName(alias.owner)}.${alias.alias}`, alias.original])) };
-
-    const targets = new Map<string, PropertyPath>();
-    const targetOf = new Map<string, string>();
-    for (const wrapper of wrappers.values()) {
-        if (wrapper.target.length !== 2) continue;
-        const id = JSON.stringify(wrapper.target);
-        targets.set(id, wrapper.target);
-        targetOf.set(wrapper.key, id);
-    }
-    const assigned = new Map<string, Statement[]>();
-    for (const statement of rootStatements(runtime.root)) {
-        if (statement.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression") continue;
-        const target = statement.expression.left;
-        const key = target.type === "MemberExpression" && matcher.isStorage(target.object) ? propertyKey(target) : undefined;
-        if (key !== undefined) assigned.set(key, [...(assigned.get(key) ?? []), statement]);
-    }
-    const order = new Map(runtime.preludeCalls.map((call, index) => [call, index]));
-    const recorded = [...runtime.preludeCalls, ...runtime.unmappedCalls.filter((call) => !order.has(call))];
-
-    for (const [id, target] of targets) {
-        const [key, method] = target as [string, string];
-        const name = `${storage}.${target.join(".")}`;
-        const statements = assigned.get(key) ?? [];
-        const [statement] = statements;
-        if (statement === undefined || statements.length !== 1) {
-            log.debug(
-                `${name}: not a string decoder of the known template, ${statements.length === 0 ? `no root statement assigns ${storage}.${key}` : `${statements.length} root statements assign ${storage}.${key}`}`
-            );
-            continue;
-        }
-        const template = templateOf(cx, statement, method);
-        if (typeof template === "string") {
-            log.debug(`${name}: not a string decoder of the known template, ${template}`, statement);
-            continue;
-        }
-        templated.add(id);
-        const identities = runtime.built.get(statement);
-        const stageId = identities?.methods.get(method);
-        if (identities === undefined || stageId === undefined) {
-            log.debug(`decoder ${name}: not proven, the guest didn't see what the builder stored`, statement);
-            continue;
-        }
-        const holderId = identities.holder;
-        const calls = recorded.filter((call) => targetOf.get(call.key) === id);
-        const frozenTo = new Set(calls.filter((call) => call.owner === holderId && call.before === stageId && call.after !== stageId).map((call) => call.after));
-        if (frozenTo.size > 1 || frozenTo.has(null)) {
-            log.debug(`decoder ${name}: not proven, its calls left ${frozenTo.size} different values at ${name}`, statement);
-            continue;
-        }
-        const [lookupId] = frozenTo;
-        const settled = settlingCall(calls, order, template, holderId, stageId);
-        if (settled === undefined) {
-            log.debug(`decoder ${name}: not proven, no recorded call settled it while the guest followed a real run`, statement);
-            continue;
-        }
-        const settledAt = order.get(settled) as number;
-        let count = 0;
-        for (const call of calls) {
-            if ((order.get(call) ?? Number.POSITIVE_INFINITY) <= settledAt || call.owner !== holderId || call.before !== call.after) continue;
-            if (call.before !== stageId && (lookupId === undefined || call.before !== lookupId)) continue;
-            if (call.args.some((arg) => typeof arg === "object" && arg !== null) || (typeof call.result === "object" && call.result !== null)) continue;
-            lookups.add(call);
-            count++;
-        }
-        const stage = `${settled.key}(${settled.args.map((arg) => JSON.stringify(arg)).join(", ")})`;
-        log.debug(
-            `decoder ${name}: settled by its recorded call ${stage} = ${String(settled.result)}, which leaves its counter past all ${template.stages.length} stage guards; ${count} later recorded call(s) are pure lookups`,
-            statement
-        );
-        // Later calls are lookups only if the prelude leaves G.k at Q and G.k.m at S or L.
-        const current = runtime.guest.stateKey(target);
-        if (runtime.guest.stateKey([key]) !== `o:${holderId}` || (current !== `o:${stageId}` && (lookupId === undefined || current !== `o:${lookupId}`))) {
-            log.debug(
-                `decoder ${name}: after the prelude, ${name} is no longer its stage function or lookup (or ${storage}.${key} no longer its holder): later calls aren't proven lookups`,
-                statement
-            );
-            continue;
-        }
-        for (const [wrapperKey, wrapperTarget] of targetOf) if (wrapperTarget === id) settledKeys.add(wrapperKey);
-        settlingCalls.add(settled);
-    }
-    if (settledKeys.size > 0) log.info(`${settledKeys.size} wrapper(s) of string decoders proven settled during the prelude; ${lookups.size} recorded call(s) on them were pure lookups`);
-    return { lookups, settled: settledKeys, templated, settlingCalls };
-};
 
 /** An alias's original, or the name itself (relies on model 7: builtins intact). */
 const builtin = (cx: DecoderContext, owner: string, name: string | undefined): string | undefined => (name === undefined ? undefined : (cx.originals.get(`${owner}.${name}`) ?? name));
@@ -545,16 +424,380 @@ const splits = (cx: DecoderContext, value: Node, table: Variable): boolean => {
     return callAliasOf(cx, callee) === "String.prototype.split" && value.arguments.length === 2 && isTableName(value.arguments[0]) && isStringLiteral(value.arguments[1]);
 };
 
-/** The first call, made while the guest followed a real run, leaving S in place and the counter past every guard. */
-const settlingCall = (calls: readonly LoggedCall[], order: ReadonlyMap<LoggedCall, number>, template: Template, holderId: number, stageId: number): LoggedCall | undefined => {
+/** Whether a stage call with `argument` that gave `result` and left S in place leaves the counter past every guard. */
+const settles = (template: Template, argument: Value | undefined, result: Value): boolean => {
+    if (typeof argument !== "number" || !Number.isInteger(argument) || argument < 0 || argument >= 2 ** 32 - 1 || typeof result !== "number") return false;
     const highest = template.stages.reduce((most, stage) => Math.max(most, stage.state), Number.NEGATIVE_INFINITY);
-    return calls.find((call) => {
-        const [argument] = call.args;
-        const { result } = call;
-        if (!order.has(call) || call.owner !== holderId || call.before !== stageId || call.after !== stageId || call.indexed !== false) return false;
-        if (typeof argument !== "number" || !Number.isInteger(argument) || argument < 0 || argument >= 2 ** 32 - 1 || typeof result !== "number") return false;
-        const before = result - template.bodyStep - (template.tail === "pre" ? 1 : 0);
-        const after = before + template.bodyStep + (template.tail === "after" ? 0 : 1);
-        return after > highest && template.stages.some((stage) => stage.state === before && (stage.argument === undefined || stage.argument === argument));
-    });
+    const before = result - template.bodyStep - (template.tail === "pre" ? 1 : 0);
+    const after = before + template.bodyStep + (template.tail === "after" ? 0 : 1);
+    return after > highest && template.stages.some((stage) => stage.state === before && (stage.argument === undefined || stage.argument === argument));
 };
+
+/**
+ * Where a decoder settles: its settling call, the root statement it is in, the calls of it there known to come after
+ * it, and the storage keys holding its holder (`G.k`, and copies `G.x = G.k` root statements make).
+ */
+export interface Settling {
+    readonly call: CallExpression;
+    readonly statement: Statement;
+    readonly after: ReadonlySet<Node>;
+    readonly holders: ReadonlySet<string>;
+}
+
+export interface DecoderProof {
+    /** Targets (`JSON.stringify` of `[k, m]`) following the template: a call writes only state reachable through `G.k`. */
+    readonly templated: ReadonlySet<string>;
+    /**
+     * Root builder statements of templated decoders built on the host (`buildHostDecoder`). Building one changes
+     * nothing but objects it made: the interpreter writes only plain objects and arrays, and none existed before the
+     * build (the storage function, root function closures and builtins it reads through are no such objects, and it
+     * refuses writing their properties); it assigns only variables the run declared; every call it ran was of code it
+     * interpreted under the same rules, or of a modelled builtin (model 7). The real build runs alike: its name probe
+     * finds the one value given it, drawing only `Math.random` on the way (which leaves no state the program reads).
+     */
+    readonly hostBuilt: ReadonlySet<Node>;
+    /** Wrapper keys of decoders the prelude settles: a later call is a lookup on the final table (see `settling`). */
+    readonly settled: ReadonlySet<string>;
+    /** The decoders' calls the prelude makes in its proven order, up to the one that settles them: their values. */
+    readonly stageCalls: ReadonlyMap<Node, Value>;
+    /** By settled target (its path, `\0`-joined). */
+    readonly settling: ReadonlyMap<string, Settling>;
+    /** A call of a settled decoder's wrapper `key` on its final table, on the host; then the reads `keys` on its result. */
+    readonly lookup: (key: string, args: readonly Value[], keys?: readonly string[]) => Held;
+}
+
+/** For cleanup: stage calls of templated decoders only touch their own state. */
+export const DECODER_PROOF = factKey<DecoderProof>("decoder proof");
+
+/** A reference to `G` with the member chain on it: its static keys (`undefined` for computed ones). */
+interface StorageChain {
+    readonly keys: readonly (string | undefined)[];
+    /** The outermost member of the chain (or `G`), its parent and the key it has there. */
+    readonly node: Node;
+    readonly parent: Node | null;
+    readonly key: string | null;
+    readonly write: boolean;
+    readonly statement: Statement | undefined;
+}
+
+const storageChains = (runtime: RuntimeModel, matcher: StorageMatcher): StorageChain[] => {
+    const chains: StorageChain[] = [];
+    for (const statement of rootStatements(runtime.root)) {
+        traverse(statement, {
+            Identifier(path) {
+                const node = path.node;
+                if (!matcher.isStorage(node) || matcher.isAliasBinding(node) || (path.parent?.type === "FunctionDeclaration" && path.key === "id")) return;
+                const keys: (string | undefined)[] = [];
+                let outer = path as typeof path | NonNullable<typeof path.parentPath>;
+                while (outer.parent?.type === "MemberExpression" && outer.key === "object" && outer.parentPath !== null) {
+                    keys.push(propertyKey(outer.parent));
+                    outer = outer.parentPath;
+                }
+                const write = outer.isWriteTarget() || (outer.parent?.type === "UnaryExpression" && outer.parent.operator === "delete");
+                chains.push({ keys, node: outer.node, parent: outer.parent, key: outer.key, write, statement });
+            },
+        });
+    }
+    return chains;
+};
+
+/** The receiver argument of `G.k.m.apply(G.k, ...)`/`.call(G.k, ...)`: what `this` the target gets. */
+const isReceiverOf = (node: Node, parent: Node | null, holderKeys: ReadonlySet<string>, method: string, isStorage: (node: Node) => boolean): boolean => {
+    if (parent?.type !== "CallExpression" || parent.arguments[0] !== node) return false;
+    const callee = memberPath(parent.callee);
+    const [first, second, third] = callee?.keys ?? [];
+    return callee !== undefined && isStorage(callee.root) && callee.keys.length === 3 && holderKeys.has(first ?? "") && second === method && (third === "apply" || third === "call");
+};
+
+/** Root statements `G.x = G.k` (also of copies), by the copy's key. */
+const holderCopies = (runtime: RuntimeModel, matcher: StorageMatcher, key: string): Map<string, Statement> => {
+    const copies = new Map<string, Statement>();
+    for (const statement of rootStatements(runtime.root)) {
+        if (statement.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression" || statement.expression.operator !== "=") continue;
+        const { left, right } = statement.expression;
+        const from = right.type === "MemberExpression" && matcher.isStorage(right.object) ? propertyKey(right) : undefined;
+        const to = left.type === "MemberExpression" && matcher.isStorage(left.object) ? propertyKey(left) : undefined;
+        if (from !== undefined && to !== undefined && (from === key || copies.has(from))) copies.set(to, statement);
+    }
+    return copies;
+};
+
+/**
+ * How the program uses the holder `G.k` (and its `copies`): written only by its builder (and the copies), handed on
+ * only as the receiver of `G.k.m.apply`, its method `G.k.m` only called (directly or by `apply`/`call`), read under
+ * `typeof`, or read as a value (`valueReads`: S and L are the same lookup once it settled, but not the same function).
+ * No other method of it is called with it as `this`, and no computed read of `G` that may select it (key sets, as
+ * `cleanup` judges computed reads) reads or calls its members.
+ */
+const holderUses = (
+    cx: { runtime: RuntimeModel; matcher: StorageMatcher; scopes: ScopeInfo },
+    chains: readonly StorageChain[],
+    target: readonly [string, string],
+    builder: Statement,
+    copies: ReadonlyMap<string, Statement>,
+    keySetOf: (property: Node, statement: Statement | undefined) => KeySet | undefined
+): { valueReads: Node[] } | string => {
+    const { runtime, matcher } = cx;
+    const [key, method] = target;
+    const name = `${runtime.storage}.${key}`;
+    const holderKeys = new Set([key, ...copies.keys()]);
+    const valueReads: Node[] = [];
+    for (const chain of chains) {
+        const [first, second, third] = chain.keys;
+        const { node, parent } = chain;
+        if (first === undefined || !holderKeys.has(first)) continue;
+        const depth = chain.keys.length;
+        if (depth === 1) {
+            if (chain.write) {
+                if (node === assignedTarget(first === key ? builder : copies.get(first))) continue;
+                return `${runtime.storage}.${first} is written outside its builder`;
+            }
+            if (
+                parent?.type === "AssignmentExpression" &&
+                chain.key === "right" &&
+                [...copies.values()].some((statement) => statement.type === "ExpressionStatement" && statement.expression === parent)
+            )
+                continue;
+            if (isReceiverOf(node, parent, holderKeys, method, matcher.isStorage)) continue;
+            return `the holder ${name} is used as a value`;
+        }
+        if (second === undefined) return `a computed key of the holder ${name} is used`;
+        if (second !== method) {
+            if (depth === 2 && parent?.type === "CallExpression" && chain.key === "callee") return `${runtime.storage}.${first}.${second}() runs with the holder as this`;
+            continue;
+        }
+        if (chain.write) return `${runtime.storage}.${first}.${method} is written`;
+        const called = parent?.type === "CallExpression" && chain.key === "callee";
+        if (depth === 2 && (called || (parent?.type === "UnaryExpression" && parent.operator === "typeof"))) continue;
+        if (depth === 3 && (third === "apply" || third === "call") && called) continue;
+        valueReads.push(node);
+    }
+    // Computed reads of `G` that may select the holder: but for a call of what one selects (the holder isn't callable,
+    // so none of its methods runs) and reads of its other static keys, a key set must rule the holder out.
+    for (const chain of chains) {
+        const [first, next] = chain.keys;
+        if (chain.keys.length === 0 || first !== undefined) continue;
+        const called = chain.keys.length === 1 && chain.parent?.type === "CallExpression" && chain.key === "callee";
+        const methodCall = chain.keys.length === 2 && chain.parent?.type === "CallExpression" && chain.key === "callee";
+        if (called || (chain.keys.length >= 2 && next !== undefined && next !== method && !methodCall)) continue;
+        const member = findComputed(chain.node, chain.keys.length);
+        const keys = member === undefined ? undefined : keySetOf(member.property, chain.statement);
+        if (keys === undefined || [...holderKeys].some((holder) => mayName(keys, holder))) return `a computed read of ${runtime.storage} may give the holder ${name}`;
+    }
+    return { valueReads };
+};
+
+/** The innermost member of a chain `depth` members deep ending at `outer` (the one on `G` itself). */
+const findComputed = (outer: Node, depth: number): (Node & { type: "MemberExpression" }) | undefined => {
+    let member: Node = outer;
+    for (let i = 1; i < depth; i++) {
+        if (member.type !== "MemberExpression") return undefined;
+        member = member.object;
+    }
+    return member.type === "MemberExpression" ? member : undefined;
+};
+
+/**
+ * Which templated string decoders the prelude settles, and their calls' values, on the host.
+ *
+ * Proof, per decoder `G.k.m`. The template makes `S` write only `T`, `R` (stage paths) and `Q.m` (lookup exits, only
+ * ever to `L`), and return `L(x)`, which only reads `T[x]`, on every path but the stage paths; a stage path requires
+ * `R === c` for one of the stage guards `c`, and `R` only grows. So once `R` exceeds every guard (the decoder is
+ * settled), S and L are both `x => T[x]` with `T` fixed: T's array came fresh from `split` and only ever went to
+ * builtins as their receiver (the shuffles), so nothing else holds it; the stage paths, the only code writing `T`
+ * after the setup, can't run again. That holds wherever S or L got to. (Relies on model 7: builtins intact. `split`,
+ * `splice`, `unshift` and `apply`, reached by name, through the aliases the runtime added or through its call aliases,
+ * are the standard ones: they return fresh arrays and keep no receiver.)
+ *
+ * When that happens: its one root builder `G.k = ...` is built on the host (`buildHostDecoder`). Then the root
+ * statements after it run in place (`statementOrder`; model 1: the prelude runs to completion, and no callback runs
+ * before it did): nothing they do may call it or run code that could, but its calls made exactly once in that order
+ * with constant arguments, through its wrappers (defined by then, not rewritten since) or of `G.k.m`. Those are made
+ * on the host in that order until one leaves `S` in place with an integer argument and a number result that puts `R`
+ * past every guard (`settles`: `L`'s `T[x]` gives the table's strings or `undefined`, model 7: no index properties on
+ * the builtin prototypes); their values are exact, and they keep running (`stageCalls`). Calls that may run before it
+ * settles but aren't in that order (in code the walk stops at, or in functions made earlier) can't be told: the walk
+ * stops at the first, and the decoder isn't settled. From the settling call on every call of it is a lookup on the
+ * final table (`lookup`), whatever its order. Dropping one may drop the call that freezes `G.k.m` to `L`: so the holder
+ * must be used only in ways that can't tell `S` and `L` apart (`holderUses`), but for reads of `G.k.m` the walk passed
+ * before the settling call (they get `S`). That `G.k` and `G.k.m` stay so after the prelude is the caller's to check
+ * (`effects.ts`: only the builder writes them).
+ */
+export const proveDecoders = (runtime: RuntimeModel, matcher: StorageMatcher, scopes: ScopeInfo, log: PassLog): DecoderProof => {
+    const settled = new Set<string>();
+    const templated = new Set<string>();
+    const hostBuilt = new Set<Node>();
+    const stageCalls = new Map<Node, Value>();
+    const settling = new Map<string, Settling>();
+    const decoders = new Map<string, HostDecoder>();
+    const { storage, wrappers, aliases, callAliases } = runtime;
+    const cx: DecoderContext = { scopes, matcher, callAliases, originals: new Map(aliases.map((alias) => [`${pathName(alias.owner)}.${alias.alias}`, alias.original])) };
+    const host = { runtime, matcher, scopes };
+    const root = rootStatements(runtime.root);
+
+    const targets = new Map<string, readonly [string, string]>();
+    const keysOf = new Map<string, string[]>();
+    for (const wrapper of wrappers.values()) {
+        if (wrapper.target.length !== 2) continue;
+        const id = JSON.stringify(wrapper.target);
+        targets.set(id, wrapper.target as [string, string]);
+        keysOf.set(id, [...(keysOf.get(id) ?? []), wrapper.key]);
+    }
+    const assigned = new Map<string, Statement[]>();
+    for (const statement of root) {
+        if (statement.type !== "ExpressionStatement" || statement.expression.type !== "AssignmentExpression") continue;
+        const target = statement.expression.left;
+        const key = target.type === "MemberExpression" && matcher.isStorage(target.object) ? propertyKey(target) : undefined;
+        if (key !== undefined) assigned.set(key, [...(assigned.get(key) ?? []), statement]);
+    }
+    let chains: StorageChain[] | undefined;
+    const keySetsByStatement = new Map<Statement, (key: Expression) => KeySet | undefined>();
+    const keySetOf = (property: Node, statement: Statement | undefined): KeySet | undefined => {
+        if (statement === undefined) return undefined;
+        let of = keySetsByStatement.get(statement);
+        if (of === undefined) {
+            of = keySets(scopes, parentsWithin(statement), keySetAliases(host));
+            keySetsByStatement.set(statement, of);
+        }
+        return of(property as Expression);
+    };
+
+    for (const [id, target] of targets) {
+        const [key, method] = target;
+        const name = `${storage}.${target.join(".")}`;
+        const statements = assigned.get(key) ?? [];
+        const [statement] = statements;
+        if (statement === undefined || statements.length !== 1) {
+            log.debug(
+                `${name}: not a string decoder of the known template, ${statements.length === 0 ? `no root statement assigns ${storage}.${key}` : `${statements.length} root statements assign ${storage}.${key}`}`
+            );
+            continue;
+        }
+        const template = templateOf(cx, statement, method);
+        if (typeof template === "string") {
+            log.debug(`${name}: not a string decoder of the known template, ${template}`, statement);
+            continue;
+        }
+        templated.add(id);
+        const built = buildHostDecoder(host, statement, method);
+        if (typeof built === "string") {
+            log.debug(`decoder ${name}: not proven, ${built}`, statement);
+            continue;
+        }
+        const { decoder } = built;
+        hostBuilt.add(statement);
+        log.debug(`decoder ${name}: built on the host; ${built.probe}`, statement);
+        // The prelude's calls of it, in order, until one settles it; then until one freezes it.
+        const copies = holderCopies(runtime, matcher, key);
+        const wrapperKeys = new Set(keysOf.get(id));
+        const holderKeys = new Set([key, ...copies.keys()]);
+        const definitions = new Map([...wrapperKeys].map((wrapperKey) => [wrapperKey, wrappers.get(wrapperKey)?.definition]));
+        const seen = new Set<Node>();
+        const order: OrderContext = {
+            scopes,
+            matcher,
+            runtime,
+            decoderCall: (call: CallExpression) => {
+                const callee = call.callee;
+                if (callee.type === "MemberExpression" && matcher.isStorage(callee.object) && wrapperKeys.has(propertyKey(callee) ?? "")) return true;
+                const path = memberPath(callee);
+                return path !== undefined && matcher.isStorage(path.root) && path.keys.length === 2 && holderKeys.has(path.keys[0] as string) && path.keys[1] === method;
+            },
+            holder: (slot) => holderKeys.has(slot),
+            guarded: (slot, write) => {
+                if (holderKeys.has(slot)) return write === assignedTarget(copies.get(slot)) ? undefined : `it writes ${storage}.${slot}, which holds the decoder`;
+                const definition = definitions.get(slot);
+                return definition === undefined || write === assignedTarget(definition) ? undefined : `it writes ${storage}.${slot}, a wrapper of the decoder`;
+            },
+            seen,
+        };
+        const start = root.indexOf(statement);
+        let settledBy: { statement: Statement; call: CallExpression } | undefined;
+        let freeze: CallExpression | undefined;
+        const after = new Set<Node>();
+        let why: string | undefined;
+        let replayed = 0;
+        let seenBefore: ReadonlySet<Node> = new Set();
+        statements: for (const [index, current] of root.entries()) {
+            if (index <= start) continue;
+            const walk = statementOrder(order, current);
+            for (let step = walk.next(); step.done !== true;) {
+                const event = step.value;
+                if (event.kind === "stop") {
+                    if (settledBy === undefined) why = `root statement ${index} ${event.reason} before it settles`;
+                    break statements;
+                }
+                const wrapperKey = event.call.callee.type === "MemberExpression" && wrapperKeys.has(propertyKey(event.call.callee) ?? "") ? propertyKey(event.call.callee) : undefined;
+                const definedAt = wrapperKey === undefined ? -1 : root.indexOf(definitions.get(wrapperKey) as Statement);
+                if (wrapperKey !== undefined && !(definedAt >= 0 && definedAt < index)) {
+                    why = `root statement ${index} calls ${storage}.${wrapperKey} before it is defined`;
+                    break statements;
+                }
+                const unfrozen = decoder.unfrozen;
+                const answer = decoder.call(event.args);
+                if (!answer.ok || isObject(answer.value)) {
+                    why = `its call at root statement ${index} ${answer.ok ? "gives an object" : `refused on the host: ${answer.reason}`}`;
+                    break statements;
+                }
+                const value = answer.value as Value;
+                if (settledBy === undefined) {
+                    stageCalls.set(event.call, value);
+                    replayed++;
+                    if (unfrozen && decoder.unfrozen && settles(template, event.args[0], value)) {
+                        settledBy = { statement: current, call: event.call };
+                        seenBefore = new Set(seen);
+                    }
+                } else if (unfrozen && !decoder.unfrozen) {
+                    // The call that freezes it to `L`: it keeps running, as the stage calls do.
+                    stageCalls.set(event.call, value);
+                    freeze = event.call;
+                    break statements;
+                } else after.add(event.call);
+                step = walk.next(value);
+            }
+        }
+        if (settledBy === undefined) {
+            log.debug(`decoder ${name}: not proven, ${why ?? "no prelude call settles it"}${replayed > 0 ? ` (its ${replayed} call(s) before that keep running with their values)` : ""}`, statement);
+            continue;
+        }
+        chains ??= storageChains(runtime, matcher);
+        const uses = holderUses(host, chains, target, statement, copies, keySetOf);
+        if (typeof uses === "string") {
+            log.debug(`decoder ${name}: not proven, ${uses}`, statement);
+            continue;
+        }
+        // Where no known call froze it, which later call does isn't known: then nothing may tell S from L but where it is S.
+        const wrapperStatements = [...definitions.values()];
+        const early =
+            freeze === undefined
+                ? uses.valueReads.find((read) => !seenBefore.has(read) && !wrapperStatements.some((definition) => definition !== undefined && within(scopes, definition, read)))
+                : undefined;
+        if (early !== undefined) {
+            log.debug(`decoder ${name}: not proven, ${name} is read as a value where it may be either its stage function or its lookup`, early);
+            continue;
+        }
+        for (const wrapperKey of wrapperKeys) settled.add(wrapperKey);
+        settling.set(target.join("\u0000"), { call: settledBy.call, statement: settledBy.statement, after, holders: holderKeys });
+        decoders.set(id, decoder);
+        log.debug(
+            `decoder ${name}: settled by the prelude's call ${replayed} of it, at root statement ${root.indexOf(settledBy.statement)}${freeze === undefined ? "" : ", frozen by a later one"}; later calls are lookups on its final table`,
+            settledBy.call
+        );
+    }
+    if (settled.size > 0) log.info(`${settled.size} wrapper(s) of string decoders proven settled during the prelude, on the host`);
+    const lookup = (wrapperKey: string, args: readonly Value[], keys: readonly string[] = []): Held => {
+        const target = wrappers.get(wrapperKey)?.target;
+        const decoder = target === undefined ? undefined : decoders.get(JSON.stringify(target));
+        return decoder === undefined ? { ok: false, reason: "not a settled decoder", steps: 0, exhausted: false } : decoder.call(args, keys);
+    };
+    return { templated, hostBuilt, settled, stageCalls, settling, lookup };
+};
+
+/** Whether `inner` is inside `outer`, by the parents of the last scope walk (positions don't tell: passes moved code). */
+const within = (scopes: ScopeInfo, outer: Node, inner: Node): boolean => {
+    for (let node: Node | undefined = inner; node !== undefined; node = scopes.parentOf(node)) if (node === outer) return true;
+    return false;
+};
+
+/** The target of a statement `t = v`. */
+const assignedTarget = (node: Node | undefined): Node | undefined => (node?.type === "ExpressionStatement" && node.expression.type === "AssignmentExpression" ? node.expression.left : undefined);

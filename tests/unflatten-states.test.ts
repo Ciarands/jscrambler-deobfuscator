@@ -51,7 +51,7 @@ const RUN: Run = { globals: () => ({ host: { a: true, b: false } }) };
 
 describe("unflatten with runtime state keys", () => {
     it("unflattens machines whose states are table rows compared by identity", async () => {
-        const { code } = await deobfuscate(PROGRAM, { passes: ["emulate", "unflatten"] });
+        const { code } = await deobfuscate(PROGRAM, { passes: ["runtime", "unflatten"] });
         expect(machinesLeft(code)).toBe(0);
         expect(observe(code, RUN)).toBe(observe(PROGRAM, RUN));
     });

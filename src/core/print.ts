@@ -303,7 +303,6 @@ const endsWithOpenIf = (statement: Statement): boolean => {
 };
 
 class Printer {
-    readonly #layout: boolean;
     /** Output is `#parts.join("") + #buffer`; flushed in chunks because joining many tiny strings is slow. */
     #parts: string[] = [];
     #buffer = "";
@@ -317,23 +316,11 @@ class Printer {
     #abortAt = Infinity;
     readonly #indents: string[] = ["\n"];
 
-    /** Output for people, not for the sandbox: text printed raw gets its unsafe characters escaped. */
-    readonly #display: boolean;
     readonly #warn: ((message: string) => void) | undefined;
     readonly #warned = new Set<Node>();
-    /** When set, where each function's text starts in the output (see `printStatement`). */
-    #functions: Map<number, Node> | undefined;
 
-    constructor(layout: boolean, display: boolean, warn?: (message: string) => void) {
-        this.#layout = layout;
-        this.#display = display;
+    constructor(warn?: (message: string) => void) {
         this.#warn = warn;
-    }
-
-    /** Only without layout: a layout attempt that backs out would leave stale offsets. */
-    track(functions: Map<number, Node>): void {
-        if (this.#layout) throw new Error("print: functions are tracked without layout only");
-        this.#functions = functions;
     }
 
     get output(): string {
@@ -410,7 +397,7 @@ class Printer {
             this.write(open + close);
             return;
         }
-        if (!this.#layout || this.#flat || (kind === "arguments" && items.length === 1)) return this.#inline(open, close, items, kind);
+        if (this.#flat || (kind === "arguments" && items.length === 1)) return this.#inline(open, close, items, kind);
         if (this.#attempt(true, open, close, items, kind)) return;
         if (kind === "arguments" && this.#attempt(false, open, close, items, kind)) return;
         // A trailing hole needs its own comma: `[a, ,]` has two elements.
@@ -481,7 +468,7 @@ class Printer {
     }
 
     program(program: Program): void {
-        if (program.hashbang !== null) this.write(`#!${this.#display ? escapeUnsafeSource(program.hashbang.value, true, false) : program.hashbang.value}`);
+        if (program.hashbang !== null) this.write(`#!${escapeUnsafeSource(program.hashbang.value, true, false)}`);
         const body = program.body as Statement[];
         if (body.length === 0) return;
         this.statements(body, true);
@@ -502,7 +489,7 @@ class Printer {
             const expression = statement.expression;
             if (isOriginalDirective(statement)) {
                 const raw = statement.expression.raw;
-                this.write(`${this.#display ? escapeUnsafeSource(raw, false, true) : raw};`);
+                this.write(`${escapeUnsafeSource(raw, false, true)};`);
                 continue;
             }
             if (inPrologue && expression.type === "Literal" && typeof expression.value === "string") {
@@ -773,13 +760,7 @@ class Printer {
         this.list("{", "}", attributes, "attributes");
     }
 
-    /** Notes where `fn` starts (QuickJS's position of a function: its first token, or a method's). */
-    #start(fn: Node): void {
-        this.#functions?.set(this.#length, fn);
-    }
-
     function(node: FunctionNode): void {
-        this.#start(node);
         if (node.async) this.write("async ");
         this.write(node.generator ? "function*" : "function");
         this.write(node.id === null ? " " : ` ${node.id.name}`);
@@ -793,7 +774,6 @@ class Printer {
     }
 
     arrow(node: Extract<Node, { type: "ArrowFunctionExpression" }>, flags: number): void {
-        this.#start(node);
         if (node.async) this.write("async ");
         const only = node.params.length === 1 ? node.params[0] : undefined;
         if (only?.type === "Identifier") this.write(only.name);
@@ -872,7 +852,6 @@ class Printer {
 
     method(kind: "get" | "set" | "method", key: Node, computed: boolean, fn: Node): void {
         if (fn.type !== "FunctionExpression") throw new Error(`print: method value ${fn.type}`);
-        this.#start(fn);
         if (kind !== "method") this.write(`${kind} `);
         if (fn.async) this.write("async ");
         if (fn.generator) this.write("*");
@@ -1078,7 +1057,7 @@ class Printer {
     literal(node: Extract<Node, { type: "Literal" }>): void {
         if ("regex" in node && node.regex !== undefined) {
             const { pattern, flags } = node.regex;
-            return this.write(`/${this.#display ? escapeUnsafeSource(pattern, flags.includes("u") || flags.includes("v"), false) : pattern}/${flags}`);
+            return this.write(`/${escapeUnsafeSource(pattern, flags.includes("u") || flags.includes("v"), false)}/${flags}`);
         }
         if ("bigint" in node && typeof node.bigint === "string") return this.write(`${node.bigint}n`);
         const value = node.value;
@@ -1098,7 +1077,7 @@ class Printer {
             const quasi = node.quasis[i] as TemplateElement;
             const raw = quasi.value.raw;
             if (raw === undefined || raw === null) this.writeMultiline(templateRaw(quasi.value.cooked ?? ""));
-            else if (!this.#display || !hasUnsafe(raw)) this.writeMultiline(raw);
+            else if (!hasUnsafe(raw)) this.writeMultiline(raw);
             else if (!tagged) this.writeMultiline(templateRaw(quasi.value.cooked ?? ""));
             else {
                 if (!this.#warned.has(quasi)) {
@@ -1122,26 +1101,11 @@ class Printer {
  * bodies, directives, the hashbang) are written as escapes; `warn` hears of those a tagged template must keep.
  */
 export const print = (program: Program, warn?: (message: string) => void): string => {
-    const printer = new Printer(true, true, warn);
+    const printer = new Printer(warn);
     try {
         printer.program(program);
     } catch (error) {
         throw isStackOverflow(error) ? new NestingError() : error;
     }
     return printer.output;
-};
-
-/** A statement's exact text, without layout work, and where each function in it starts (a UTF-16 offset). */
-export interface PrintedFunctions {
-    readonly source: string;
-    readonly functions: ReadonlyMap<number, Node>;
-}
-
-/** For running in the sandbox. Function starts are where QuickJS places a function: one it made is found by its `lineNumber`/`columnNumber`. */
-export const printStatement = (statement: Statement): PrintedFunctions => {
-    const printer = new Printer(false, false);
-    const functions = new Map<number, Node>();
-    printer.track(functions);
-    printer.statements([statement], true);
-    return { source: printer.output, functions };
 };

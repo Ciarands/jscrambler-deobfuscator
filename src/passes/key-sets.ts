@@ -4,7 +4,6 @@ import type { Value } from "../core/evaluate.js";
 import { binary } from "../core/evaluate.js";
 import type { ScopeInfo, Variable } from "../core/scope.js";
 import { forEachChild } from "../core/traverse.js";
-import { slotArray } from "./emulate/builders.js";
 
 /** Keys a computed read may select: one of `strings`, or any string made only of `chars`. */
 export interface KeySet {
@@ -74,6 +73,16 @@ const charsOf = (a: Abstract, inJoin: boolean): Set<string> | undefined => {
     return chars;
 };
 
+/** Builtin aliases the setup added (model 7), so key sets can be found before the aliases pass rewrote them. */
+export interface KeySetAliases {
+    /** By owner (`""` for globals, `String`, `Array.prototype`): the original name an alias stands for. */
+    readonly aliasOf: (owner: string, name: string) => string | undefined;
+    /** A storage call alias `G.k(...)`: the builtin it hands out and how it passes arguments on (`aliases.ts`). */
+    readonly callAlias: (call: Node & { type: "CallExpression" }) => { readonly owner: string; readonly original: string; readonly style: "static" | "method" | "call" } | undefined;
+}
+
+const NO_ALIASES: KeySetAliases = { aliasOf: () => undefined, callAlias: () => undefined };
+
 /**
  * The keys computed reads may select, from a flow-insensitive abstract evaluation over the function they sit in.
  * Built for jscrambler's decoder probe:
@@ -81,18 +90,38 @@ const charsOf = (a: Abstract, inJoin: boolean): Set<string> | undefined => {
  *     do { key = c.sort(function () { return 0.5 - random(); }).join(""); found = G[key]; } while (!found);
  *
  * A variable holds any of its writes or `undefined`; a parameter what any call passes, when its function is only
- * called directly by name and doesn't use `arguments`; a local array whatever its element writes put there, when it
- * is only read, written by element, sorted or joined. Relies on model 7 (builtins intact, no index properties on
- * their prototypes). Anything else is top.
+ * called directly by name and doesn't use `arguments`; a local array whatever its element writes and pushes put
+ * there, when it is only read, written by element, pushed to, sorted or joined. Builtins also count through the
+ * setup's `aliases`. Relies on model 7 (builtins intact, no index properties on their prototypes). Anything else is
+ * top.
  */
-export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((key: Expression) => KeySet | undefined) => {
+export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>, aliases: KeySetAliases = NO_ALIASES): ((key: Expression) => KeySet | undefined) => {
+    const { aliasOf } = aliases;
     const withScope = scopes.manager.scopes.some((scope) => scope.type === "with");
     const values = new Map<Variable, Abstract | undefined>();
     const sources = new Map<Node | Variable, ArraySource | undefined>();
     const pending = new Set<Variable>();
 
-    /** Whether `node` is the global `name` (`namesGlobal`), with no `with` to make it another. */
-    const isGlobal = (node: Node, name: string): boolean => node.type === "Identifier" && node.name === name && !withScope && scopes.namesGlobal(node);
+    /** Whether `node` is the global `name` (`namesGlobal`) or a global alias of it, with no `with` to make it another. */
+    const isGlobal = (node: Node, name: string): boolean => node.type === "Identifier" && (node.name === name || aliasOf("", node.name) === name) && !withScope && scopes.namesGlobal(node);
+
+    /**
+     * An array method call as `receiver.method(...args)`: written so (the method also through an alias on
+     * `Array.prototype`), or through a call alias passing the receiver first (`G.k(receiver, ...args)`, styles `method`
+     * and `call` of an `Array.prototype` method).
+     */
+    const methodCall = (node: Node & { type: "CallExpression" }): { receiver: Node; method: string | undefined; args: readonly Node[] } | undefined => {
+        const callee = node.callee;
+        if (callee.type !== "MemberExpression" || callee.computed) return undefined;
+        const alias = aliases.callAlias(node);
+        if (alias === undefined) {
+            const key = propertyKey(callee);
+            return { receiver: callee.object, method: key === undefined ? undefined : (aliasOf("Array.prototype", key) ?? key), args: node.arguments };
+        }
+        const [receiver, ...args] = node.arguments;
+        if (alias.style === "static" || alias.owner !== "Array.prototype" || receiver === undefined || receiver.type === "SpreadElement") return undefined;
+        return { receiver, method: alias.original, args };
+    };
 
     const parentOf = (id: Node): Node | undefined => parents.get(id);
 
@@ -120,26 +149,49 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
         return false;
     };
 
-    /** A local array declared with a literal and used only in ways that leave its elements to the writes `V[k] = v`. */
+    /**
+     * A local array declared with a literal and used only in ways that leave its elements to the writes `V[k] = v` and
+     * the pushes `V.push(v)`.
+     */
     const arraySource = (variable: Variable): ArraySource | undefined => {
         if (sources.has(variable)) return sources.get(variable);
         let source: ArraySource | undefined;
-        // `spreadless`, `member`: its elements are the literal's and the writes below; `sort`/`join` leave them be.
-        if (slotArray(variable, scopes.staticReferences(variable), parents, { init: "spreadless", placement: "anywhere", uses: "member" })) {
-            const declarator = variable.defs[0]?.node as unknown as Node & { type: "VariableDeclarator" };
-            const elements = (declarator.init as Node & { type: "ArrayExpression" }).elements.filter((element): element is Expression => element !== null);
+        const declarator = variable.defs[0]?.node as unknown as Node | undefined;
+        // Its elements are the literal's (no spread), the writes and the pushes below; `sort`/`join` leave them be.
+        if (
+            variable.defs.length === 1 &&
+            variable.defs[0]?.type === "Variable" &&
+            declarator?.type === "VariableDeclarator" &&
+            declarator.init?.type === "ArrayExpression" &&
+            declarator.init.elements.every((element) => element?.type !== "SpreadElement")
+        ) {
+            const elements = declarator.init.elements.filter((element): element is Expression => element !== null);
             let ok = true;
             for (const reference of scopes.staticReferences(variable)) {
                 if (!ok) break;
                 if (reference.init) continue;
-                const member = parentOf(reference.identifier as unknown as Node) as Node & { type: "MemberExpression" };
-                const above = parentOf(member);
-                if (above?.type === "AssignmentExpression" && above.left === member) {
+                const id = reference.identifier as unknown as Node;
+                const parent = parentOf(id);
+                const above = parent === undefined ? undefined : parentOf(parent);
+                // `G.k(V, ...)`: a call alias's receiver; `V.m(...)`: a method's.
+                const called =
+                    parent?.type === "CallExpression" && parent.arguments[0] === id
+                        ? methodCall(parent)
+                        : parent?.type === "MemberExpression" && parent.object === id && above?.type === "CallExpression" && above.callee === parent
+                          ? methodCall(above)
+                          : undefined;
+                if (called !== undefined && called.receiver === id) {
+                    if (called.method === "push" && called.args.every((arg) => arg.type !== "SpreadElement")) elements.push(...(called.args as Expression[]));
+                    else ok = called.method === "sort" || called.method === "join";
+                    continue;
+                }
+                if (parent?.type !== "MemberExpression" || parent.object !== id) ok = false;
+                else if (above?.type === "AssignmentExpression" && above.left === parent) {
                     if (above.operator === "=") elements.push(above.right);
                     else ok = false;
-                } else if (above?.type === "CallExpression" && above.callee === member) ok = propertyKey(member) === "sort" || propertyKey(member) === "join";
+                } else if (above?.type === "CallExpression" && above.callee === parent) ok = false;
                 else if (above?.type === "UpdateExpression" || (above?.type === "UnaryExpression" && above.operator === "delete")) ok = false;
-                else if (above?.type === "TaggedTemplateExpression" && above.tag === member) ok = false;
+                else if (above?.type === "TaggedTemplateExpression" && above.tag === parent) ok = false;
                 else if (above?.type === "ArrayPattern" || above?.type === "RestElement" || above?.type === "ForInStatement" || above?.type === "ForOfStatement") ok = false;
             }
             if (ok) source = { elements };
@@ -272,14 +324,17 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
 
     const call = (node: Node): Abstract | undefined => {
         if (node.type !== "CallExpression") return undefined;
-        const callee = node.callee;
-        const method = callee.type === "MemberExpression" && !callee.computed ? propertyKey(callee) : undefined;
-        if (callee.type === "MemberExpression" && (method === "sort" || method === "join")) {
-            const object = abstract(callee.object);
+        const alias = aliases.callAlias(node);
+        // `G.k()`: the builtin itself.
+        if (alias !== undefined && node.arguments.length === 0) return alias.owner === "String" && alias.original === "fromCharCode" ? { ...EMPTY, fromCharCode: true } : undefined;
+        const called = methodCall(node);
+        if (called !== undefined && (called.method === "sort" || called.method === "join")) {
+            const { method, args } = called;
+            const object = abstract(called.receiver);
             if (object === undefined || !arraysOnly(object)) return undefined;
-            if (method === "sort") return node.arguments.length <= 1 && node.arguments.every((arg) => arg.type === "FunctionExpression" || arg.type === "ArrowFunctionExpression") ? object : undefined;
-            if (node.arguments.length > 1) return undefined;
-            const separator = node.arguments[0];
+            if (method === "sort") return args.length <= 1 && args.every((arg) => arg.type === "FunctionExpression" || arg.type === "ArrowFunctionExpression") ? object : undefined;
+            if (args.length > 1) return undefined;
+            const separator = args[0];
             const sepValue = separator === undefined ? prims(",") : separator.type === "SpreadElement" ? undefined : abstract(separator);
             const sepChars = sepValue === undefined ? undefined : charsOf({ ...sepValue, prims: new Set([...sepValue.prims].map((v) => (v === undefined ? "," : v))) }, false);
             let chars = sepChars;
@@ -292,9 +347,13 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
             }
             return chars === undefined ? undefined : { ...EMPTY, chars };
         }
-        const fn = abstract(callee);
-        // `undefined`/`null` callees throw: no value.
-        if (fn === undefined || !fn.fromCharCode || fn.numbers || fn.chars !== undefined || fn.arrays.size > 0 || [...fn.prims].some((v) => v !== undefined && v !== null)) return undefined;
+        if (alias !== undefined) {
+            if (alias.style !== "static" || alias.owner !== "String" || alias.original !== "fromCharCode") return undefined;
+        } else {
+            const fn = abstract(node.callee);
+            // `undefined`/`null` callees throw: no value.
+            if (fn === undefined || !fn.fromCharCode || fn.numbers || fn.chars !== undefined || fn.arrays.size > 0 || [...fn.prims].some((v) => v !== undefined && v !== null)) return undefined;
+        }
         if (node.arguments.length !== 1 || node.arguments[0]?.type === "SpreadElement") return undefined;
         const arg = abstract(node.arguments[0] as Expression);
         if (arg === undefined || !onlyPrims(arg)) return undefined;
@@ -313,7 +372,10 @@ export const keySets = (scopes: ScopeInfo, parents: ReadonlyMap<Node, Node>): ((
                 return variable === undefined ? undefined : valuesOf(variable);
             }
             case "MemberExpression": {
-                if (isGlobal(node.object, "String") && propertyKey(node) === "fromCharCode") return { ...EMPTY, fromCharCode: true };
+                if (isGlobal(node.object, "String")) {
+                    const key = propertyKey(node);
+                    if (key !== undefined && (aliasOf("String", key) ?? key) === "fromCharCode") return { ...EMPTY, fromCharCode: true };
+                }
                 const object = abstract(node.object);
                 if (object === undefined) return undefined;
                 return elementRead(object, node.computed ? abstract(node.property) : undefined);

@@ -6,12 +6,12 @@ import type { ScopeInfo, Variable } from "../core/scope.js";
 import { OWN_GLOBAL_OBJECT_NAMES } from "../core/scope.js";
 import { replaceNodes, traverse } from "../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
-import type { Builder } from "./emulate/builders.js";
-import { builderOf, definitionOf } from "./emulate/builders.js";
-import { storageAnalysis } from "./emulate/effects.js";
-import type { PropertyPath } from "./emulate/guest.js";
-import { RUNTIME } from "./emulate/model.js";
-import { assignedPaths, storageMatcher } from "./emulate/storage.js";
+import type { Builder } from "./runtime/builders.js";
+import { builderOf, definitionOf } from "./runtime/builders.js";
+import { storageAnalysis } from "./runtime/effects.js";
+import type { PropertyPath } from "./runtime/model.js";
+import { RUNTIME } from "./runtime/model.js";
+import { assignedPaths, storageMatcher } from "./runtime/storage.js";
 import { dynamicUses, HolderReach } from "./storage-usage.js";
 
 /** A literal argument or comparand: a literal, or a minus or `!` on one. */
@@ -54,7 +54,7 @@ export const domainLocks: Pass = {
         // a root statement makes. With no such method, none is, and the walk for tests is skipped.
         const anyReachesHost = assignedPaths(runtime, matcher.isStorage).some((path) => {
             if (path.length !== 1) return false;
-            const definition = definitionOf(runtime, matcher.isStorage, path, true);
+            const definition = definitionOf(runtime, matcher.isStorage, path);
             if (typeof definition === "string") return false;
             const builder = builders.get(definition.iife) ?? builderOf(definition.iife, scopes);
             builders.set(definition.iife, builder);
@@ -107,7 +107,7 @@ export const domainLocks: Pass = {
         for (const [id, calls] of callsOf) {
             const path = (calls[0] as GateCall).path;
             const name = `${runtime.storage}.${path.join(".")}`;
-            const definition = definitionOf(runtime, matcher.isStorage, path.slice(0, 1), true);
+            const definition = definitionOf(runtime, matcher.isStorage, path.slice(0, 1));
             const refusal = ((): { reason: string; node?: Node } | undefined => {
                 if (typeof definition === "string") return { reason: definition };
                 const builder = builders.get(definition.iife) ?? builderOf(definition.iife, scopes);
