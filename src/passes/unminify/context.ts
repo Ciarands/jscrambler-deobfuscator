@@ -34,6 +34,10 @@ export const TRANSFORMS = [
     "unreachable",
     "copies",
     "loops",
+    "moveDeclarations",
+    "constDeclarations",
+    "letDeclarations",
+    "joinDeclarations",
 ] as const;
 
 export type Transform = (typeof TRANSFORMS)[number];

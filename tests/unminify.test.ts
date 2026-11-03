@@ -458,7 +458,7 @@ describe("unminify", () => {
                 "result = [f(1), g(2), k(4), u(5), n(6), out];",
             ].join("\n")
         );
-        expect(output).toContain("function f(x) {\n  var c;\n  c = {");
+        expect(output).toContain("function f(x) {\n  const c = {");
         expect(output).toContain("o = { k: 1, v: t(x), w: t(7) };\n  return o;");
         for (const kept of ["b = a;\n  return [a, b];", "b = a;\n  return [b, arguments[0]];", "later = a;", "out = top;"]) expect(output).toContain(kept);
         // A direct eval may read the copy's source.

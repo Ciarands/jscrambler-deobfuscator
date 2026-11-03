@@ -1,9 +1,11 @@
 import type { Statement } from "../../core/ast.js";
 import { isFunctionNode } from "../../core/ast.js";
+import { ScopeInfo } from "../../core/scope.js";
 import { traverse } from "../../core/traverse.js";
 import type { Path } from "../../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../../pipeline/pass.js";
 import { UnminifyContext } from "./context.js";
+import { placeDeclarations } from "./declarations.js";
 import { rewriteExpression } from "./expressions.js";
 import { expandStatements, mergeElseIf, removeDeclarators, rewriteStatement, unlabelStatements } from "./statements.js";
 
@@ -34,11 +36,12 @@ const statementList = (path: Path): { list: Statement[]; functionBody: boolean }
  * Changing statement values (`a && b();` -> `if (a) { b(); }`, dropping `void 0;`) relies on the semantic model's
  * "the script's completion value is unused": only an eval of the whole script would see it.
  *
- * Runs last: the passes before it expect the minified shapes.
+ * Runs last: the passes before it expect the minified shapes. Declarations move last of all, on a fresh scope analysis
+ * of the otherwise final tree (`placeDeclarations`).
  */
 export const unminify: Pass = {
     name: "unminify",
-    description: "Readability rewrites: blocks, if/else for &&/?:, split declarations, plain keys, natural comparisons",
+    description: "Readability rewrites: blocks, if/else for &&/?:, split declarations, plain keys, natural comparisons, declarations at first assignment",
     run({ program, log, scope }: PassContext): PassResult {
         const context = new UnminifyContext(scope(), log);
         let stoppedEarly = 0;
@@ -68,6 +71,7 @@ export const unminify: Pass = {
             },
         });
         if (context.unusedDeclarators.size > 0) removeDeclarators(program, context.unusedDeclarators);
+        placeDeclarations(program, new ScopeInfo(program), context);
 
         const counts = context.counts;
         const changed = Object.values(counts).reduce((sum, count) => sum + count, 0);
