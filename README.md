@@ -103,6 +103,7 @@ Options:
 
 - Large files take a while. A 2.7 MB script takes around 15 seconds.
 - Anything it can't prove is left as it was, so some code may stay obfuscated.
+- Does not devirt JScrambler VM 
 
 ## Development
 
