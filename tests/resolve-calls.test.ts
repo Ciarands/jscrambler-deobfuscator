@@ -1,0 +1,253 @@
+import { describe, expect, it } from "vitest";
+import { deobfuscate } from "../src/index.js";
+import { observe, type Run } from "./helpers.js";
+
+// A stateful decoder that isn't the standard template: nothing proves its later calls free of effects.
+const PROGRAM = `
+function G() {}
+G.D = (function () {
+  var table = ["c", "b", "a"], stage = 0;
+  return {
+    get: function (i) {
+      if (stage === 0 && i === 7) { table.reverse(); stage = 1; return 1; }
+      stage = 2;
+      return table[i];
+    },
+    num: function () { return 42; }
+  };
+})();
+G.w = function () { return typeof G.D.get === "function" ? G.D.get.apply(G.D, arguments) : G.D.get; };
+G.n = function () { return typeof G.D.num === "function" ? G.D.num.apply(G.D, arguments) : G.D.num; };
+var flag = G.w(7) === 1;
+var out = [];
+function f(k) {
+  var i = 0;
+  out.push(G.w(i), G.w(1), G.w(k), G.n());
+}
+f(host.k);
+out.push(flag);
+result = out;
+`;
+
+const RUN: Run = { globals: () => ({ host: { k: 2 } }), timers: true };
+
+// Standard decoder: stage calls shuffle T until counter R passes every guard; the first non-stage call freezes it
+// (G.D.m becomes the lookup L).
+const decoder = ({ lookup = "return T[y];", setup = "", stages = "R += 1;" } = {}) => `
+function G() {}
+var hits = 0;
+G.D = (function () {
+  var Q = {
+    m: (function (key) {
+      var T = "";
+      T += "a,b,c,d,e,f";
+      T = T.split(",");${setup}
+      var R = 0;
+      var S = function (x) {
+        if (R === 0 && x === 2) { ${stages} T.unshift.apply(T, T.splice(-2, 2).splice(0, 1)); }
+        else if (R === 1 && x === 4) { ${stages} T.unshift.apply(T, T.splice(-3, 3).splice(0, 2)); }
+        else { Q.m = L; return L(x); }
+        return R;
+      };
+      var L = function (y) { ${lookup} };
+      return S;
+    })("k")
+  };
+  return Q;
+})();
+G.w = function () { return typeof G.D.m === "function" ? G.D.m.apply(G.D, arguments) : G.D.m; };
+G.v = function () { return typeof G.D.m === "function" ? G.D.m.apply(G.D, arguments) : G.D.m; };
+`;
+const deobfuscated = async (program: string): Promise<string> => (await deobfuscate(program, { passes: ["runtime", "resolve-calls"] })).code;
+const prelude = "var flag = G.w(2) === 1 && G.v(4) === 2;\nvar first = G.w(1);\n";
+// What a run sees, including whether the decoder still froze (G.D.m is L) and the table's order at runtime.
+const later = "setTimeout(function () { result = [flag, first, second, G.w(host.k), G.v(5), G.D.m.name, hits]; });\n";
+
+describe("resolve-calls", () => {
+    it("resolves later calls of a settled decoder with constant arguments", async () => {
+        const program = `${decoder()}${prelude}var second = G.v(0);\nfunction f(k) { var i = 0; result = [flag, first, second, G.w(i), G.v(3), G.w(k)]; }\nsetTimeout(function () { f(host.k); });\n`;
+        const code = await deobfuscated(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        // `i` is a constant binding; `k` isn't known.
+        expect(code).toMatch(/result = \[flag, first, second, "[a-f]", "[a-f]", G\.w\(k\)\]/);
+    });
+
+    it("resolves a call whose argument runs something before its constant, keeping that first", async () => {
+        // Some builds pass a calculator's selector call ahead of the index: `G.w((G.sel(1), 3))`.
+        const program = `${decoder()}${prelude}var second = 0;\nG.sel = function (n) { hits += n; };\nsetTimeout(function () { result = [G.w((G.sel(5), 3)), hits]; });\n`;
+        const code = await deobfuscated(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).toMatch(/result = \[\(G\.sel\(5\), "[a-f]"\), hits\]/);
+    });
+
+    it("resolves the receiver of a method called on a decoded string", async () => {
+        const program = `${decoder()}${prelude}var second = 0;\nsetTimeout(function () { result = [G.w(3).toUpperCase(), G.w(3).concat(G.v(1)).length]; });\n`;
+        const code = await deobfuscated(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).toMatch(/result = \["[a-f]"\.toUpperCase\(\), "[a-f]"\.concat\("[a-f]"\)\.length\]/);
+        // A method on a value looked up on the result: the lookup is the receiver.
+        const nested = `${decoder()}${prelude}var second = 0;\nsetTimeout(function () { result = [G.w(3).length.toString()]; });\n`;
+        expect(observe(await deobfuscated(nested), RUN)).toBe(observe(nested, RUN));
+    });
+
+    it("resolves direct calls of a settled decoder's target after the prelude", async () => {
+        // What wrappers makes of wrapper calls: `G.D.m(3)`. Direct stage calls in the prelude stay (the simplify-group test at the end).
+        const program = `${decoder()}${prelude}var second = 0;\nsetTimeout(function () { result = [first, G.D.m(3), G.D.m(host.k)]; });\n`;
+        const code = await deobfuscated(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).toMatch(/result = \[first, "[a-f]", G\.D\.m\(host\.k\)\]/);
+    });
+
+    it("resolves direct calls of the target in prelude statements after the one that settled the decoder", async () => {
+        const program = `${decoder()}${prelude}var direct = G.D.m(3);\nsetTimeout(function () { result = [flag, first, direct, G.D.m.name]; });\n`;
+        const code = await deobfuscated(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).toMatch(/var direct = "[a-f]";/);
+    });
+
+    it("keeps direct calls of the target that run before the decoder settled: they may be stage calls", async () => {
+        // `G.D.m(2)` is the first stage; `G.v(4)` the second, which settles it: before it, or in its statement.
+        const tail = "var first = G.w(1);\nvar direct = G.D.m(3);\nsetTimeout(function () { result = [flag, first, direct]; });\n";
+        for (const start of ["G.D.m(2);\nvar flag = G.v(4) === 2;\n", "var flag = G.D.m(2) === 1 && G.v(4) === 2;\n"]) {
+            const program = `${decoder()}${start}${tail}`;
+            const code = await deobfuscated(program);
+            expect(observe(code, RUN)).toBe(observe(program, RUN));
+            expect(code).toContain("G.D.m(2)");
+        }
+    });
+
+    it("keeps calls of targets not proven free of effects, prelude ones too", async () => {
+        const { code } = await deobfuscate(PROGRAM, { passes: ["runtime", "resolve-calls"] });
+        expect(code).toContain("var flag = G.w(7) === 1;");
+        expect(code).toContain("out.push(G.w(i), G.w(1), G.w(k), G.n());");
+        expect(observe(code, RUN)).toBe(observe(PROGRAM, RUN));
+        // A settled decoder the prelude replaced afterwards: its replacement's calls give the same twice, and count.
+        const replaced = `${decoder()}${prelude}G.D.m = function (y) { hits++; return "z"; };\nsetTimeout(function () { result = [G.v(5), G.v(5), hits]; });\n`;
+        const output = await deobfuscated(replaced);
+        expect(observe(output, RUN)).toBe(observe(replaced, RUN));
+        expect(output).toContain("result = [G.v(5), G.v(5), hits];");
+    });
+
+    it("keeps calls of a decoder written after the prelude, also through a local holding part of G", async () => {
+        const program = `${decoder()}${prelude}var d = G.D;\nsetTimeout(function () { d.m = function () { return "swapped"; }; });\nsetTimeout(function () { result = G.v(0); });\n`;
+        const code = await deobfuscated(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).toContain("result = G.v(0);");
+    });
+
+    it("keeps a call of a target whose state a runtime statement reading a host global changes", async () => {
+        // `G.k = ...` sets `G.s`, then reads `host`, which a real run has and the deobfuscator doesn't model.
+        const program = `function G() {}
+G.D = { m: function () { return "v" + G.s + G.k; } };
+G.w = function () { return typeof G.D.m === "function" ? G.D.m.apply(G.D, arguments) : G.D.m; };
+G.k = (function () { G.s = 5; return host.k; })();
+var v = G.w();
+result = [v];
+`;
+        const code = await deobfuscated(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).toContain("var v = G.w();");
+    });
+
+    it("finds the storage object by its evidence, not by which object a root statement assigns first", async () => {
+        const program = `var config = {};\nconfig.ready = true;\n${decoder()}${prelude}var second = G.v(0);\n${later}`;
+        const code = await deobfuscated(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).toContain("var flag = (G.w(2), 1) === 1 && (G.v(4), 2) === 2;");
+    });
+
+    it("finds the runtime in a lone arrow IIFE after directives", async () => {
+        const program = `"use client";\n(() => {\n${decoder()}${prelude}var second = G.v(0);\n${later}})();\n`;
+        const code = await deobfuscated(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).toContain("var flag = (G.w(2), 1) === 1 && (G.v(4), 2) === 2;");
+    });
+
+    it("drops prelude calls made on a settled decoder, keeping its stage calls and the call that froze it", async () => {
+        const program = `${decoder()}${prelude}var second = G.v(0);\n${later}`;
+        const code = await deobfuscated(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).toContain("var flag = (G.w(2), 1) === 1 && (G.v(4), 2) === 2;");
+        expect(code).toMatch(/var first = \(G\.w\(1\), "[a-f]"\);/);
+        expect(code).toMatch(/var second = "[a-f]";/);
+    });
+
+    it("drops them also for `return R++` and a stage function the program got hold of", async () => {
+        // R++ in the return: stage calls give R before the step. The escaped stage function can't run a stage again.
+        const program = `${decoder({ stages: "" }).replace("return R;", "return R++;")}var f = G.D.m;\nvar flag = G.w(2) === 0 && G.v(4) === 1;\nvar first = G.w(1);\nvar second = G.v(0);\nsetTimeout(function () { result = [first, second, f(2), f(4), G.w(host.k), G.v(5), G.D.m.name]; });\n`;
+        const code = await deobfuscated(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).toMatch(/var second = "[a-f]";/);
+    });
+
+    it("keeps prelude calls made before the decoder settled, when it froze early", async () => {
+        // Frozen with a stage left: the escaped stage function still runs it (and shuffles the table).
+        const program = `${decoder()}var f = G.D.m;\nvar flag = G.w(2) === 1;\nvar first = G.w(1);\nvar second = G.v(0);\nvar third = (f(4), G.v(0));\nsetTimeout(function () { result = [first, second, third, G.v(5), hits]; });\n`;
+        const code = await deobfuscated(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).toMatch(/var second = \(G\.v\(0\), "[a-f]"\);/);
+    });
+
+    it("leaves calls alone when the decoder doesn't follow the template", async () => {
+        const shapes = [
+            { lookup: "hits++; return T[y];" },
+            // The table leaks out of the decoder: code holding it can change it.
+            { setup: "\n      G.leak = function () { return T; };" },
+        ];
+        for (const shape of shapes) {
+            const program = `${decoder(shape)}${prelude}var second = G.v(0);\n${later.replace("hits]", "hits, G.leak && G.leak().reverse(), G.v(5)]")}`;
+            const code = await deobfuscated(program);
+            expect(observe(code, RUN)).toBe(observe(program, RUN));
+            expect(code).toContain("var flag = G.w(2) === 1 && G.v(4) === 2;");
+            expect(code).toContain("var second = G.v(0);");
+        }
+    });
+
+    it("settles no decoder whose holder or method the prelude replaces or hands on, keeping the calls it ordered", async () => {
+        const replacements = [
+            'G.D.m = function (y) { hits++; return "z"; };\n',
+            // Another holder for the stage function: the freeze writes the old holder.
+            "var old;\n(function () { old = G.D; G.D = { m: old.m }; })();\n",
+        ];
+        for (const replacement of replacements) {
+            const program = `${decoder()}var flag = G.w(2) === 1 && G.v(4) === 2;\n${replacement}var first = G.w(1);\nvar second = G.v(0);\nsetTimeout(function () { result = [first, second, G.w(host.k), G.D.m.name, typeof old === "object" && old.m.name, hits]; });\n`;
+            const code = await deobfuscated(program);
+            expect(observe(code, RUN)).toBe(observe(program, RUN));
+            expect(code).toContain("var flag = (G.w(2), 1) === 1 && (G.v(4), 2) === 2;");
+            expect(code).toContain("var first = G.w(1);");
+        }
+    });
+
+    it("resolves no call of a decoder the prelude may call where its order can't be told", async () => {
+        // The calls inside `map` callbacks run in a builtin: the walk stops there, before the decoder settles.
+        const program = `${decoder()}var flag = [2].map(function (i) { return G.w(i); })[0] === 1 && G.v(4) === 2;\nvar first = G.w(1);\nvar list = [3, 5].map(function (i) { return G.w(i); });\nsetTimeout(function () { result = [flag, first, list, G.w(3), G.w(2), G.v(4), G.w(host.k)]; });\n`;
+        const code = await deobfuscated(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).toContain("result = [flag, first, list, G.w(3), G.w(2), G.v(4), G.w(host.k)]");
+        expect(code).toContain("var first = G.w(1);");
+    });
+
+    it("resolves calls of a settled decoder whose arguments only become constant in the simplify group", async () => {
+        // `s[1]` has two writes until the dead branch goes; then it is a constant (and wrappers left the call alone).
+        const program = `${decoder()}${prelude}setTimeout(function () { var s = [arguments]; s[1] = 3; if (false) { s[1] = 4; } result = [flag, first, G.w(s[1]), G.w(host.k)]; });\n`;
+        const { code } = await deobfuscate(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        // `flag` and `first` are constants too once the prelude's calls are split off their declarations.
+        expect(code).toMatch(/result = \[true, "c", "[a-f]", G\.w\(host\.k\)\]/);
+    });
+
+    it("resolves calls of a settled decoder whose arguments only become constant in the cleanup group", async () => {
+        // A counting loop on a pure hash over slots: decided once arguments-arrays made the slots locals.
+        const hashing = `G.U = (function () {
+  var h = function (s, n, seed) { var q = seed; for (var i = 0; i < n; i++) { q = Math.imul(q ^ s.charCodeAt(i), 16777619) | 0; } return q; };
+  return { h: h };
+})();
+`;
+        const until = Math.imul(77300 ^ "2".charCodeAt(0), 16777619) | 0;
+        const body = `var s = [arguments]; s[1] = ${until}; s[3] = 2; for (var d = 1; G.U.h(d.toString(), d.toString().length, 77300) !== s[1]; d++) { s[3] += 1; } result = [G.w(s[3]), G.w(host.k)];`;
+        const program = `${decoder()}${hashing}${prelude}setTimeout(function () { ${body} });\n`;
+        const { code } = await deobfuscate(program);
+        expect(observe(code, RUN)).toBe(observe(program, RUN));
+        expect(code).toMatch(/result = \["[a-f]", G\.w\(host\.k\)\]/);
+    });
+});

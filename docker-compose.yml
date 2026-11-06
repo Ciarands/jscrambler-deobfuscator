@@ -1,0 +1,46 @@
+# Put files to deobfuscate in ./input (or set INPUT_DIR). Results go to ./output, which must be writable by uid 1000
+# (the image's `node` user). The input is hostile: no network, a read-only root, no capabilities, resource limits.
+
+x-hardening: &hardening
+  network_mode: none
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,noexec,nosuid,nodev
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  mem_limit: 3g
+  memswap_limit: 3g
+  cpus: 2
+  pids_limit: 128
+  user: "1000:1000"
+
+services:
+  jscrambler-deobfuscator:
+    <<: *hardening
+    build: .
+    container_name: jscrambler-deobfuscator
+    volumes:
+      - ${INPUT_DIR:-./input}:/app/input:ro
+      - ./output:/app/output
+    environment:
+      - NODE_ENV=production
+    command: ["/app/input", "-o", "/app/output"]
+
+  jscrambler-deobfuscator-dev:
+    <<: *hardening
+    build:
+      context: .
+      target: builder
+    container_name: jscrambler-deobfuscator-dev
+    volumes:
+      - ${INPUT_DIR:-./input}:/app/input:ro
+      - ./output:/app/output
+      - ./src:/app/src:ro
+    environment:
+      - NODE_ENV=development
+      - npm_config_cache=/tmp/npm
+    command: ["npx", "tsx", "src/cli.ts", "/app/input", "-o", "/app/output", "-v"]
+    profiles:
+      - dev

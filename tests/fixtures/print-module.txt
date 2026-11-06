@@ -1,0 +1,14 @@
+import a, { b as c, "d e" as f } from "m";
+import * as ns from "m";
+import g, * as ns2 from "m";
+import "side";
+import j from "j" with { type: "json" };
+export { a, c as cc, f as "g h" };
+export * from "m";
+export * as nsx from "m";
+export { b } from "m";
+export default (function () {});
+export var v1 = 1, v2 = 2;
+export function fn() {}
+export class Cl {}
+x = import("m"); x = import.meta.url; x = import("m", { with: { type: "json" } });

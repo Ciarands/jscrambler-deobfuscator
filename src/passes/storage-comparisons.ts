@@ -1,0 +1,75 @@
+import type { Node } from "../core/ast.js";
+import { memberPath } from "../core/ast.js";
+import { valueToNode } from "../core/build.js";
+import { replaceNodes, traverse } from "../core/traverse.js";
+import type { Pass, PassContext, PassResult } from "../pipeline/pass.js";
+import { storageAnalysis } from "./runtime/effects.js";
+import type { PropertyPath } from "./runtime/model.js";
+import { RUNTIME } from "./runtime/model.js";
+import { storageMatcher } from "./runtime/storage.js";
+
+const EQUALITY: Readonly<Record<string, true>> = { "===": true, "!==": true, "==": true, "!=": true };
+
+interface Candidate {
+    readonly node: Node;
+    readonly op: string;
+    readonly left: { readonly site: Node; readonly path: PropertyPath };
+    readonly right: { readonly site: Node; readonly path: PropertyPath };
+}
+
+/**
+ * Storage comparisons: `G.k.m[1][10] != G.k.m[3][10]` becomes the boolean it always is.
+ *
+ * Where nothing may change either path after the prelude (model 3), each reads the value the prelude left, which
+ * `Snapshot` knows (a cyclic array's rows built on the host). Data property reads run no code, and two objects
+ * (identity) or two primitives compare without conversions. An object against a primitive, or a path through a getter,
+ * stays.
+ */
+export const storageComparisons: Pass = {
+    name: "storage-comparisons",
+    description: "Fold equality tests between stable runtime values (matrix opaque predicates)",
+    run({ program, log, facts, scope }: PassContext): PassResult {
+        const runtime = facts.get(RUNTIME);
+        if (runtime === undefined) return { changed: 0 };
+        const scopes = scope();
+        const matcher = storageMatcher(program, runtime, scopes);
+        const storagePath = (node: Node): { site: Node; path: PropertyPath } | undefined => {
+            const path = memberPath(node);
+            return path !== undefined && matcher.isStorage(path.root) ? { site: path.root, path: path.keys } : undefined;
+        };
+        const candidates: Candidate[] = [];
+        traverse(program, {
+            BinaryExpression(path) {
+                const node = path.node;
+                if (EQUALITY[node.operator] !== true) return;
+                const left = storagePath(node.left);
+                const right = left === undefined ? undefined : storagePath(node.right);
+                if (left !== undefined && right !== undefined) candidates.push({ node, op: node.operator, left, right });
+            },
+        });
+        if (candidates.length === 0) return { changed: 0 };
+
+        const { effects } = storageAnalysis(program, runtime, scopes, log);
+        let kept = 0;
+        const stable = candidates.filter(({ node, left, right }) => {
+            const stale = effects.staleAt(left.site, left.path) ?? effects.staleAt(right.site, right.path);
+            if (stale === undefined) return true;
+            kept++;
+            log.debug(`kept: ${stale.reason}`, node);
+            return false;
+        });
+        const replacements = new Map<Node, Node>();
+        for (const candidate of stable) {
+            const answer = effects.snapshot.compare(candidate.left.path, candidate.right.path, candidate.op);
+            if (typeof answer === "string") {
+                kept++;
+                log.debug(`kept: ${answer}`, candidate.node);
+                continue;
+            }
+            replacements.set(candidate.node, valueToNode(answer, candidate.node, scopes));
+        }
+        replaceNodes(program, replacements);
+        log.info(`folded ${replacements.size} comparison(s) of runtime values; kept ${kept}`);
+        return { changed: replacements.size, bindingsChanged: false, stats: { folded: replacements.size, kept } };
+    },
+};

@@ -1,0 +1,266 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import { parseArgs } from "node:util";
+import { ParseError } from "../core/parse.js";
+import { deobfuscate } from "../deobfuscate.js";
+import type { DeobfuscateReport } from "../deobfuscate.js";
+import { createLogger, sanitizeLine, sanitizeText } from "../logger.js";
+import type { Logger, LogLevel } from "../logger.js";
+import { PIPELINE } from "../passes/index.js";
+import { passesOf, selectPasses, UnknownPassError } from "../pipeline/run.js";
+import type { PassSelection } from "../pipeline/run.js";
+import { dumpHooks } from "./dump.js";
+import { blockedTarget, writeOutput } from "./write.js";
+
+export const EXIT_OK = 0;
+export const EXIT_FAILED = 1;
+export const EXIT_USAGE = 2;
+
+export interface CliEnv {
+    readonly cwd: string;
+    readonly stdout: (text: string) => void;
+    readonly stdoutIsTTY: boolean;
+    readonly stderr: (text: string) => void;
+    readonly readStdin: () => Promise<string>;
+    readonly stdinIsTTY: boolean;
+    readonly version: string;
+}
+
+const USAGE = `Usage: jscrambler-deobfuscator [input] [options]
+
+Deobfuscates a file, every .js/.mjs/.cjs file in a directory, or stdin when no input is given.
+Output goes to stdout unless -o is set.
+
+Options:
+  -o, --output <path>    Output file, or output directory when the input is a directory
+  -f, --force            Overwrite existing output, report and dump files (never through a symbolic link)
+      --passes <list>    Only run these passes (comma-separated)
+      --skip <list>      Skip these passes (comma-separated)
+      --list-passes      Print the available passes and exit
+      --report <file>    Write a JSON report to <file>
+      --dump-dir <dir>   Write the code after every pass to <dir>/<input name>/NN-<pass>.js
+  -q, --quiet            Only print errors
+  -v, --verbose          Print what each pass did; repeat (-vv) for every decision, with source locations
+  -h, --help             Print this help and exit
+      --version          Print the version and exit
+
+Exit codes: 0 success, 1 a file failed, 2 usage error.
+`;
+
+const SOURCE_EXTENSIONS: Record<string, true> = { ".js": true, ".mjs": true, ".cjs": true };
+
+interface FileResult {
+    readonly input: string;
+    readonly output: string;
+    readonly ok: boolean;
+    readonly error?: string;
+    readonly report?: DeobfuscateReport;
+}
+
+class UsageError extends Error {}
+
+const splitList = (value: string | undefined): string[] | undefined =>
+    value === undefined
+        ? undefined
+        : value
+              .split(",")
+              .map((name) => name.trim())
+              .filter((name) => name.length > 0);
+
+const errorMessage = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+const isInside = (child: string, parent: string): boolean => {
+    const relative = path.relative(parent, child);
+    return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+};
+
+/** Skips node_modules and `exclude` (the output directory's real path). */
+const collectSources = async (root: string, exclude: string): Promise<string[]> => {
+    const found: string[] = [];
+    const walk = async (dir: string): Promise<void> => {
+        const entries = await fs.readdir(dir, { withFileTypes: true });
+        entries.sort((a, b) => a.name.localeCompare(b.name));
+        for (const entry of entries) {
+            const full = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                if (entry.name !== "node_modules" && !isInside(await fs.realpath(full), exclude)) await walk(full);
+            } else if (entry.isFile() && SOURCE_EXTENSIONS[path.extname(entry.name)] === true) {
+                found.push(full);
+            }
+        }
+    };
+    await walk(root);
+    return found;
+};
+
+const logFailure = (logger: Logger, label: string, error: unknown): void => {
+    logger.error(`error: ${JSON.stringify(label)}: ${errorMessage(error)}`);
+    if (error instanceof ParseError) for (const frame of error.codeframes) for (const line of frame.split("\n")) logger.debug(line);
+};
+
+export const runCli = async (argv: readonly string[], env: CliEnv): Promise<number> => {
+    let values;
+    let positionals;
+    try {
+        ({ values, positionals } = parseArgs({
+            args: [...argv],
+            allowPositionals: true,
+            strict: true,
+            options: {
+                output: { type: "string", short: "o" },
+                force: { type: "boolean", short: "f" },
+                passes: { type: "string" },
+                skip: { type: "string" },
+                "list-passes": { type: "boolean" },
+                report: { type: "string" },
+                "dump-dir": { type: "string" },
+                quiet: { type: "boolean", short: "q" },
+                verbose: { type: "boolean", short: "v", multiple: true },
+                help: { type: "boolean", short: "h" },
+                version: { type: "boolean" },
+            },
+        }));
+    } catch (error) {
+        env.stderr(`${errorMessage(error)}\n\n${USAGE}`);
+        return EXIT_USAGE;
+    }
+
+    if (values.help) {
+        env.stdout(USAGE);
+        return EXIT_OK;
+    }
+    if (values.version) {
+        env.stdout(`${env.version}\n`);
+        return EXIT_OK;
+    }
+    if (values["list-passes"]) {
+        for (const pass of passesOf(PIPELINE)) env.stdout(`${pass.name}\t${pass.description}\n`);
+        return EXIT_OK;
+    }
+
+    const verbosity = values.verbose?.length ?? 0;
+    const level: LogLevel = values.quiet ? "error" : verbosity >= 2 ? "debug" : verbosity === 1 ? "info" : "warn";
+    const logger = createLogger(level, (line) => env.stderr(`${line}\n`));
+    const selection: PassSelection = { passes: splitList(values.passes), skip: splitList(values.skip) };
+
+    try {
+        if (values.quiet && verbosity > 0) throw new UsageError("--quiet and --verbose can't be used together");
+        if (positionals.length > 1) throw new UsageError(`Expected at most one input, got ${positionals.length}`);
+        selectPasses(PIPELINE, selection);
+
+        const outputPath = values.output === undefined ? undefined : path.resolve(env.cwd, values.output);
+        const dumpDir = values["dump-dir"] === undefined ? undefined : path.resolve(env.cwd, values["dump-dir"]);
+        const progress = values.quiet ? () => {} : (line: string) => env.stderr(`${sanitizeLine(line)}\n`);
+        const reportPath = values.report === undefined ? undefined : path.resolve(env.cwd, values.report);
+        const options: RunOptions = { force: values.force === true, outputPath, reportPath, dumpDir, selection, logger, progress, env };
+        const input = positionals[0];
+        const results = input === undefined ? await runStdin(options) : await runPath(path.resolve(env.cwd, input), options);
+
+        if (reportPath !== undefined) writeOutput(reportPath, `${JSON.stringify({ files: results }, null, 2)}\n`, options.force, display(env, reportPath));
+        return results.every((result) => result.ok) ? EXIT_OK : EXIT_FAILED;
+    } catch (error) {
+        if (error instanceof UsageError || error instanceof UnknownPassError) {
+            env.stderr(`${error.message}\n`);
+            return EXIT_USAGE;
+        }
+        logger.error(`error: ${errorMessage(error)}`);
+        return EXIT_FAILED;
+    }
+};
+
+interface RunOptions {
+    readonly force: boolean;
+    readonly outputPath: string | undefined;
+    readonly reportPath: string | undefined;
+    readonly dumpDir: string | undefined;
+    readonly selection: PassSelection;
+    readonly logger: Logger;
+    /** Silent with --quiet. */
+    readonly progress: (line: string) => void;
+    readonly env: CliEnv;
+}
+
+const display = (env: CliEnv, target: string): string => path.relative(env.cwd, target) || ".";
+
+const runOne = async (code: string, label: string, name: string, outputPath: string | undefined, run: RunOptions): Promise<FileResult> => {
+    const output = outputPath === undefined ? "<stdout>" : display(run.env, outputPath);
+    try {
+        const hooks = run.dumpDir === undefined ? {} : dumpHooks(path.join(run.dumpDir, name), run.force);
+        const result = await deobfuscate(code, { ...run.selection, ...hooks, filename: path.basename(name), logger: run.logger });
+        // Output for a terminal goes through the same escaping as log lines: a tagged template's raw text keeps its
+        // control characters in the code, and a terminal would act on them.
+        if (outputPath === undefined) run.env.stdout(run.env.stdoutIsTTY ? sanitizeText(result.code) : result.code);
+        else writeOutput(outputPath, result.code, run.force, output);
+        return { input: label, output, ok: true, report: result.report };
+    } catch (error) {
+        logFailure(run.logger, label, error);
+        return { input: label, output, ok: false, error: errorMessage(error) };
+    }
+};
+
+/**
+ * Checked before the (possibly long) run, and again by each write: the outputs `targets` and the report. Targets that
+ * differ only in case are refused too.
+ */
+const refuseOverwrite = (targets: readonly string[], run: RunOptions): void => {
+    const blocked: string[] = [];
+    const seen = new Map<string, string>();
+    for (const target of run.reportPath === undefined ? targets : [...targets, run.reportPath]) {
+        const reason = blockedTarget(target, run.force);
+        if (reason !== undefined) blocked.push(`${JSON.stringify(display(run.env, target))} ${reason}`);
+        const other = seen.get(target.toLowerCase());
+        if (other !== undefined) {
+            throw new UsageError(`${JSON.stringify(display(run.env, other))} and ${JSON.stringify(display(run.env, target))} differ only in case: one would overwrite the other`);
+        }
+        seen.set(target.toLowerCase(), target);
+    }
+    if (blocked.length === 0) return;
+    throw new Error(`${blocked[0]}${blocked.length > 1 ? ` (and ${blocked.length - 1} more)` : ""}`);
+};
+
+const runStdin = async (run: RunOptions): Promise<FileResult[]> => {
+    if (run.env.stdinIsTTY) throw new UsageError(`No input given and stdin is a terminal\n\n${USAGE}`);
+    refuseOverwrite(run.outputPath === undefined ? [] : [run.outputPath], run);
+    return [await runOne(await run.env.readStdin(), "<stdin>", "stdin", run.outputPath, run)];
+};
+
+const runPath = async (inputPath: string, run: RunOptions): Promise<FileResult[]> => {
+    const stat = await fs.stat(inputPath).catch(() => undefined);
+    if (stat === undefined) throw new UsageError(`No such file or directory: ${display(run.env, inputPath)}`);
+
+    if (stat.isFile()) {
+        if (run.outputPath !== undefined && (await fs.realpath(run.outputPath).catch(() => run.outputPath)) === (await fs.realpath(inputPath))) {
+            throw new UsageError("The output file can't be the input file");
+        }
+        refuseOverwrite(run.outputPath === undefined ? [] : [run.outputPath], run);
+        const label = display(run.env, inputPath);
+        return [await runOne(await fs.readFile(inputPath, "utf8"), label, path.basename(inputPath), run.outputPath, run)];
+    }
+
+    const outputDir = run.outputPath;
+    if (outputDir === undefined) throw new UsageError("A directory input needs -o <directory>");
+    const realOutput = await fs.realpath(outputDir).catch(() => outputDir);
+    if (realOutput === (await fs.realpath(inputPath))) throw new UsageError("The output directory can't be the input directory");
+
+    const sources = await collectSources(inputPath, realOutput);
+    const files = sources.map((source) => ({ source, target: path.join(outputDir, path.relative(inputPath, source)) }));
+    refuseOverwrite(
+        files.map((file) => file.target),
+        run
+    );
+    if (sources.length === 0) {
+        run.logger.warn(`No .js/.mjs/.cjs files in ${display(run.env, inputPath)}`);
+        return [];
+    }
+
+    const results: FileResult[] = [];
+    for (const { source, target } of files) {
+        const label = display(run.env, source);
+        const result = await runOne(await fs.readFile(source, "utf8"), label, path.relative(inputPath, source), target, run);
+        if (result.ok) run.progress(`ok: ${JSON.stringify(label)} -> ${JSON.stringify(result.output)}`);
+        results.push(result);
+    }
+    const failed = results.filter((result) => !result.ok).length;
+    run.progress(`${results.length} file(s): ${results.length - failed} ok, ${failed} failed`);
+    return results;
+};

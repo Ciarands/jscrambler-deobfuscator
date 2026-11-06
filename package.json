@@ -1,16 +1,55 @@
 {
-  "name": "jscrambler-deobfuscator",
-  "version": "1.0.0",
-  "main": "index.js",
-  "type": "module",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "Ciarands",
-  "license": "ISC",
-  "description": "",
-  "dependencies": {
-    "@babel/core": "^7.27.4"
-  }
+    "name": "jscrambler-deobfuscator",
+    "version": "0.1.0",
+    "description": "Deobfuscator for Jscrambler-protected JavaScript. CLI and library.",
+    "author": "Ciarands",
+    "type": "module",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js"
+        }
+    },
+    "bin": {
+        "jscrambler-deobfuscator": "./dist/cli.js"
+    },
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "build": "tsc -p tsconfig.build.json",
+        "dev": "tsx src/cli.ts",
+        "typecheck": "tsc --noEmit",
+        "lint": "oxlint",
+        "test": "vitest run",
+        "check": "npm run typecheck && npm run lint && npm run test",
+        "format": "prettier --write \"src/**/*.ts\" \"tests/**/*.ts\"",
+        "corpus": "tsx scripts/corpus.ts"
+    },
+    "keywords": [
+        "javascript",
+        "deobfuscation",
+        "deobfuscator",
+        "ast",
+        "oxc",
+        "jscrambler",
+        "reverse-engineering"
+    ],
+    "dependencies": {
+        "eslint-scope": "9.1.2",
+        "oxc-parser": "0.156.0"
+    },
+    "devDependencies": {
+        "@types/node": "^22.19.0",
+        "oxlint": "^1.90.0",
+        "prettier": "^3.9.10",
+        "tsx": "^4.23.15",
+        "typescript": "^7.0.2",
+        "vitest": "^5.0.5"
+    },
+    "engines": {
+        "node": ">=22.12.0"
+    }
 }
