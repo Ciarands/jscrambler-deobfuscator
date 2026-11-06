@@ -7,6 +7,8 @@ COPY src ./src
 RUN npm run build
 
 FROM node:24-alpine
+LABEL org.opencontainers.image.source="https://github.com/Ciarands/jscrambler-deobfuscator" \
+      org.opencontainers.image.description="jsd: deobfuscator for Jscrambler-protected JavaScript"
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
