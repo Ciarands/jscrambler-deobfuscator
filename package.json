@@ -13,7 +13,7 @@
         }
     },
     "bin": {
-        "jscrambler-deobfuscator": "./dist/cli.js"
+        "jsd": "./dist/cli.js"
     },
     "files": [
         "dist"

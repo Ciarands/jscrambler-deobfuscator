@@ -26,7 +26,7 @@ export interface CliEnv {
     readonly version: string;
 }
 
-const USAGE = `Usage: jscrambler-deobfuscator [input] [options]
+const USAGE = `Usage: jsd [input] [options]
 
 Deobfuscates a file, every .js/.mjs/.cjs file in a directory, or stdin when no input is given.
 Output goes to stdout unless -o is set.
