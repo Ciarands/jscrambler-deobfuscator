@@ -8,10 +8,6 @@ yarn-error.log*
 dist/
 *.tsbuildinfo
 
-# Runtime inputs and outputs
-input/
-output/
-
 # Development files
 .git/
 .gitignore
