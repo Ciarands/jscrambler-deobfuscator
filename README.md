@@ -43,7 +43,7 @@ npm run build
 npm link
 ```
 
-### Docker:
+### (Alternative) Docker Installation:
 
 ```
 docker pull ghcr.io/ciarands/jsd
