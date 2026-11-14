@@ -36,6 +36,7 @@ export const TRANSFORMS = [
     "stringAppends",
     "returnTemps",
     "entryLists",
+    "zeroSubtractions",
     "loops",
     "moveDeclarations",
     "constDeclarations",

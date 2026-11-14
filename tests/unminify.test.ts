@@ -557,6 +557,17 @@ describe("unminify", () => {
         expect(split).toContain("result = [{ a: 1 }, typeof globalThis.build];");
     });
 
+    it("drops a subtracted zero another number operation follows, not one an addition follows or one that stands alone", async () => {
+        const output = await sameBehaviour(
+            [
+                "function s(x) { return [x - 0 - 1, (x - 0) * 2, (x - 0) % 3, x - 0 + 1, x - 0, x - 2 - 1]; }",
+                "function big() { try { return 5n - 0 - 1; } catch (e) { return e.name; } }",
+                'result = [s(5), s("7"), s({ valueOf() { t("value"); return 3; } }), s(null), s(-0), big()];',
+            ].join("\n")
+        );
+        expect(output).toContain("return [x - 1, x * 2, x % 3, x - 0 + 1, x - 0, x - 2 - 1];");
+    });
+
     it("rebuilds while (true) shells as conditional loops and drops a continue ending a loop body or a return ending a function", async () => {
         const output = await sameBehaviour(
             [

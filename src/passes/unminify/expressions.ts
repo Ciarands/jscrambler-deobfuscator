@@ -583,9 +583,30 @@ const rewriteBinary = (node: Binary, context: UnminifyContext): Expression | und
         context.refused(`keeps the order: \`${node.left.name}\` here may not be the global`, node);
     }
     const truncated = truncateNumbers(node);
-    if (truncated !== undefined) context.did("truncateNumbers", node);
-    return truncated;
+    if (truncated !== undefined) {
+        context.did("truncateNumbers", node);
+        return truncated;
+    }
+    // `x - 0 - 1` -> `x - 1`: the outer operator converts `x` to a number as `- 0` did, and with a number on its other
+    // side a BigInt `x` throws the same TypeError either way.
+    const inner = node.left;
+    if (
+        ARITHMETIC.has(node.operator) &&
+        node.right.type === "Literal" &&
+        typeof node.right.value === "number" &&
+        inner.type === "BinaryExpression" &&
+        inner.operator === "-" &&
+        inner.right.type === "Literal" &&
+        inner.right.value === 0
+    ) {
+        context.did("zeroSubtractions", node);
+        return at<BinaryExpression>({ ...node, left: inner.left }, node);
+    }
+    return undefined;
 };
+
+/** Operators that convert both operands to numbers. */
+const ARITHMETIC: ReadonlySet<string> = new Set(["-", "*", "/", "%"]);
 
 const templateStrings = (path: Path, node: TemplateLiteral, context: UnminifyContext): TemplateLiteral | undefined => {
     if (path.parent?.type === "TaggedTemplateExpression") {
