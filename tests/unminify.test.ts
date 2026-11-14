@@ -520,6 +520,43 @@ describe("unminify", () => {
         expect(module).toContain("r = t(x);\n  return r;");
     });
 
+    it("writes an entry list given to a reduce-into-object helper as the object, not other keys, shapes, helpers or a call that may come first", async () => {
+        const output = await sameBehaviour(
+            [
+                "(function () {",
+                "  const build = list => list.reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {});",
+                '  function a(x) { return build([["a", t(x)], ["b", build([["c", t(2)]])], ["a", t(3)], [1, 4], ["two words", 5]]); }',
+                "  function none() { return build([]); }",
+                "  result = [a(1), Object.keys(a(1)), none()];",
+                "})();",
+            ].join("\n")
+        );
+        expect(output).toContain('return { a: t(x), b: { c: t(2) }, a: t(3), 1: 4, "two words": 5 };');
+        expect(output).not.toContain("reduce");
+        const kept = await sameBehaviour(
+            [
+                "(function () {",
+                '  function early() { try { return late([["a", 1]]); } catch (e) { return e.name; } }',
+                "  const first = early();",
+                "  const late = list => list.reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {});",
+                "  const build = list => list.reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {});",
+                "  const bump = list => list.reduce((acc, [k, v]) => { acc[k] = v + 1; return acc; }, {});",
+                "  let swapped = list => list.reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {});",
+                "  swapped = () => 0;",
+                '  function f(k, list, o) { return [build([[k, 1]]), build(list), build([["a", 1, 2]]), build([["__proto__", o]]).marker, bump([["a", 1]]), swapped([["a", 1]])]; }',
+                '  result = [first, f("key", [["z", 2]], { marker: 3 })];',
+                "})();",
+            ].join("\n")
+        );
+        for (const call of ['late([["a", 1]])', "build([[k, 1]])", "build(list)", 'build([["a", 1, 2]])', 'build([["__proto__", o]])', 'bump([["a", 1]])', 'swapped([["a", 1]])'])
+            expect(kept).toContain(call);
+        // The helper's declaration stays where its write would be left without it (and make a global).
+        const split = await sameBehaviour(
+            '(function () { var build; build = list => list.reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {}); result = [build([["a", 1]]), typeof globalThis.build]; })();'
+        );
+        expect(split).toContain("result = [{ a: 1 }, typeof globalThis.build];");
+    });
+
     it("rebuilds while (true) shells as conditional loops and drops a continue ending a loop body or a return ending a function", async () => {
         const output = await sameBehaviour(
             [
