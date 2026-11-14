@@ -6,6 +6,7 @@ Deobfuscator for JavaScript protected with Jscrambler. Works as a CLI and as a l
 
 - control flow flattening
 - string revealing
+- string concatenation
 - resolving global object proxying
 - inlining steps
   * setup aliases
@@ -33,7 +34,7 @@ Deobfuscator for JavaScript protected with Jscrambler. Works as a CLI and as a l
 
 ## Install
 
-### Build from source:
+### - Build from source:
 
 ```
 git clone https://github.com/Ciarands/jscrambler-deobfuscator
@@ -43,7 +44,7 @@ npm run build
 npm link
 ```
 
-### (Alternative) Docker Installation:
+### - Docker:
 
 ```
 docker pull ghcr.io/ciarands/jsd
