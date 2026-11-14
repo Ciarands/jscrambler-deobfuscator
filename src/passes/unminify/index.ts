@@ -6,6 +6,7 @@ import type { Path } from "../../core/traverse.js";
 import type { Pass, PassContext, PassResult } from "../../pipeline/pass.js";
 import { UnminifyContext } from "./context.js";
 import { placeDeclarations } from "./declarations.js";
+import { objectsFromEntryLists } from "./entries.js";
 import { rewriteExpression } from "./expressions.js";
 import { expandStatements, mergeElseIf, removeDeclarators, rewriteStatement, unlabelStatements } from "./statements.js";
 
@@ -43,7 +44,7 @@ export const unminify: Pass = {
     name: "unminify",
     description: "Readability rewrites: blocks, if/else for &&/?:, split declarations, plain keys, natural comparisons, declarations at first assignment",
     run({ program, log, scope }: PassContext): PassResult {
-        const context = new UnminifyContext(scope(), log);
+        const context = new UnminifyContext(program, scope(), log);
         let stoppedEarly = 0;
 
         const rewrite = (path: Path): void => {
@@ -58,6 +59,7 @@ export const unminify: Pass = {
             log.warn(`stopped after ${MAX_STEPS} rewrites of one node: this ${path.node.type} may still have rewrites left undone`, path.node);
         };
 
+        objectsFromEntryLists(program, context);
         traverse(program, {
             enter(path) {
                 const statements = statementList(path);

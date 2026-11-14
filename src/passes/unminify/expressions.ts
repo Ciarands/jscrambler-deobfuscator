@@ -414,7 +414,8 @@ export interface PlannedStore {
  * `name.j.k = v;` when `j` is the last property of `literal` (with the properties `planned` before it) and holds a
  * plain object literal: `k: v` goes in that one, where `v` still runs after every other value (it ran last). Not
  * `__proto__`, which a literal reads as the prototype; not computed keys other than literals (an assignment converts
- * its key after the value).
+ * its key after the value). An anonymous function or class `v` gets the key as its name, which the store didn't give
+ * it (model 12).
  */
 export const plannedStore = (statement: Statement, holder: Holder, own: OwnBindings, literal: ObjectExpression, planned: readonly PlannedStore[]): PlannedStore | undefined => {
     const { name } = holder;
@@ -582,9 +583,30 @@ const rewriteBinary = (node: Binary, context: UnminifyContext): Expression | und
         context.refused(`keeps the order: \`${node.left.name}\` here may not be the global`, node);
     }
     const truncated = truncateNumbers(node);
-    if (truncated !== undefined) context.did("truncateNumbers", node);
-    return truncated;
+    if (truncated !== undefined) {
+        context.did("truncateNumbers", node);
+        return truncated;
+    }
+    // `x - 0 - 1` -> `x - 1`: the outer operator converts `x` to a number as `- 0` did, and with a number on its other
+    // side a BigInt `x` throws the same TypeError either way.
+    const inner = node.left;
+    if (
+        ARITHMETIC.has(node.operator) &&
+        node.right.type === "Literal" &&
+        typeof node.right.value === "number" &&
+        inner.type === "BinaryExpression" &&
+        inner.operator === "-" &&
+        inner.right.type === "Literal" &&
+        inner.right.value === 0
+    ) {
+        context.did("zeroSubtractions", node);
+        return at<BinaryExpression>({ ...node, left: inner.left }, node);
+    }
+    return undefined;
 };
+
+/** Operators that convert both operands to numbers. */
+const ARITHMETIC: ReadonlySet<string> = new Set(["-", "*", "/", "%"]);
 
 const templateStrings = (path: Path, node: TemplateLiteral, context: UnminifyContext): TemplateLiteral | undefined => {
     if (path.parent?.type === "TaggedTemplateExpression") {

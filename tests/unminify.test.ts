@@ -299,7 +299,7 @@ describe("unminify", () => {
         expect(output).toContain("p.a = peek();");
         expect(output).toContain("q.a = look();");
         expect(output).toContain("o2.self = typeof o2;");
-        expect(output).toContain("var o = { n: t(1), inner: { deep: t(x) }, extra: { v: t(2) }, after: t(4) };");
+        expect(output).toContain("return { n: t(1), inner: { deep: t(x) }, extra: { v: t(2) }, after: t(4) };");
         for (const kept of ["o.inner.deep = t(x);", "p.inner.deep = t(x);", "o.s = 3;"]) expect(output).toContain(kept);
     });
 
@@ -458,12 +458,15 @@ describe("unminify", () => {
                 "result = [f(1), g(2), k(4), u(5), n(6), out];",
             ].join("\n")
         );
-        expect(output).toContain("function f(x) {\n  const c = {");
-        expect(output).toContain("o = { k: 1, v: t(x), w: t(7) };\n  return o;");
+        expect(output).toContain("function f(x) {\n  return {");
+        expect(output).toContain("return { k: 1, v: t(x), w: t(7) };");
         for (const kept of ["b = a;\n  return [a, b];", "b = a;\n  return [b, arguments[0]];", "later = a;", "out = top;"]) expect(output).toContain(kept);
         // A direct eval may read the copy's source.
         const evaluated = await sameBehaviour('function e(x) { var a; var b; a = t(x); b = a; return [b, eval("a")]; }\nresult = e(6);');
         expect(evaluated).toContain("b = a;");
+        // Other modules read an exported binding: its write stays.
+        const module = await unminify("export var a; var b;\nexport function f(x) { a = x; b = a; return [b]; }");
+        expect(module).toContain("a = x;\n  b = a;");
     });
 
     it("joins a string built by consecutive literal appends, not one with other code between, a script-level var or a name a with may answer", async () => {
@@ -480,7 +483,7 @@ describe("unminify", () => {
                 "result = [a(), b(), c(1), d(), n(), p(0), w()];",
             ].join("\n")
         );
-        expect(output).toContain('const s = "abcdef";');
+        expect(output).toContain('return "abcdef";');
         expect(output).toContain('s = "ab";\n  return [s, arguments[0]];');
         for (const kept of ["s += x;", 'const s = "a";\n    s += "b";', 'var s = 1;\n  s += "b";', 's = "a";\n    s += "b";']) expect(output).toContain(kept);
         expect(count(output, (node) => node.type === "AssignmentExpression" && node.operator === "+=")).toBe(5);
@@ -488,6 +491,81 @@ describe("unminify", () => {
         const script = 'var top = "a";\ntop += "b";\nresult = top;';
         const page: Run = { ...RUN, prelude: 'Object.defineProperty(globalThis, "top", { get() { return "q"; }, set(v) { t(v); }, configurable: true });' };
         expect(observe(await unminify(script), page)).toBe(observe(script, page));
+    });
+
+    it("returns a value straight where a local only holds it for the return, not one a closure, a later write or a with may see", async () => {
+        const output = await sameBehaviour(
+            [
+                "function a(x) { var r = t(x) + 1; return r; }",
+                "function b(x) { var r; r = t(x); return r; }",
+                "function c(x) { const r = { v: t(x) }; return r; }",
+                "function d(x) { keep = function () { return r; }; var r = t(x); return r; }",
+                "function g() { var r = t(1); r = t(2); return r; }",
+                "function h(x) { var r = t(x); return r; function late() {} }",
+                'function e(x) { eval("x = 5"); var r = x; return r; }',
+                // The declaration's value goes to the object's property, which the return then reads.
+                "function w(o) { with (o) { var r = 1; return r; } }",
+                "var o = { r: 9 };",
+                // A script-level var is a global property, which stays written.
+                "var top;",
+                "function gl() { top = t(8); return top; }",
+                "result = [a(1), b(2), c(3), d(4), keep(), g(), h(6), e(7), w(o), o.r, gl(), globalThis.top];",
+            ].join("\n")
+        );
+        for (const inlined of ["return t(x) + 1;", "function b(x) {\n  return t(x);\n}", "return { v: t(x) };", "function h(x) {\n  return t(x);"]) expect(output).toContain(inlined);
+        for (const kept of ["var r = t(x);\n  return r;", "r = t(2);\n  return r;", "var r = x;\n  return r;", "var r = 1;\n    return r;", "top = t(8);\n  return top;"])
+            expect(output).toContain(kept);
+        // Other modules read an exported binding: its write stays.
+        const module = await unminify("export var r;\nexport function g(x) { r = t(x); return r; }");
+        expect(module).toContain("r = t(x);\n  return r;");
+    });
+
+    it("writes an entry list given to a reduce-into-object helper as the object, not other keys, shapes, helpers or a call that may come first", async () => {
+        const output = await sameBehaviour(
+            [
+                "(function () {",
+                "  const build = list => list.reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {});",
+                '  function a(x) { return build([["a", t(x)], ["b", build([["c", t(2)]])], ["a", t(3)], [1, 4], ["two words", 5]]); }',
+                "  function none() { return build([]); }",
+                "  result = [a(1), Object.keys(a(1)), none()];",
+                "})();",
+            ].join("\n")
+        );
+        expect(output).toContain('return { a: t(x), b: { c: t(2) }, a: t(3), 1: 4, "two words": 5 };');
+        expect(output).not.toContain("reduce");
+        const kept = await sameBehaviour(
+            [
+                "(function () {",
+                '  function early() { try { return late([["a", 1]]); } catch (e) { return e.name; } }',
+                "  const first = early();",
+                "  const late = list => list.reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {});",
+                "  const build = list => list.reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {});",
+                "  const bump = list => list.reduce((acc, [k, v]) => { acc[k] = v + 1; return acc; }, {});",
+                "  let swapped = list => list.reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {});",
+                "  swapped = () => 0;",
+                '  function f(k, list, o) { return [build([[k, 1]]), build(list), build([["a", 1, 2]]), build([["__proto__", o]]).marker, bump([["a", 1]]), swapped([["a", 1]])]; }',
+                '  result = [first, f("key", [["z", 2]], { marker: 3 })];',
+                "})();",
+            ].join("\n")
+        );
+        for (const call of ['late([["a", 1]])', "build([[k, 1]])", "build(list)", 'build([["a", 1, 2]])', 'build([["__proto__", o]])', 'bump([["a", 1]])', 'swapped([["a", 1]])'])
+            expect(kept).toContain(call);
+        // The helper's declaration stays where its write would be left without it (and make a global).
+        const split = await sameBehaviour(
+            '(function () { var build; build = list => list.reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {}); result = [build([["a", 1]]), typeof globalThis.build]; })();'
+        );
+        expect(split).toContain("result = [{ a: 1 }, typeof globalThis.build];");
+    });
+
+    it("drops a subtracted zero another number operation follows, not one an addition follows or one that stands alone", async () => {
+        const output = await sameBehaviour(
+            [
+                "function s(x) { return [x - 0 - 1, (x - 0) * 2, (x - 0) % 3, x - 0 + 1, x - 0, x - 2 - 1]; }",
+                "function big() { try { return 5n - 0 - 1; } catch (e) { return e.name; } }",
+                'result = [s(5), s("7"), s({ valueOf() { t("value"); return 3; } }), s(null), s(-0), big()];',
+            ].join("\n")
+        );
+        expect(output).toContain("return [x - 1, x * 2, x % 3, x - 0 + 1, x - 0, x - 2 - 1];");
     });
 
     it("rebuilds while (true) shells as conditional loops and drops a continue ending a loop body or a return ending a function", async () => {
