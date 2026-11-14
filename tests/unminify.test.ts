@@ -466,6 +466,30 @@ describe("unminify", () => {
         expect(evaluated).toContain("b = a;");
     });
 
+    it("joins a string built by consecutive literal appends, not one with other code between, a script-level var or a name a with may answer", async () => {
+        const output = await sameBehaviour(
+            [
+                'function a() { var s; s = "ab"; s += "cd"; s += "ef"; return s; }',
+                'function b() { var s = "x\\ud83d"; s += "\\ude00y"; return [s, s.length]; }',
+                'function c(x) { var s = "a"; s += x; s += "b"; return s; }',
+                'function d() { try { const s = "a"; s += "b"; return s; } catch (e) { return e.name; } }',
+                'function n() { var s = 1; s += "b"; return s; }',
+                'function p(s) { s = "a"; s += "b"; return [s, arguments[0]]; }',
+                // The object's setter sees every write.
+                'function w() { var o = { get s() { return "q"; }, set s(v) { t(v); } }; with (o) { s = "a"; s += "b"; } return 1; }',
+                "result = [a(), b(), c(1), d(), n(), p(0), w()];",
+            ].join("\n")
+        );
+        expect(output).toContain('const s = "abcdef";');
+        expect(output).toContain('s = "ab";\n  return [s, arguments[0]];');
+        for (const kept of ["s += x;", 'const s = "a";\n    s += "b";', 'var s = 1;\n  s += "b";', 's = "a";\n    s += "b";']) expect(output).toContain(kept);
+        expect(count(output, (node) => node.type === "AssignmentExpression" && node.operator === "+=")).toBe(5);
+        // A script-level var is a global property: an accessor an earlier script put there sees every write.
+        const script = 'var top = "a";\ntop += "b";\nresult = top;';
+        const page: Run = { ...RUN, prelude: 'Object.defineProperty(globalThis, "top", { get() { return "q"; }, set(v) { t(v); }, configurable: true });' };
+        expect(observe(await unminify(script), page)).toBe(observe(script, page));
+    });
+
     it("rebuilds while (true) shells as conditional loops and drops a continue ending a loop body or a return ending a function", async () => {
         const output = await sameBehaviour(
             [
