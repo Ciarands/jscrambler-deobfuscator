@@ -34,7 +34,7 @@ Deobfuscator for JavaScript protected with Jscrambler. Works as a CLI and as a l
 
 ## Install
 
-### - Build from source:
+### Build from source:
 
 ```
 git clone https://github.com/Ciarands/jscrambler-deobfuscator
@@ -44,7 +44,7 @@ npm run build
 npm link
 ```
 
-### - Docker:
+### (Alternative) Docker Installation:
 
 ```
 docker pull ghcr.io/ciarands/jsd
