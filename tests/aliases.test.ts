@@ -80,12 +80,15 @@ setTimeout(function () { ${later} });
 /** Model 10: the page has the host objects the script uses. */
 const PAGE: Run = { globals: () => ({ hostDoc: { title: "page" } }), timers: true };
 
-/** `q7Un`, an accessor of the global `target`, read after the global `holder` got a value. */
-const withAliasOf = (target: string) =>
-    withHost("holder = 5; result = [q7Un, typeof q7Un];").replace(
-        "S(G[3]);",
-        `S(G[3]);\nvar holder = false;\n(function (g) { Object.defineProperty(g, "q7Un", { get: function () { return g.${target} || undefined; }, set: function (v) { g.${target} = v; }, configurable: true }); })(G[3]);`
-    );
+/**
+ * `q7Un`, a global a setup call defines with `descriptor` (`g` is the global object, `state` a local of the call), used
+ * by `later`. `holder` is declared first: a statement between the prelude's own would end the setup.
+ */
+const withGlobal = (descriptor: string, later: string) =>
+    `var holder = false;\n${withHost(later).replace("S(G[3]);", `S(G[3]);\n(function (g) { var state; Object.defineProperty(g, "q7Un", ${descriptor}); })(G[3]);`)}`;
+
+/** An accessor of the global `target`, as the setup makes them. */
+const accessorOf = (target: string) => `{ get: function () { return g.${target} || undefined; }, set: function (v) { g.${target} = v; }, configurable: true }`;
 
 describe("aliases: host objects", () => {
     it("reads, writes and calls the host object by its own name, and the setup goes", async () => {
@@ -144,13 +147,44 @@ describe("aliases: host objects", () => {
         }
     });
 
-    it("leaves accessors that look up no missing global: they may read state that changes later", async () => {
-        for (const target of ["undefined", "holder"]) {
-            const program = withAliasOf(target);
+    it("reads an accessor of the global undefined as undefined, and the setup goes", async () => {
+        const program = withGlobal(accessorOf("undefined"), "result = [q7Un, typeof q7Un, q7Un === void 0, { q7Un }];");
+        const { code } = await deobfuscate(program);
+        expect(code).not.toContain("defineProperty");
+        expect(code).toContain('result = [undefined, "undefined", true, { q7Un: undefined }];');
+        expect(observe(code, { timers: true })).toBe(observe(program, { timers: true }));
+    });
+
+    it("keeps a write to an accessor of undefined, with its setup, and a read where undefined is another binding", async () => {
+        const program = withGlobal(accessorOf("undefined"), "q7Un = 5; result = [q7Un, (function (undefined) { return q7Un; })(3)];");
+        const { code } = await deobfuscate(program);
+        for (const kept of ["q7Un = 5;", 'Object.defineProperty(g, "q7Un"', "return q7Un;"]) expect(code).toContain(kept);
+        expect(code).toMatch(/result = \[\s+undefined,/);
+        expect(observe(code, { timers: true })).toBe(observe(program, { timers: true }));
+    });
+
+    it("leaves a global that may read as something else later: a changing global, a local its setter writes, a data property", async () => {
+        const descriptors = [
+            accessorOf("holder"),
+            "{ get: function () { return state; }, set: function (v) { state = v; }, configurable: true }",
+            "{ value: undefined, writable: true, configurable: true }",
+        ];
+        for (const descriptor of descriptors) {
+            const program = withGlobal(descriptor, "holder = 5; q7Un = 7; result = [q7Un, typeof q7Un];");
             const { code } = await deobfuscate(program);
-            expect(code).toContain("q7Un");
+            expect(code).toContain("result = [q7Un, typeof q7Un];");
             expect(observe(code, { timers: true })).toBe(observe(program, { timers: true }));
         }
+    });
+
+    it("leaves an accessor a builtin other than the global object gets, though it reads as undefined", async () => {
+        const program = withHost('result = ["a".q7Un];').replace(
+            "S(G[3]);",
+            'S(G[3]);\n(function () { Object.defineProperty(String.prototype, "q7Un", { get: function () { return undefined; }, configurable: true }); })();'
+        );
+        const { code } = await deobfuscate(program);
+        expect(code).toContain('"a".q7Un');
+        expect(observe(code, { timers: true })).toBe(observe(program, { timers: true }));
     });
 
     it("leaves an alias the program deletes or names as a string", async () => {

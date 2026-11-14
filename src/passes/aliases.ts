@@ -78,8 +78,9 @@ const rewriteCall = (call: CallExpression, alias: CallAlias, scopes: ScopeInfo, 
 
 /**
  * Aliases: undo the builtin aliases the prelude's setup function created (recorded by `runtime`): global aliases
- * (`S` -> `String`), builtin-owned property aliases naming exactly one builtin property, call aliases on the storage
- * object (`G.a(s, "%")` -> `s.split("%")`), and host aliases (`D` -> `document`; model 10: the host globals exist).
+ * (`S` -> `String`, or `U` -> `undefined` for an accessor that reads as it every time), builtin-owned property aliases
+ * naming exactly one builtin property, call aliases on the storage object (`G.a(s, "%")` -> `s.split("%")`), and host
+ * aliases (`D` -> `document`; model 10: the host globals exist).
  *
  * Other writes are never rewritten, and a global name is only introduced where no local of that name is in scope.
  */

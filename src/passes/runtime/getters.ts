@@ -1874,7 +1874,14 @@ export class SetupAnalysis {
                 } else this.#hostAlias(key, descriptors, read, facts.hostAliases, statement);
                 continue;
             }
-            const original = read === undefined ? undefined : this.#cx.realm.nameOf(path, read.k === "builtin" ? { path: read.path } : { primitive: read.v });
+            // A global accessor that reads as `undefined` every time stands for the global of that name, which nothing
+            // can write or redefine. Not a data property: a write would change it.
+            const original =
+                read !== undefined
+                    ? this.#cx.realm.nameOf(path, read.k === "builtin" ? { path: read.path } : { primitive: read.v })
+                    : path.length === 0 && descriptors.every((descriptor) => descriptor.kind === "accessor")
+                      ? "undefined"
+                      : undefined;
             if (original !== undefined) {
                 facts.aliases.push({ owner: path, alias: key, original });
                 log.debug(`alias ${pathName(path)}.${key} = ${pathName(path)}.${original}`, statement);
