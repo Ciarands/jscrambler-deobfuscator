@@ -299,7 +299,7 @@ describe("unminify", () => {
         expect(output).toContain("p.a = peek();");
         expect(output).toContain("q.a = look();");
         expect(output).toContain("o2.self = typeof o2;");
-        expect(output).toContain("var o = { n: t(1), inner: { deep: t(x) }, extra: { v: t(2) }, after: t(4) };");
+        expect(output).toContain("return { n: t(1), inner: { deep: t(x) }, extra: { v: t(2) }, after: t(4) };");
         for (const kept of ["o.inner.deep = t(x);", "p.inner.deep = t(x);", "o.s = 3;"]) expect(output).toContain(kept);
     });
 
@@ -458,8 +458,8 @@ describe("unminify", () => {
                 "result = [f(1), g(2), k(4), u(5), n(6), out];",
             ].join("\n")
         );
-        expect(output).toContain("function f(x) {\n  const c = {");
-        expect(output).toContain("o = { k: 1, v: t(x), w: t(7) };\n  return o;");
+        expect(output).toContain("function f(x) {\n  return {");
+        expect(output).toContain("return { k: 1, v: t(x), w: t(7) };");
         for (const kept of ["b = a;\n  return [a, b];", "b = a;\n  return [b, arguments[0]];", "later = a;", "out = top;"]) expect(output).toContain(kept);
         // A direct eval may read the copy's source.
         const evaluated = await sameBehaviour('function e(x) { var a; var b; a = t(x); b = a; return [b, eval("a")]; }\nresult = e(6);');
@@ -483,7 +483,7 @@ describe("unminify", () => {
                 "result = [a(), b(), c(1), d(), n(), p(0), w()];",
             ].join("\n")
         );
-        expect(output).toContain('const s = "abcdef";');
+        expect(output).toContain('return "abcdef";');
         expect(output).toContain('s = "ab";\n  return [s, arguments[0]];');
         for (const kept of ["s += x;", 'const s = "a";\n    s += "b";', 'var s = 1;\n  s += "b";', 's = "a";\n    s += "b";']) expect(output).toContain(kept);
         expect(count(output, (node) => node.type === "AssignmentExpression" && node.operator === "+=")).toBe(5);
@@ -491,6 +491,33 @@ describe("unminify", () => {
         const script = 'var top = "a";\ntop += "b";\nresult = top;';
         const page: Run = { ...RUN, prelude: 'Object.defineProperty(globalThis, "top", { get() { return "q"; }, set(v) { t(v); }, configurable: true });' };
         expect(observe(await unminify(script), page)).toBe(observe(script, page));
+    });
+
+    it("returns a value straight where a local only holds it for the return, not one a closure, a later write or a with may see", async () => {
+        const output = await sameBehaviour(
+            [
+                "function a(x) { var r = t(x) + 1; return r; }",
+                "function b(x) { var r; r = t(x); return r; }",
+                "function c(x) { const r = { v: t(x) }; return r; }",
+                "function d(x) { keep = function () { return r; }; var r = t(x); return r; }",
+                "function g() { var r = t(1); r = t(2); return r; }",
+                "function h(x) { var r = t(x); return r; function late() {} }",
+                'function e(x) { eval("x = 5"); var r = x; return r; }',
+                // The declaration's value goes to the object's property, which the return then reads.
+                "function w(o) { with (o) { var r = 1; return r; } }",
+                "var o = { r: 9 };",
+                // A script-level var is a global property, which stays written.
+                "var top;",
+                "function gl() { top = t(8); return top; }",
+                "result = [a(1), b(2), c(3), d(4), keep(), g(), h(6), e(7), w(o), o.r, gl(), globalThis.top];",
+            ].join("\n")
+        );
+        for (const inlined of ["return t(x) + 1;", "function b(x) {\n  return t(x);\n}", "return { v: t(x) };", "function h(x) {\n  return t(x);"]) expect(output).toContain(inlined);
+        for (const kept of ["var r = t(x);\n  return r;", "r = t(2);\n  return r;", "var r = x;\n  return r;", "var r = 1;\n    return r;", "top = t(8);\n  return top;"])
+            expect(output).toContain(kept);
+        // Other modules read an exported binding: its write stays.
+        const module = await unminify("export var r;\nexport function g(x) { r = t(x); return r; }");
+        expect(module).toContain("r = t(x);\n  return r;");
     });
 
     it("rebuilds while (true) shells as conditional loops and drops a continue ending a loop body or a return ending a function", async () => {

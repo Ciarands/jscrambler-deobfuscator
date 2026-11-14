@@ -34,6 +34,7 @@ export const TRANSFORMS = [
     "unreachable",
     "copies",
     "stringAppends",
+    "returnTemps",
     "loops",
     "moveDeclarations",
     "constDeclarations",

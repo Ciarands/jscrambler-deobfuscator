@@ -290,7 +290,8 @@ const replaceEach = (list: Statement[], rewrite: (index: number) => Statement[] 
 
 /**
  * Repeats on what an expansion made, then drops unreachable statements and merges object assignments and copies; a
- * copy can put a literal under the name the stores use (`t = {...}; o = t; o.a = x;`), so the merge runs again.
+ * copy can put a literal under the name the stores use (`t = {...}; o = t; o.a = x;`), so the merge runs again. A
+ * copy can also leave a temporary that is only returned.
  */
 export const expandStatements = (list: Statement[], context: UnminifyContext, functionBody = false): void => {
     replaceEach(list, (i) => expandStatement(list[i] as Statement, context) ?? unlabel(list, i, context, functionBody));
@@ -298,6 +299,7 @@ export const expandStatements = (list: Statement[], context: UnminifyContext, fu
     joinStringAppends(list, context);
     mergeObjectAssignments(list, context);
     if (mergeCopies(list, context)) mergeObjectAssignments(list, context);
+    inlineReturnTemp(list, context);
 };
 
 /**
@@ -487,6 +489,40 @@ const joinStringAppends = (list: Statement[], context: UnminifyContext): void =>
         store.set(valueToNode(value, store.id));
         for (const statement of list.splice(i + 1, end - i - 1)) context.removedReferences.add(((statement as ExpressionStatement).expression as AssignmentExpression).left);
     }
+};
+
+/**
+ * `var t = e; return t;` (also `let`, `const`, or `t = e;` for a function's `var`) -> `return e;` when these are `t`'s
+ * only references: nothing reads it in between or later, no closure holds it, and it is declared once. `e` runs at
+ * the same point either way. Names under a `with` or a direct `eval` don't resolve in the scope analysis, so they
+ * are left alone. An anonymous function or class `e` loses the name `t` gave it (model 12). A `var t;` left behind
+ * goes after the walk (`unusedDeclarators`).
+ */
+const inlineReturnTemp = (list: Statement[], context: UnminifyContext): void => {
+    const { scopes } = context;
+    // The return isn't always last: hoisted declarations may follow it.
+    const index = list.findIndex((statement) => statement.type === "ReturnStatement") - 1;
+    const store = list[index];
+    const returned = list[index + 1];
+    if (store === undefined || returned?.type !== "ReturnStatement" || returned.argument?.type !== "Identifier") return;
+    const assignment = assignmentOf(store);
+    const declarator = store.type === "VariableDeclaration" && store.declarations.length === 1 && store.kind !== "using" && store.kind !== "await using" ? store.declarations[0] : undefined;
+    const id = assignment?.left ?? (declarator?.id.type === "Identifier" ? declarator.id : undefined);
+    const value = assignment?.right ?? declarator?.init;
+    const variable = id === undefined ? undefined : scopes.variableOf(id);
+    if (id === undefined || value === null || value === undefined || variable === undefined || scopes.variableOf(returned.argument) !== variable) return;
+    const [def] = variable.defs;
+    if (variable.defs.length !== 1 || def?.type !== "Variable" || variable.scope.type === "global" || context.isExported(variable) || variable.name === "arguments") return;
+    // An assignment's target is a hoisted `var` declared without a value (an initializer would be a third reference).
+    if (assignment !== undefined ? (def.parent as { kind?: string } | null)?.kind !== "var" : (def.node as unknown as Node) !== declarator) return;
+    const references = scopes.references(variable)?.filter((reference) => !context.removedReferences.has(reference.identifier as unknown as Node));
+    if (references?.length !== 2 || !references.every((reference) => (reference.identifier as unknown as Node) === id || (reference.identifier as unknown as Node) === returned.argument)) return;
+    context.did("returnTemps", store);
+    context.removedReferences.add(id);
+    context.removedReferences.add(returned.argument);
+    returned.argument = value;
+    list.splice(index, 1);
+    if (assignment !== undefined) context.unusedDeclarators.add(def.node as unknown as Node);
 };
 
 export const removeDeclarators = (program: Node, unused: ReadonlySet<Node>): void => {

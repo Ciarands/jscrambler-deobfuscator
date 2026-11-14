@@ -96,7 +96,7 @@ describe("hoisted declarations", () => {
             function f(k) {
                 var x, y;
                 switch (k) {
-                    case 1: x = t(1); return x;
+                    case 1: x = t(1); return [x];
                     case 2: y = t(2); break;
                     default: y = t(3);
                 }
@@ -108,7 +108,7 @@ describe("hoisted declarations", () => {
     });
 
     it("keeps a moved declaration a var when its name can't be declared lexically", async () => {
-        const found = await declarations("function f() { var let; t(0); let = t(1); return let; } result = f();");
+        const found = await declarations("function f() { var let; t(0); let = t(1); return [let]; } result = f();");
         expect(found).toEqual(["var let ="]);
     });
 
@@ -118,12 +118,12 @@ describe("hoisted declarations", () => {
     });
 
     it("leaves a name a catch parameter shadows to its own uses", async () => {
-        const found = await declarations("function f() { var x; try { throw t(1); } catch (x) { x = t(2); t(x); } x = t(3); return x; } result = f();");
+        const found = await declarations("function f() { var x; try { throw t(1); } catch (x) { x = t(2); t(x); } x = t(3); return [x]; } result = f();");
         expect(found).toEqual(["const x ="]);
     });
 
     it("leaves a name an enclosing block declares lexically to its own uses", async () => {
-        const found = await declarations("function f() { var x; { let x; x = t(1); t(x); } x = t(2); return x; } result = f();");
+        const found = await declarations("function f() { var x; { let x; x = t(1); t(x); } x = t(2); return [x]; } result = f();");
         expect(found).toEqual(["let x", "const x ="]);
     });
 
