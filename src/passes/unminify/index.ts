@@ -43,7 +43,7 @@ export const unminify: Pass = {
     name: "unminify",
     description: "Readability rewrites: blocks, if/else for &&/?:, split declarations, plain keys, natural comparisons, declarations at first assignment",
     run({ program, log, scope }: PassContext): PassResult {
-        const context = new UnminifyContext(scope(), log);
+        const context = new UnminifyContext(program, scope(), log);
         let stoppedEarly = 0;
 
         const rewrite = (path: Path): void => {

@@ -464,6 +464,9 @@ describe("unminify", () => {
         // A direct eval may read the copy's source.
         const evaluated = await sameBehaviour('function e(x) { var a; var b; a = t(x); b = a; return [b, eval("a")]; }\nresult = e(6);');
         expect(evaluated).toContain("b = a;");
+        // Other modules read an exported binding: its write stays.
+        const module = await unminify("export var a; var b;\nexport function f(x) { a = x; b = a; return [b]; }");
+        expect(module).toContain("a = x;\n  b = a;");
     });
 
     it("joins a string built by consecutive literal appends, not one with other code between, a script-level var or a name a with may answer", async () => {

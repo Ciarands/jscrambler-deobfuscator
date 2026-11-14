@@ -1,6 +1,6 @@
 import type { Node } from "../../core/ast.js";
 import type { PassLog } from "../../core/log.js";
-import type { ScopeInfo } from "../../core/scope.js";
+import type { ScopeInfo, Variable } from "../../core/scope.js";
 
 export const TRANSFORMS = [
     "blockStatements",
@@ -56,13 +56,22 @@ export class UnminifyContext {
 
     readonly #hasWith: boolean;
     readonly #hasEval: boolean;
+    /** The declarations a module exports directly (`export var a;`), as the scope analysis saw them. */
+    readonly #exported: ReadonlySet<Node>;
 
-    constructor(scopes: ScopeInfo, log: PassLog) {
+    constructor(program: Node, scopes: ScopeInfo, log: PassLog) {
         this.scopes = scopes;
         this.log = log;
         this.counts = Object.fromEntries(TRANSFORMS.map((name) => [name, 0])) as Record<Transform, number>;
         this.#hasWith = scopes.manager.scopes.some((scope) => scope.type === "with");
         this.#hasEval = scopes.manager.scopes.some((scope) => scope.type !== "global" && scope.dynamic);
+        const body = program.type === "Program" ? program.body : [];
+        this.#exported = new Set(body.flatMap((statement): Node[] => (statement.type === "ExportNamedDeclaration" && statement.declaration !== null ? [statement.declaration] : [])));
+    }
+
+    /** Whether other modules read the binding: its writes then stay. An `export { a }` is a reference instead. */
+    isExported(variable: Variable): boolean {
+        return variable.defs.some((def) => this.#exported.has(def.parent as unknown as Node));
     }
 
     /** Whether the program has a `with` statement (which can answer any name, `this` for calls included). */

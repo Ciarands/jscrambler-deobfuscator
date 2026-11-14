@@ -434,7 +434,7 @@ const mergeCopies = (list: Statement[], context: UnminifyContext): boolean => {
         const temp = scopes.variableOf(first.left);
         if (temp === undefined || scopes.variableOf(second.right) !== temp || scopes.variableOf(second.left) === undefined) continue;
         const references = scopes.references(temp)?.filter((reference) => !context.removedReferences.has(reference.identifier as unknown as Node));
-        if (!temp.defs.every((def) => (def.parent as { kind?: string } | null)?.kind === "var") || temp.scope.type === "global" || references?.length !== 2) continue;
+        if (!temp.defs.every((def) => (def.parent as { kind?: string } | null)?.kind === "var") || temp.scope.type === "global" || context.isExported(temp) || references?.length !== 2) continue;
         context.did("copies", list[i] as Statement);
         first.left = second.left;
         list.splice(i + 1, 1);
