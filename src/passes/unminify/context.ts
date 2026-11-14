@@ -33,6 +33,7 @@ export const TRANSFORMS = [
     "emptyBranches",
     "unreachable",
     "copies",
+    "stringAppends",
     "loops",
     "moveDeclarations",
     "constDeclarations",

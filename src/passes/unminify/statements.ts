@@ -18,7 +18,7 @@ import type {
     VariableDeclarator,
 } from "../../core/ast.js";
 import { isFunctionNode, isJump, isLoopNode } from "../../core/ast.js";
-import { at } from "../../core/build.js";
+import { at, valueToNode } from "../../core/build.js";
 import { deadRemainder, isPlaceholder } from "../../core/hoisting.js";
 import { hasPlainBreak, isBlockScoped, isJumpingIf, isJumpTo, labeledJumps, plainJumps, unlabelJumps } from "../../core/jumps.js";
 import { pushAll, spliceList } from "../../core/list.js";
@@ -295,6 +295,7 @@ const replaceEach = (list: Statement[], rewrite: (index: number) => Statement[] 
 export const expandStatements = (list: Statement[], context: UnminifyContext, functionBody = false): void => {
     replaceEach(list, (i) => expandStatement(list[i] as Statement, context) ?? unlabel(list, i, context, functionBody));
     dropUnreachable(list, context);
+    joinStringAppends(list, context);
     mergeObjectAssignments(list, context);
     if (mergeCopies(list, context)) mergeObjectAssignments(list, context);
 };
@@ -441,6 +442,50 @@ const mergeCopies = (list: Statement[], context: UnminifyContext): boolean => {
         i--;
     }
     return merged;
+};
+
+type StringLiteral = Expression & { type: "Literal"; value: string };
+const isStringLiteral = (node: Node | null | undefined): node is StringLiteral => node?.type === "Literal" && typeof node.value === "string";
+
+/** `x = "a";` or `var x = "a";` (also `let`): the name, and where the literal sits. */
+const stringStore = (statement: Statement | undefined): { id: Node; set: (literal: Expression) => void; value: string } | undefined => {
+    const assignment = assignmentOf(statement);
+    if (assignment !== undefined) return isStringLiteral(assignment.right) ? { id: assignment.left, set: (literal) => (assignment.right = literal), value: assignment.right.value } : undefined;
+    if (statement?.type !== "VariableDeclaration" || statement.declarations.length !== 1 || (statement.kind !== "var" && statement.kind !== "let")) return undefined;
+    const declarator = statement.declarations[0] as VariableDeclarator;
+    return declarator.id.type === "Identifier" && isStringLiteral(declarator.init) ? { id: declarator.id, set: (literal) => (declarator.init = literal), value: declarator.init.value } : undefined;
+};
+
+/**
+ * `x = "a"; x += "b"; x += "c";` -> `x = "abc";`. The statements are consecutive and their right sides are literals,
+ * so nothing runs in between and no code sees the shorter strings. `x` is a declared binding, whose writes run no
+ * setter; where a write to it throws or is ignored (`const`, a dead zone, a function expression's own name), the first
+ * one already does and so does the joined one. A script-level `var` or function is a property of the global object,
+ * which may have an accessor: left alone. Names under a `with` or a direct `eval` don't resolve in the scope
+ * analysis, so they are left alone too.
+ */
+const joinStringAppends = (list: Statement[], context: UnminifyContext): void => {
+    const { scopes } = context;
+    for (let i = 0; i + 1 < list.length; i++) {
+        const store = stringStore(list[i]);
+        const variable = store === undefined ? undefined : scopes.variableOf(store.id);
+        if (store === undefined || variable === undefined) continue;
+        const lexical = variable.defs.length > 0 && variable.defs.every((def) => def.type === "Variable" && (def.parent as { kind?: string } | null)?.kind !== "var");
+        if (variable.scope.type === "global" && !lexical) continue;
+        let value = store.value;
+        let end = i + 1;
+        for (; end < list.length; end++) {
+            const statement = list[end] as Statement;
+            const append = statement.type === "ExpressionStatement" ? statement.expression : undefined;
+            if (append?.type !== "AssignmentExpression" || append.operator !== "+=" || append.left.type !== "Identifier" || !isStringLiteral(append.right)) break;
+            if (scopes.variableOf(append.left) !== variable) break;
+            value += append.right.value;
+        }
+        if (end === i + 1) continue;
+        context.did("stringAppends", list[i] as Statement);
+        store.set(valueToNode(value, store.id));
+        for (const statement of list.splice(i + 1, end - i - 1)) context.removedReferences.add(((statement as ExpressionStatement).expression as AssignmentExpression).left);
+    }
 };
 
 export const removeDeclarators = (program: Node, unused: ReadonlySet<Node>): void => {
