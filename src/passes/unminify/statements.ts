@@ -421,7 +421,8 @@ const assignmentOf = (statement: Statement | undefined): (AssignmentExpression &
  * other script sees it). `b`, a declared name, is resolved before `x` runs instead of after, which only a `with` or a
  * direct `eval` could make differ (an undeclared one could be made by `x`: strict assignments to it then throw only
  * when resolved before). Names under a `with` or a direct `eval` don't resolve in the scope analysis, so neither is
- * found there. `a`'s declarators go after the walk (`unusedDeclarators`).
+ * found there. `a`'s declarators go after the walk (`unusedDeclarators`). An anonymous function or class `x` is then
+ * named after `b` (model 12).
  */
 const mergeCopies = (list: Statement[], context: UnminifyContext): boolean => {
     const { scopes } = context;

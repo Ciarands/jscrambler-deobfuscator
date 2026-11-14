@@ -680,7 +680,8 @@ const convert = (conversion: Conversion, references: ReadonlyMap<Variable, Argum
  * per slot: function-scoped and hoisted (reads before the first write see undefined), one binding per invocation
  * shared with closures. Slot 0 starts as the `arguments` the literal names there; while it is the function's own,
  * never reassigned, its uses become parameters, parameter copies or `arguments` where exact (`convertArguments`).
- * Parameters are never added (`length` would change). Names: `freshName`.
+ * Parameters are never added (`length` would change). Names: `freshName`. An anonymous function or class stored in a
+ * slot gets the local's name where it had none (model 12).
  *
  * Also folds the inline form `[arguments][0]` to `arguments` (`foldedArguments`), and turns direct reads
  * `arguments[i]` into parameters where exact (`convertDirectReads`).

@@ -414,7 +414,8 @@ export interface PlannedStore {
  * `name.j.k = v;` when `j` is the last property of `literal` (with the properties `planned` before it) and holds a
  * plain object literal: `k: v` goes in that one, where `v` still runs after every other value (it ran last). Not
  * `__proto__`, which a literal reads as the prototype; not computed keys other than literals (an assignment converts
- * its key after the value).
+ * its key after the value). An anonymous function or class `v` gets the key as its name, which the store didn't give
+ * it (model 12).
  */
 export const plannedStore = (statement: Statement, holder: Holder, own: OwnBindings, literal: ObjectExpression, planned: readonly PlannedStore[]): PlannedStore | undefined => {
     const { name } = holder;
