@@ -23,7 +23,7 @@ const declarations = async (input: string, run: Run = RUN): Promise<string[]> =>
 };
 
 describe("hoisted declarations", () => {
-    it("moves a var to its first assignment: const for one write, let for more, joining the names left at the top", async () => {
+    it("moves a var to its first assignment: const for one write, let for more, and a let before the block that first uses the rest", async () => {
         const found = await declarations(`
             function f(c) {
                 var a, b, d, e;
@@ -35,16 +35,33 @@ describe("hoisted declarations", () => {
             }
             result = [f(true), f(false)];
         `);
-        expect(found).toEqual(["var d, e", "const a =", "let b ="]);
+        expect(found).toEqual(["const a =", "let b =", "let d, e"]);
     });
 
-    it("keeps a var where it is when the first use reads it", async () => {
-        const found = await declarations("function f() { var x; t(x); x = t(1); return x; } result = f();");
+    it("declares a var whose first use isn't an assignment with a let right before that use", async () => {
+        const input = "function f() { var x; t(0); t(x); x = t(1); return x; } result = f();";
+        expect(await declarations(input)).toEqual(["let x"]);
+        expect((await deobfuscate(input, { passes: ["unminify"] })).code).toContain("t(0);\n  let x;\n  t(x);");
+    });
+
+    it("declares names whose uses are in separate blocks before the first of those blocks, one let for all that start there", async () => {
+        const input = "function f(c) { var x, y, z; t(0); if (c) { x = t(1); [y, z] = t([2, 3]); } if (t(c)) { t(x); } return [x, y, z]; } result = [f(1), f(0)];";
+        expect(await declarations(input)).toEqual(["let x, y, z"]);
+        expect((await deobfuscate(input, { passes: ["unminify"] })).code).toContain("t(0);\n  let x, y, z;\n  if (c) {");
+    });
+
+    it("keeps a var at the top when the block holding its uses runs in a loop (a let would start each iteration undefined)", async () => {
+        const found = await declarations("function f() { var out = []; for (var i = 0; i < 3; i++) { var x; if (i === 0) { x = t(1); } out.push(x); } return out; } result = f();");
+        expect(found).toContain("var x");
+    });
+
+    it("keeps a var at the top when a hoisted function declaration uses it (it may run before a let)", async () => {
+        const found = await declarations("function f() { var x; t(g()); if (t(1)) { x = 2; } return [x, g()]; function g() { return typeof x; } } result = f();");
         expect(found).toEqual(["var x"]);
     });
 
-    it("keeps a var at the top when its uses are in separate blocks", async () => {
-        const found = await declarations("function f(c) { var x; if (c) { x = t(1); } if (t(c)) { t(x); } return x; } result = [f(1), f(0)];");
+    it("keeps a script's top-level var at the top when its first use isn't an assignment: it is a global object property", async () => {
+        const found = await declarations("var x; t(0); if (t(1)) { x = 2; } result = [x, this.x];");
         expect(found).toEqual(["var x"]);
     });
 
@@ -104,7 +121,7 @@ describe("hoisted declarations", () => {
             }
             result = [f(1), f(2), f(3)];
         `);
-        expect(found).toEqual(["var y", "const x ="]);
+        expect(found).toEqual(["let y", "const x ="]);
     });
 
     it("keeps a moved declaration a var when its name can't be declared lexically", async () => {

@@ -9,7 +9,10 @@ import { removeDeclarators } from "./statements.js";
 /**
  * jscrambler hoists every local into one `var a, b, c;` at the top of its function. A `var x;` moves to the first
  * assignment of `x` (`var x = e;`) when every reference is in the statement list holding it, and becomes a `let` or
- * `const` where that binds the same. The names left at the top are joined back into one `var a, b;`.
+ * `const` where that binds the same. Where the first statement using `x` is no such assignment, a `let x;` goes right
+ * before it instead, when that binds the same (`#lexicalKind`) and the list doesn't run in a loop (a `let` there would
+ * start each iteration undefined, where the `var` keeps the last one's value). The names left at the top are joined
+ * back into one `var a, b;`.
  *
  * Moving is exact: a `var` binds function-wide wherever it stands, `var x;` does nothing when it runs, and `var x = e;`
  * assigns `x` as `x = e;` does, provided the new place binds `x` to the same variable. It does: every reference
@@ -94,7 +97,8 @@ interface Plan {
     readonly declarator: VariableDeclarator;
     readonly list: Statement[];
     readonly statement: Statement;
-    readonly site: Site;
+    /** `undefined`: a bare `let x;` goes before `statement`. */
+    readonly site: Site | undefined;
     readonly kind: "var" | "let" | "const";
 }
 
@@ -186,21 +190,19 @@ class Planner {
         const index = Math.min(...indexes);
         const statement = list[index] as Statement;
         const site = siteOf(statement, new Set(references.map((reference) => reference.identifier as unknown as Node)));
-        if (site === undefined) {
-            const reason = COMPOUND[statement.type] === true ? "its first use is inside a compound statement, not `x = e;`" : "its first use is not an assignment `x = e;`";
-            return this.#refuse(reason, declarator);
-        }
-
-        let inLoop = site.head;
+        let inLoop = site?.head ?? false;
         for (let k = depth; k > 0 && !inLoop; k--) inLoop = isLoopNode(first[k]);
 
-        const kind = this.#lexicalKind(variable, references, chains, indexes, index, depth, site, inLoop);
-        return { declarator, list, statement, site, kind: kind ?? "var" };
-    }
-
-    #keepVar(reason: string, node: Node): undefined {
-        this.#context.refused(`keeps the moved declaration a var: ${reason}`, node);
-        return undefined;
+        if (site === undefined) {
+            const what = COMPOUND[statement.type] === true ? "its first use is inside a compound statement, not `x = e;`" : "its first use is not an assignment `x = e;`";
+            if (inLoop) return this.#refuse(`${what}, and a let there would start each iteration of a loop undefined`, declarator);
+            const kind = this.#lexicalKind(variable, references, chains, indexes, index, depth, declarator.id as Identifier, undefined, false);
+            if (typeof kind !== "string") return this.#refuse(`${what}, and a let there could be told apart: ${kind.reason}`, kind.node);
+            return { declarator, list, statement, site, kind: "let" };
+        }
+        const kind = this.#lexicalKind(variable, references, chains, indexes, index, depth, site.write, site, inLoop);
+        if (typeof kind !== "string") this.#context.refused(`keeps the moved declaration a var: ${kind.reason}`, kind.node);
+        return { declarator, list, statement, site, kind: typeof kind === "string" ? kind : "var" };
     }
 
     /**
@@ -208,7 +210,8 @@ class Planner {
      * use before the declaration runs (so none in its dead zone) and none after the loop it heads; none in a function
      * declaration (hoisted, it may run first); in a loop, no closure that could keep one iteration's binding. No other
      * declaration of the name can be in its block: every reference resolves to the variable. A script's top-level `var`
-     * is also a global object property: those stay.
+     * is also a global object property: those stay. Without a `site` the declaration is a bare `let x;` before the first
+     * statement using `x`, so it runs before every use too.
      */
     #lexicalKind(
         variable: Variable,
@@ -217,25 +220,25 @@ class Planner {
         indexes: readonly number[],
         index: number,
         depth: number,
-        site: Site,
+        node: Node,
+        site: Site | undefined,
         inLoop: boolean
-    ): "let" | "const" | undefined {
-        const node = site.write;
-        if (variable.scope.type !== "function") return this.#keepVar("only a function's var becomes lexical (a script's is a global object property)", node);
-        if (!isBindingName(variable.name)) return this.#keepVar("its name can't be declared lexically", node);
+    ): "let" | "const" | { readonly reason: string; readonly node: Node } {
+        if (variable.scope.type !== "function") return { reason: "only a function's var becomes lexical (a script's is a global object property)", node };
+        if (!isBindingName(variable.name)) return { reason: "its name can't be declared lexically", node };
         for (let i = 0; i < chains.length; i++) {
             const chain = chains[i] as Node[];
             const identifier = chain[chain.length - 1] as Node;
-            if (identifier === site.write) continue;
-            if (chain.includes(site.initializer)) return this.#keepVar("its initializer uses it", identifier);
-            if (indexes[i] !== index && site.head) return this.#keepVar("it is used after the loop its head declares it in", identifier);
+            if (identifier === site?.write) continue;
+            if (site !== undefined && chain.includes(site.initializer)) return { reason: "its initializer uses it", node: identifier };
+            if (indexes[i] !== index && site?.head === true) return { reason: "it is used after the loop its head declares it in", node: identifier };
             for (let k = depth + 1; k < chain.length; k++) {
                 const ancestor = chain[k] as Node;
-                if (ancestor.type === "FunctionDeclaration") return this.#keepVar("a function declaration (hoisted) uses it", identifier);
-                if (inLoop && DEFERRED[ancestor.type] === true) return this.#keepVar("a closure in a loop captures it", identifier);
+                if (ancestor.type === "FunctionDeclaration") return { reason: "a function declaration (hoisted) uses it", node: identifier };
+                if (inLoop && DEFERRED[ancestor.type] === true) return { reason: "a closure in a loop captures it", node: identifier };
             }
         }
-        return references.filter((reference) => reference.isWrite()).length === 1 ? "const" : "let";
+        return site !== undefined && references.filter((reference) => reference.isWrite()).length === 1 ? "const" : "let";
     }
 }
 
@@ -263,8 +266,9 @@ const joinBareVars = (list: Statement[], context: UnminifyContext): void => {
 };
 
 /**
- * Moves hoisted `var x;` declarations to the first assignment, promoting them to `let`/`const` where exact, then joins
- * the ones left at the top of each function. Needs `scopes` analysed on the program as it stands.
+ * Moves hoisted `var x;` declarations to the first assignment, promoting them to `let`/`const` where exact, or to a
+ * `let x;` before the first use, then joins the ones left at the top of each function. Needs `scopes` analysed on the
+ * program as it stands.
  */
 export const placeDeclarations = (program: Program, scopes: ScopeInfo, context: UnminifyContext): void => {
     const planner = new Planner(scopes, context);
@@ -280,7 +284,20 @@ export const placeDeclarations = (program: Program, scopes: ScopeInfo, context: 
     }
 
     const moved = new Set<Node>();
+    // Bare declarations first, one `let a, b;` per statement: the moves below may replace that statement.
+    const bare = new Map<Statement, { list: Statement[]; declarators: VariableDeclarator[] }>();
+    for (const { declarator, list, statement, site } of plans) {
+        if (site !== undefined) continue;
+        context.did("moveDeclarations", declarator);
+        context.did("letDeclarations", declarator);
+        moved.add(declarator);
+        const entry = bare.get(statement) ?? { list, declarators: [] };
+        entry.declarators.push(declaratorOf({ ...(declarator.id as Identifier) }, null));
+        bare.set(statement, entry);
+    }
+    for (const [statement, { list, declarators }] of bare) list.splice(list.indexOf(statement), 0, declarationOf("let", declarators, statement));
     for (const { declarator, list, statement, site, kind } of plans) {
+        if (site === undefined) continue;
         context.did("moveDeclarations", declarator);
         if (kind !== "var") context.did(kind === "const" ? "constDeclarations" : "letDeclarations", site.write);
         moved.add(declarator);
