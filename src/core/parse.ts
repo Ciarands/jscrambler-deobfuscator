@@ -18,12 +18,15 @@ const describe = (source: SourceMap, error: OxcError): string => {
     return start === undefined ? error.message : `${error.message} (${source.location(start)})`;
 };
 
-/** `range` is always on (scope analysis needs it). Parenthesized expressions are not kept as nodes. */
+/**
+ * Parenthesized expressions are not kept as nodes. No `range` arrays: `start`/`end` say the same, and the arrays are
+ * an object per node, a third of the tree's memory, which every walk pays for in cache misses.
+ */
 export const parse = (code: string, filename = "input.js"): Program => {
     const result = parseSync(filename, code, {
         lang: "js",
         sourceType: "unambiguous",
-        range: true,
+        range: false,
         preserveParens: false,
     });
     if (result.errors.length > 0) {

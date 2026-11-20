@@ -22,7 +22,7 @@ export class SourceMap {
     }
 
     snippet(node: Node, max = 80): string {
-        const [start, end] = node.range ?? [node.start, node.end];
+        const { start, end } = node;
         // Whitespace runs collapse to one space, so read past `max` for the snippet to still fill, but not a whole big node.
         const text = this.#source.slice(start, Math.min(end, start + max * 4)).replace(/\s+/g, " ");
         return text.length > max ? `${text.slice(0, max - 3)}...` : text;
@@ -39,8 +39,7 @@ export interface PassLog {
 const ignore = (): void => {};
 
 export const createPassLog = (pass: string, logger: Logger, source: SourceMap): PassLog => {
-    const format = (message: string, node?: Node): string =>
-        node === undefined ? `[${pass}] ${message}` : `[${pass}] ${message} @ ${source.location(node.range?.[0] ?? node.start)} \`${source.snippet(node)}\``;
+    const format = (message: string, node?: Node): string => (node === undefined ? `[${pass}] ${message}` : `[${pass}] ${message} @ ${source.location(node.start)} \`${source.snippet(node)}\``);
     // A line at a level nobody writes isn't formatted (the location lookup and the snippet are what cost).
     const enabled = (level: "info" | "debug" | "warn"): boolean => logger.enabled?.(level) ?? true;
     const debugging = enabled("debug");
