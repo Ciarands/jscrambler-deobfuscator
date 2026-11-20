@@ -6,17 +6,10 @@ export type At = Node | readonly [number, number];
 interface Position {
     start: number;
     end: number;
-    range: [number, number];
 }
 
-/** Every created node needs `range`: scope analysis crashes without it, and logs use it to point into the source. */
-const positionOf = (at: At): Position => {
-    if ("type" in at) {
-        const range = at.range ?? [at.start, at.end];
-        return { start: range[0], end: range[1], range: [range[0], range[1]] };
-    }
-    return { start: at[0], end: at[1], range: [at[0], at[1]] };
-};
+/** Every created node needs a position: logs use it to point into the source. */
+const positionOf = (at: At): Position => ("type" in at ? { start: at.start, end: at.end } : { start: at[0], end: at[1] });
 
 export const at = <N extends Node>(node: { type: N["type"] } & Record<string, unknown>, position: At): N => ({ ...node, ...positionOf(position) }) as unknown as N;
 

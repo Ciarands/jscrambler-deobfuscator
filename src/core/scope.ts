@@ -72,10 +72,33 @@ export interface GlobalReach {
     readonly escapes: readonly Node[];
 }
 
+type ResolutionCheck = (this: Scope, reference: Reference, variable: Variable) => boolean;
+
 /** eslint-scope's own (untyped) check that a parameter default doesn't see the body's declarations. */
 const resolves = (scope: Scope, reference: Reference, variable: Variable): boolean =>
     // oxlint-disable-next-line no-underscore-dangle -- eslint-scope's method, called for parity with its resolution
-    (scope as Scope & { __isValidResolution(reference: Reference, variable: Variable): boolean }).__isValidResolution(reference, variable);
+    (scope as Scope & { __isValidResolution: ResolutionCheck }).__isValidResolution(reference, variable);
+
+/**
+ * That check reads `range[0]` of the function body, the reference and the definitions; parsed nodes carry `start`
+ * instead (`parse`). Installed on eslint-scope's function scope class (not exported: found through a scope of it), the
+ * same check reads `range[0]` where a node has it, else `start`, so other users of the package see no change.
+ */
+const offsetOf = (node: { readonly range?: readonly [number, number] | undefined; readonly start?: number | undefined }): number => node.range?.[0] ?? (node.start as number);
+{
+    const fn = { type: "FunctionDeclaration", id: { type: "Identifier", name: "f" }, params: [], body: { type: "BlockStatement", body: [] }, generator: false, async: false };
+    const probe = analyze({ type: "Program", sourceType: "script", body: [fn] } as unknown as Parameters<typeof analyze>[0], { ecmaVersion: 2022 });
+    const functionScope = probe.scopes.find((scope) => scope.type === "function");
+    if (functionScope === undefined) throw new Error("eslint-scope changed: no function scope to install the resolution check on");
+    const prototype = Object.getPrototypeOf(functionScope) as { __isValidResolution: ResolutionCheck };
+    // oxlint-disable-next-line no-underscore-dangle -- eslint-scope's method, replaced with the same check on `start`
+    prototype.__isValidResolution = function (this: Scope, reference: Reference, variable: Variable): boolean {
+        const block = this.block as unknown as { type: string; body: { range?: [number, number]; start?: number } };
+        if (block.type === "Program") return true;
+        const bodyStart = offsetOf(block.body);
+        return !(variable.scope === this && offsetOf(reference.identifier) < bodyStart && variable.defs.every((def) => offsetOf(def.name) >= bodyStart));
+    };
+}
 
 /**
  * Whether definitions make a `var` of their name in their scope an early error (so Annex B leaves a block function

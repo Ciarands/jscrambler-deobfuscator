@@ -25,6 +25,17 @@ describe("scope analysis", () => {
         expect(uses("var w = 2; class A { static { w; } }", "w")).toBe(2);
         expect(uses('var y = "json"; import("m", { with: { type: y } });', "y")).toBe(2);
     });
+
+    it("resolves a parameter default to the outer name, not to a declaration of the same name in the body", () => {
+        const program = parse("var x = 1; function f(a = x) { var x = 2; return a; }");
+        const scopes = new ScopeInfo(program);
+        const [outer, fn] = program.body as Node[];
+        const declared = outer?.type === "VariableDeclaration" ? scopes.variableOf(outer.declarations[0]?.id as Node) : undefined;
+        const param = fn?.type === "FunctionDeclaration" ? fn.params[0] : undefined;
+        const read = param?.type === "AssignmentPattern" ? param.right : undefined;
+        expect(declared).toBeDefined();
+        expect(scopes.variableOf(read as Node)).toBe(declared);
+    });
 });
 
 const statements = (program: Program) => program.body.map((statement) => statement as ExpressionStatement);
