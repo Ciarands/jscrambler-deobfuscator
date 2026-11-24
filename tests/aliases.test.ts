@@ -68,6 +68,34 @@ describe("aliases", () => {
         const { code } = await deobfuscate(PROGRAM, { passes: ["runtime", "global-proxy", "aliases"] });
         expect(code).toContain("return q1Str;");
     });
+
+    it("keeps a property alias whose name the program also gives its own objects", async () => {
+        const shapes = [
+            'var own = { q3Spl: function () { return ["own"]; } };',
+            'var own = {}; own.q3Spl = function () { return ["own"]; };',
+            'class Own { q3Spl() { return ["own"]; } } var own = new Own();',
+        ];
+        for (const shape of shapes) {
+            const program = `${PRELUDE}\n${shape}\nresult = [own.q3Spl(",")[0], "a,b".q3Spl(",").length, "x".q4Joi === undefined];`;
+            const { code } = await deobfuscate(program, { passes: ["runtime", "global-proxy", "aliases"] });
+            expect(code).toContain("own.q3Spl(");
+            expect(code).toContain('"x".join');
+            expect(observe(code)).toBe(observe(program));
+        }
+    });
+
+    it("keeps a dispatch call whose receiver may be null or undefined when the alias does something else with one", async () => {
+        // Dispatch with a fallback: a nullish receiver splits a fixed string instead (the call differs from `r.split`).
+        const prelude = PRELUDE.replace(
+            "var r = a[0] === null || a[0] === undefined ? target : a[0];",
+            'if (a[0] === null || a[0] === undefined) return holder[name].apply("a,b", a.slice(1)); var r = a[0];'
+        );
+        const program = `${prelude}\nvar receiver = null, none;\nresult = [G.c1(receiver, ","), G.c1(none, ","), G.c1("x,y", ",")];`;
+        const { code } = await deobfuscate(program, { passes: ["runtime", "global-proxy", "aliases"] });
+        for (const kept of ["G.c1(receiver,", "G.c1(none,"]) expect(code).toContain(kept);
+        expect(code).toContain('"x,y".split(",")');
+        expect(observe(code)).toBe(observe(program));
+    });
 });
 
 // The same setup also forwards globals to host objects the builtins lack (a page's `document`, here `hostDoc`).

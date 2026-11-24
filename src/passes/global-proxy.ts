@@ -10,7 +10,8 @@ import { storageAnalysis } from "./runtime/effects.js";
  * Global proxy: `G[k]` (where the prelude left the global object) becomes `globalThis`.
  *
  * Only reads of those slots are rewritten; `G` stays its own object (so `G[0] = ...` doesn't land on `window[0]`).
- * A read is rewritten only where it sees the snapshot's value and `globalThis` isn't a local name.
+ * A read is rewritten only where it sees the snapshot's value and `globalThis` isn't a local name. The host has
+ * `globalThis` (model 13), whatever way the runtime found the global object.
  */
 export const globalProxy: Pass = {
     name: "global-proxy",

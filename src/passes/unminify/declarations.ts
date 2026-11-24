@@ -170,8 +170,10 @@ class Planner {
             chains.push(chain);
         }
 
-        // The smallest statement list of the function's own code holding every reference.
-        let common = Math.min(...chains.map((chain) => chain.length));
+        // The smallest statement list of the function's own code holding every reference. Minimums in loops: a spread
+        // of one argument per reference overflows the stack for a name used ~100k times.
+        let common = Infinity;
+        for (const chain of chains) common = Math.min(common, chain.length);
         const first = chains[0] as Node[];
         for (const chain of chains) while (common > 0 && chain[common - 1] !== first[common - 1]) common--;
         let depth = -1;
@@ -187,7 +189,8 @@ class Planner {
         }
         if (list === undefined) return this.#refuse("no statement list of its function holds every use", declarator);
         const indexes = chains.map((chain) => this.#indexOf(list, chain[depth + 1] as Node) as number);
-        const index = Math.min(...indexes);
+        let index = Infinity;
+        for (const position of indexes) index = Math.min(index, position);
         const statement = list[index] as Statement;
         const site = siteOf(statement, new Set(references.map((reference) => reference.identifier as unknown as Node)));
         let inLoop = site?.head ?? false;

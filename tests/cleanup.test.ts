@@ -327,6 +327,13 @@ describe("cleanup: code in literal evals", () => {
         expect(observe(code, RUN)).toBe(observe(input, RUN));
         expect(code).toContain("G.k = 41;");
     });
+
+    it("keeps the runtime for eval code it can't parse on its own, which may still run where it is", async () => {
+        const input = 'function G() {}\nG.k = 41;\nsetTimeout(function () { result = eval("[typeof new.target, G.k]"); });\n';
+        const { code } = await deobfuscate(input);
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
+        expect(code).toContain("G.k = 41;");
+    });
 });
 
 describe("cleanup: dead stores", () => {
@@ -476,6 +483,18 @@ describe("cleanup: dead stores", () => {
         ];
         for (const input of programs) {
             const { code } = await deobfuscate(input, { passes: ["cleanup"] });
+            expect(observe(code, RUN)).toBe(observe(input, RUN));
+        }
+    });
+
+    it("keeps an unused using declaration: it registers the disposer, or throws without one", async () => {
+        const programs = [
+            'function f() { using unused = 1; } try { f(); result = ["ran"]; } catch (e) { result = [e.name]; }',
+            'var log = []; function f() { using lock = { [Symbol.dispose]() { log.push("disposed"); } }; log.push("body"); } f(); result = log;',
+        ];
+        for (const input of programs) {
+            const { code } = await deobfuscate(input, { passes: ["cleanup"] });
+            expect(code).toContain("using ");
             expect(observe(code, RUN)).toBe(observe(input, RUN));
         }
     });

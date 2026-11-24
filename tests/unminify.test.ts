@@ -543,12 +543,26 @@ describe("unminify", () => {
                 "  const bump = list => list.reduce((acc, [k, v]) => { acc[k] = v + 1; return acc; }, {});",
                 "  let swapped = list => list.reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {});",
                 "  swapped = () => 0;",
+                // Without a return the helper gives undefined; without returning `acc` the next step reads undefined.
+                "  const silent = list => { list.reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {}); };",
+                "  const dropping = list => list.reduce((acc, [k, v]) => { acc[k] = v; acc; }, {});",
                 '  function f(k, list, o) { return [build([[k, 1]]), build(list), build([["a", 1, 2]]), build([["__proto__", o]]).marker, bump([["a", 1]]), swapped([["a", 1]])]; }',
-                '  result = [first, f("key", [["z", 2]], { marker: 3 })];',
+                '  function g() { try { return [silent([["a", 1]]), dropping([["a", 1], ["b", 2]])]; } catch (e) { return e.name; } }',
+                '  result = [first, f("key", [["z", 2]], { marker: 3 }), g()];',
                 "})();",
             ].join("\n")
         );
-        for (const call of ['late([["a", 1]])', "build([[k, 1]])", "build(list)", 'build([["a", 1, 2]])', 'build([["__proto__", o]])', 'bump([["a", 1]])', 'swapped([["a", 1]])'])
+        for (const call of [
+            'late([["a", 1]])',
+            "build([[k, 1]])",
+            "build(list)",
+            'build([["a", 1, 2]])',
+            'build([["__proto__", o]])',
+            'bump([["a", 1]])',
+            'swapped([["a", 1]])',
+            'silent([["a", 1]])',
+            "dropping([",
+        ])
             expect(kept).toContain(call);
         // The helper's declaration stays where its write would be left without it (and make a global).
         const split = await sameBehaviour(

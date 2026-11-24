@@ -341,7 +341,8 @@ interface EvalUses {
 
 /**
  * `eval("...")` code runs in the caller's scope and jscrambler hides storage reads there, so its uses count at the
- * call. Unparsable code throws before running: it uses nothing.
+ * call. Code that doesn't parse as a script may still run there (`new.target` in a function's eval): its uses are
+ * unknown, so it counts as an escape of the storage object, which keeps the runtime.
  */
 const literalEvalUses = (call: CallExpression, storage: string, cache: RemovalInputs["evalUses"]): EvalUses | undefined => {
     const [code] = call.arguments;
@@ -352,8 +353,9 @@ const literalEvalUses = (call: CallExpression, storage: string, cache: RemovalIn
         parsed = parse(code.value);
     } catch (error) {
         if (!(error instanceof ParseError)) throw error;
-        cache.set(code, undefined);
-        return undefined;
+        const unknown: EvalUses = { keys: new Set(), escape: true, names: new Set() };
+        cache.set(code, unknown);
+        return unknown;
     }
     const uses: EvalUses = { keys: new Set<string>(), escape: false, names: new Set<string>() };
     traverse(parsed, {
@@ -456,6 +458,12 @@ interface Liveness {
     readonly liveBy: ReadonlyMap<string, number>;
 }
 
+const addTo = (buckets: Map<string, number[]>, key: string, index: number): void => {
+    const bucket = buckets.get(key);
+    if (bucket === undefined) buckets.set(key, [index]);
+    else bucket.push(index);
+};
+
 /**
  * Root statements that stay: those not removable, what their reads and names reach (definitions and stage calls by
  * key, functions by name), and the setup call with what it reaches once one that stays uses an alias.
@@ -464,8 +472,8 @@ const computeLiveness = (roots: readonly RootUses[], log: PassContext["log"]): L
     const byKey = new Map<string, number[]>();
     const byName = new Map<string, number[]>();
     for (const [index, { role }] of roots.entries()) {
-        if ((role.kind === "def" && role.removable) || role.kind === "stage") byKey.set(role.key, [...(byKey.get(role.key) ?? []), index]);
-        if (role.kind === "fn") byName.set(role.name, [...(byName.get(role.name) ?? []), index]);
+        if ((role.kind === "def" && role.removable) || role.kind === "stage") addTo(byKey, role.key, index);
+        if (role.kind === "fn") addTo(byName, role.name, index);
     }
     const kept = new Set<number>();
     const liveBy = new Map<string, number>();
@@ -599,9 +607,14 @@ const logDefinitions = (roots: readonly RootUses[], { kept, liveBy }: Liveness, 
  */
 const removedDeclarations = new WeakSet<Node>();
 
-/** `x = <pure>`, or a bare `x` that isn't a for-in/of head (the loop writes that one: an init reference at its id). */
+/**
+ * `x = <pure>`, or a bare `x` that isn't a for-in/of head (the loop writes that one: an init reference at its id). Not
+ * `using` or `await using`: the declaration registers its value's disposer (and throws without one), unused or not.
+ */
 const removableDeclarator = (node: Node, variable: Variable, scopes: ScopeInfo): node is VariableDeclarator => {
     if (node.type !== "VariableDeclarator" || node.id.type !== "Identifier" || !isPure(node.init, scopes)) return false;
+    const kind = (variable.defs.find((def) => (def.node as unknown as Node) === node)?.parent as { kind?: string } | null | undefined)?.kind;
+    if (kind === "using" || kind === "await using") return false;
     const references = scopes.references(variable);
     return references !== undefined && (node.init !== null || !references.some((reference) => reference.init === true && (reference.identifier as unknown as Node) === node.id));
 };

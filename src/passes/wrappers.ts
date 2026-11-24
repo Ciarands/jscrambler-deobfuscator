@@ -55,7 +55,8 @@ const reorderingRisk = (call: CallExpression, target: PropertyPath, site: Node, 
  * Wrapper inlining (#5): `G.w = function () { return typeof T === "function" ? T.apply(O, arguments) : T; }`.
  *
  * - Function targets: `G.w(a, b)` -> `O.m(a, b)`. The wrapper reads T after the arguments, the inlined call before:
- *   the same only when reading T runs no code and the arguments can't change T (`reorderingRisk`).
+ *   the same only when reading T runs no code and the arguments can't change T (`reorderingRisk`). `T.apply(O, args)`
+ *   calls T with `this` O, as the direct call does, while `apply` is the builtin (model 7).
  * - Value targets: only `G.w()` -> `T`.
  *
  * The kind is `Snapshot`'s (every value the builder's code may put at T), so only where nothing writes `G.w`, T or a

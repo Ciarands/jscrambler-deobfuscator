@@ -497,6 +497,7 @@ const objectFromBuilder = (node: Node, context: UnminifyContext): ObjectExpressi
 
 type NodeOf<T extends Node["type"]> = Extract<Node, { type: T }>;
 
+/** A regex literal spelled readably: it matches the same, but its `.source` and string form change (model 14). */
 const readableRegex = (node: NodeOf<"Literal">, context: UnminifyContext): Node | undefined => {
     if (!("regex" in node) || node.regex === undefined || node.regex === null) return undefined;
     const { flags } = node.regex;
