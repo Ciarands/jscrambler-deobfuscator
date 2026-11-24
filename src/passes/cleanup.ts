@@ -458,6 +458,12 @@ interface Liveness {
     readonly liveBy: ReadonlyMap<string, number>;
 }
 
+const addTo = (buckets: Map<string, number[]>, key: string, index: number): void => {
+    const bucket = buckets.get(key);
+    if (bucket === undefined) buckets.set(key, [index]);
+    else bucket.push(index);
+};
+
 /**
  * Root statements that stay: those not removable, what their reads and names reach (definitions and stage calls by
  * key, functions by name), and the setup call with what it reaches once one that stays uses an alias.
@@ -466,8 +472,8 @@ const computeLiveness = (roots: readonly RootUses[], log: PassContext["log"]): L
     const byKey = new Map<string, number[]>();
     const byName = new Map<string, number[]>();
     for (const [index, { role }] of roots.entries()) {
-        if ((role.kind === "def" && role.removable) || role.kind === "stage") byKey.set(role.key, [...(byKey.get(role.key) ?? []), index]);
-        if (role.kind === "fn") byName.set(role.name, [...(byName.get(role.name) ?? []), index]);
+        if ((role.kind === "def" && role.removable) || role.kind === "stage") addTo(byKey, role.key, index);
+        if (role.kind === "fn") addTo(byName, role.name, index);
     }
     const kept = new Set<number>();
     const liveBy = new Map<string, number>();
