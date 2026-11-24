@@ -8,22 +8,36 @@ import type { UnminifyContext } from "./context.js";
 
 const isNamed = (node: Node | null | undefined, name: string): boolean => node?.type === "Identifier" && node.name === name;
 
-/** The statements of `(acc, [k, v]) => { acc[k] = v; return acc; }` in any of the spellings a minifier leaves. */
-const reducerSteps = (body: Node): Node[] => {
-    if (body.type !== "BlockStatement") return body.type === "SequenceExpression" ? body.expressions : [body];
-    return body.body.flatMap((statement, index, all): Node[] => {
-        if (statement.type === "ExpressionStatement") return statement.expression.type === "SequenceExpression" ? statement.expression.expressions : [statement.expression];
-        if (statement.type !== "ReturnStatement" || statement.argument === null || index !== all.length - 1) return [statement];
-        return statement.argument.type === "SequenceExpression" ? statement.argument.expressions : [statement.argument];
-    });
+/** `(a, b, e)` as the expressions run first and the value, `e` as no expressions and `e`. */
+const splitSequence = (expression: Node): { steps: Node[]; result: Node } =>
+    expression.type === "SequenceExpression" ? { steps: expression.expressions.slice(0, -1), result: expression.expressions.at(-1) as Node } : { steps: [], result: expression };
+
+/**
+ * An arrow body as the expressions it runs and the value it returns, in the spellings a minifier leaves: `e`,
+ * `(a, e)`, `{ a; return e; }`, `{ return a, e; }`. `undefined` for any other body: one that ends without a
+ * `return e` returns undefined.
+ */
+const arrowSteps = (body: Node): { steps: Node[]; result: Node } | undefined => {
+    if (body.type !== "BlockStatement") return splitSequence(body);
+    const last = body.body.at(-1);
+    if (last?.type !== "ReturnStatement" || last.argument === null) return undefined;
+    const steps: Node[] = [];
+    for (const statement of body.body.slice(0, -1)) {
+        if (statement.type !== "ExpressionStatement") return undefined;
+        const { steps: before, result } = splitSequence(statement.expression);
+        steps.push(...before, result);
+    }
+    const returned = splitSequence(last.argument);
+    return { steps: [...steps, ...returned.steps], result: returned.result };
 };
 
 /** `list => list.reduce((acc, [k, v]) => { acc[k] = v; return acc; }, {})`: builds an object from `[key, value]` pairs. */
 const isEntryBuilder = (fn: FunctionLike): boolean => {
     const [list] = fn.params;
     if (fn.type !== "ArrowFunctionExpression" || fn.async || fn.params.length !== 1 || list?.type !== "Identifier" || fn.body === null) return false;
-    const [call, ...rest] = reducerSteps(fn.body);
-    if (rest.length > 0 || call?.type !== "CallExpression" || call.optional || call.arguments.length !== 2) return false;
+    const outer = arrowSteps(fn.body);
+    const call = outer?.result;
+    if (outer === undefined || outer.steps.length > 0 || call?.type !== "CallExpression" || call.optional || call.arguments.length !== 2) return false;
     const { callee } = call;
     if (callee.type !== "MemberExpression" || callee.computed || callee.optional || !isNamed(callee.object, list.name) || !isNamed(callee.property, "reduce")) return false;
     const [reducer, seed] = call.arguments;
@@ -33,8 +47,9 @@ const isEntryBuilder = (fn: FunctionLike): boolean => {
     if (acc?.type !== "Identifier" || pair?.type !== "ArrayPattern" || pair.elements.length !== 2) return false;
     const [key, value] = pair.elements;
     if (key?.type !== "Identifier" || value?.type !== "Identifier" || new Set([acc.name, key.name, value.name]).size !== 3) return false;
-    const [store, result, ...more] = reducerSteps(reducer.body);
-    if (more.length > 0 || store?.type !== "AssignmentExpression" || store.operator !== "=" || !isNamed(result, acc.name)) return false;
+    const inner = arrowSteps(reducer.body);
+    const [store, ...more] = inner?.steps ?? [];
+    if (inner === undefined || more.length > 0 || store?.type !== "AssignmentExpression" || store.operator !== "=" || !isNamed(inner.result, acc.name)) return false;
     const target = store.left;
     return target.type === "MemberExpression" && target.computed && isNamed(target.object, acc.name) && isNamed(target.property, key.name) && isNamed(store.right, value.name);
 };
