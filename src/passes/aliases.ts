@@ -1,5 +1,5 @@
 import type { Argument, CallExpression, Expression, MemberExpression, Node } from "../core/ast.js";
-import { isBindingName, memberPath, propertyKey } from "../core/ast.js";
+import { isBindingName, keyName, memberPath, propertyKey } from "../core/ast.js";
 import { callOf, identifier, member, memberChain } from "../core/build.js";
 import type { ScopeInfo } from "../core/scope.js";
 import { OWN_GLOBAL_OBJECT_NAMES } from "../core/scope.js";
@@ -113,6 +113,27 @@ export const aliases: Pass = {
             const [only] = originals;
             if (originals.size === 1 && only !== undefined) properties.set(alias, only);
             else log.warn(`alias .${alias} stands for ${[...originals].join(" and ")}, left as is`);
+        }
+        // A property alias is rewritten by name, whatever the object: refused when the program also gives some object
+        // its own property of that name (a literal or class key, an assignment), which a read of it may mean instead.
+        if (properties.size > 0) {
+            const own = (key: string | undefined, node: Node): void => {
+                if (key === undefined || !properties.has(key)) return;
+                log.debug(`kept: .${key}, an alias of ${properties.get(key)}, is also a property the program defines`, node);
+                properties.delete(key);
+            };
+            traverse(program, {
+                enter(path) {
+                    const node = path.node;
+                    if (runtime.setup.has(node)) return path.skip();
+                    if (
+                        (node.type === "Property" || node.type === "MethodDefinition" || node.type === "PropertyDefinition" || node.type === "AccessorProperty") &&
+                        path.parent?.type !== "ObjectPattern"
+                    )
+                        own(node.computed && node.key.type !== "Literal" ? undefined : keyName(node.key), node);
+                    else if (node.type === "MemberExpression" && path.isWriteTarget()) own(propertyKey(node), node);
+                },
+            });
         }
 
         const counts = { globals: 0, properties: 0, calls: 0, hosts: 0, refused: 0 };

@@ -68,6 +68,21 @@ describe("aliases", () => {
         const { code } = await deobfuscate(PROGRAM, { passes: ["runtime", "global-proxy", "aliases"] });
         expect(code).toContain("return q1Str;");
     });
+
+    it("keeps a property alias whose name the program also gives its own objects", async () => {
+        const shapes = [
+            'var own = { q3Spl: function () { return ["own"]; } };',
+            'var own = {}; own.q3Spl = function () { return ["own"]; };',
+            'class Own { q3Spl() { return ["own"]; } } var own = new Own();',
+        ];
+        for (const shape of shapes) {
+            const program = `${PRELUDE}\n${shape}\nresult = [own.q3Spl(",")[0], "a,b".q3Spl(",").length, "x".q4Joi === undefined];`;
+            const { code } = await deobfuscate(program, { passes: ["runtime", "global-proxy", "aliases"] });
+            expect(code).toContain("own.q3Spl(");
+            expect(code).toContain('"x".join');
+            expect(observe(code)).toBe(observe(program));
+        }
+    });
 });
 
 // The same setup also forwards globals to host objects the builtins lack (a page's `document`, here `hostDoc`).
