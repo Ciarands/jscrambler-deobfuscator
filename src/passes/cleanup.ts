@@ -599,9 +599,14 @@ const logDefinitions = (roots: readonly RootUses[], { kept, liveBy }: Liveness, 
  */
 const removedDeclarations = new WeakSet<Node>();
 
-/** `x = <pure>`, or a bare `x` that isn't a for-in/of head (the loop writes that one: an init reference at its id). */
+/**
+ * `x = <pure>`, or a bare `x` that isn't a for-in/of head (the loop writes that one: an init reference at its id). Not
+ * `using` or `await using`: the declaration registers its value's disposer (and throws without one), unused or not.
+ */
 const removableDeclarator = (node: Node, variable: Variable, scopes: ScopeInfo): node is VariableDeclarator => {
     if (node.type !== "VariableDeclarator" || node.id.type !== "Identifier" || !isPure(node.init, scopes)) return false;
+    const kind = (variable.defs.find((def) => (def.node as unknown as Node) === node)?.parent as { kind?: string } | null | undefined)?.kind;
+    if (kind === "using" || kind === "await using") return false;
     const references = scopes.references(variable);
     return references !== undefined && (node.init !== null || !references.some((reference) => reference.init === true && (reference.identifier as unknown as Node) === node.id));
 };

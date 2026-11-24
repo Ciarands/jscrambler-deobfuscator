@@ -480,6 +480,18 @@ describe("cleanup: dead stores", () => {
         }
     });
 
+    it("keeps an unused using declaration: it registers the disposer, or throws without one", async () => {
+        const programs = [
+            'function f() { using unused = 1; } try { f(); result = ["ran"]; } catch (e) { result = [e.name]; }',
+            'var log = []; function f() { using lock = { [Symbol.dispose]() { log.push("disposed"); } }; log.push("body"); } f(); result = log;',
+        ];
+        for (const input of programs) {
+            const { code } = await deobfuscate(input, { passes: ["cleanup"] });
+            expect(code).toContain("using ");
+            expect(observe(code, RUN)).toBe(observe(input, RUN));
+        }
+    });
+
     it("merges a var whose literal value another literal replaces right away, not one any other value replaces", async () => {
         const input =
             'function read() { return g; } var a = ""; var a = "keyCode"; var b = ""; b = "href"; var e = "", e = "done", f = 1, f; var g = "old", g = read(); var h = 0; h = 0; result = [a, b, e, f, g, h];';
