@@ -57,7 +57,11 @@ const isPresent = (node: Node, scopes: ScopeInfo, bare: (call: CallExpression) =
     }
 };
 
-/** `G.alias(...)` as the builtin call it stands for. `site` is the reference to `G`; `present` is `isPresent` there. */
+/**
+ * `G.alias(...)` as the builtin call it stands for. `site` is the reference to `G`; `present` is `isPresent` there.
+ * The alias reaches the builtin through `apply`/`call` and the builtin's own property, which are the standard ones
+ * (model 7), so the direct call runs the same function with the same `this` and arguments.
+ */
 const rewriteCall = (call: CallExpression, alias: CallAlias, scopes: ScopeInfo, site: Node, present: (node: Node) => boolean): Rewrite => {
     const args = call.arguments;
     if (args.length === 0) return builtin(alias, scopes, site, call);
