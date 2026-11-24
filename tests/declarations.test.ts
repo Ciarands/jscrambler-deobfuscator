@@ -163,4 +163,10 @@ describe("hoisted declarations", () => {
         const found = await declarations("function f(p) { var x, p; x = t(1); var x; p = t(2); return [x, p]; } result = f(0);");
         expect(found).toEqual(["var x, p", "var x"]);
     });
+
+    it("moves a var read from very many places, without running out of stack", async () => {
+        const input = `function f() { var x; x = t(1); ${"t(x);".repeat(150_000)} }`;
+        const output = (await deobfuscate(input, { passes: ["unminify"] })).code;
+        expect(output).toContain("const x = t(1);");
+    }, 60_000);
 });
