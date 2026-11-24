@@ -327,6 +327,13 @@ describe("cleanup: code in literal evals", () => {
         expect(observe(code, RUN)).toBe(observe(input, RUN));
         expect(code).toContain("G.k = 41;");
     });
+
+    it("keeps the runtime for eval code it can't parse on its own, which may still run where it is", async () => {
+        const input = 'function G() {}\nG.k = 41;\nsetTimeout(function () { result = eval("[typeof new.target, G.k]"); });\n';
+        const { code } = await deobfuscate(input);
+        expect(observe(code, RUN)).toBe(observe(input, RUN));
+        expect(code).toContain("G.k = 41;");
+    });
 });
 
 describe("cleanup: dead stores", () => {

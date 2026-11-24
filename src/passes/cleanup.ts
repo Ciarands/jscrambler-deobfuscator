@@ -341,7 +341,8 @@ interface EvalUses {
 
 /**
  * `eval("...")` code runs in the caller's scope and jscrambler hides storage reads there, so its uses count at the
- * call. Unparsable code throws before running: it uses nothing.
+ * call. Code that doesn't parse as a script may still run there (`new.target` in a function's eval): its uses are
+ * unknown, so it counts as an escape of the storage object, which keeps the runtime.
  */
 const literalEvalUses = (call: CallExpression, storage: string, cache: RemovalInputs["evalUses"]): EvalUses | undefined => {
     const [code] = call.arguments;
@@ -352,8 +353,9 @@ const literalEvalUses = (call: CallExpression, storage: string, cache: RemovalIn
         parsed = parse(code.value);
     } catch (error) {
         if (!(error instanceof ParseError)) throw error;
-        cache.set(code, undefined);
-        return undefined;
+        const unknown: EvalUses = { keys: new Set(), escape: true, names: new Set() };
+        cache.set(code, unknown);
+        return unknown;
     }
     const uses: EvalUses = { keys: new Set<string>(), escape: false, names: new Set<string>() };
     traverse(parsed, {
