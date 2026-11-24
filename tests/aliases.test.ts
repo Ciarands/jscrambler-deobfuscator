@@ -83,6 +83,19 @@ describe("aliases", () => {
             expect(observe(code)).toBe(observe(program));
         }
     });
+
+    it("keeps a dispatch call whose receiver may be null or undefined when the alias does something else with one", async () => {
+        // Dispatch with a fallback: a nullish receiver splits a fixed string instead (the call differs from `r.split`).
+        const prelude = PRELUDE.replace(
+            "var r = a[0] === null || a[0] === undefined ? target : a[0];",
+            'if (a[0] === null || a[0] === undefined) return holder[name].apply("a,b", a.slice(1)); var r = a[0];'
+        );
+        const program = `${prelude}\nvar receiver = null, none;\nresult = [G.c1(receiver, ","), G.c1(none, ","), G.c1("x,y", ",")];`;
+        const { code } = await deobfuscate(program, { passes: ["runtime", "global-proxy", "aliases"] });
+        for (const kept of ["G.c1(receiver,", "G.c1(none,"]) expect(code).toContain(kept);
+        expect(code).toContain('"x,y".split(",")');
+        expect(observe(code)).toBe(observe(program));
+    });
 });
 
 // The same setup also forwards globals to host objects the builtins lack (a page's `document`, here `hostDoc`).
